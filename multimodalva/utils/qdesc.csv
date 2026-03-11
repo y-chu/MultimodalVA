@@ -1,0 +1,354 @@
+﻿indic,qdesc,sdesc,type,desc
+i004a,Did s(he) die during the wet season?,d wet,environment,die during wet season
+i004b,Did s(he) die during the dry season?,d dry,environment,die during dry season
+i019a,Was he male?,male,demographics,male
+i019b,Was she female?,female,demographics,female
+i022a,Was s(he) aged 65 years or more at death?,65+,demographics,above 65 years old
+i022b,Was s(he) aged 50 to 64 years at death?,50 to 64,demographics,50 to 64 years old
+i022c,Was s(he) aged 15 to 49 years at death?,15 to 49,demographics,15 to 49 years old
+i022d,Was s(he) aged 5-14 years at death?,5 to 14,demographics,5 to 14 years old
+i022e,Was s(he) aged 1 to 4 years at death?,1 to 4,demographics,1 to 4 years old
+i022f,Was s(he) aged 1 to 11 months at death?,1 to 11m,demographics,postneonate
+i022g,Was s(he) aged < 1 month (28 days) at death?,neonate,demographics,neonate
+i022h,Was s(he) a live baby who died within 24 hours of birth?,d day0,demographics,a baby died within 24 hours of birth
+i022i,Was s(he) a baby who died between 24 and 48 hours of birth?,d day1,demographics,a baby died on the second day after birth
+i022j,"Was s(he) a baby who died more than 48 hours from birth, but within the first week?",d day2-6,demographics,a baby died within a week
+i022k,"Was s(he) a baby who died after the first week, but within the first month?",d wk2-4,demographics,a baby died within a month
+i022l,Was she a woman aged 12-19 years at death?,f 12-19,demographics,a woman aged 12 to 19 years at death
+i022m,Was she a woman aged 20-34 years at death?,f 20-34,demographics,a woman aged 20 to 34 years at death
+i022n,Was she a woman aged 35 to 49 years at death?,f 30-49,demographics,a woman aged 35 to 49 years at death
+i059o,Was she married at the time of death?,married,demographics,married at the time of death
+i077o,Did (s)he suffer from any injury or accident that led to her/his death?,injury,injury,injury that led to the death
+i079o,Was (s)he injured in a road traffic accident?,inj rta,injury,injured in a road traffic accident
+i082o,Was (s)he injured in a non-road transport accident?,inj nrta,injury,injured in a non-road transport accident
+i083o,Was (s)he injured in a fall?,inj fall,injury,injured in a fall
+i084o,Was (s)he poisoned in any way?,inj poison,injury,poisoned
+i085o,Did (s)he die of drowning?,inj drown,injury,died of drowning
+i086o,Was (s)he injured by the bite or sting of a venomous animal?,inj venom,injury,injured by venomous animal
+i087o,Was (s)he injured by an animal or insect (non-venomous),inj anim,injury,injured by non-venomous animal
+i089o,Was (s)he injured by burns or fire?,inj burn,injury,injured by burns or fire
+i090o,"Was (s)he subject to violence (suicide, homicide, abuse)?",inj viol,injury,injured by violence
+i091o,Was (s)he injured by a fire arm?,inj gun,injury,injured by firearm
+i092o,"Was (s)he stabbed, cut or pierced?",inj stab,injury,"stabbed, cut or pierced"
+i093o,Was (s)he strangled?,inj strng,injury,strangled
+i094o,Was (s)he injured by a blunt force?,inj blfor,injury,injured by blunt force
+i095o,Was (s)he injured by a force of nature?,inj nature,injury,injured by force of nature
+i096o,Was (s)he electrocuted?,inj elec,injury,electrocuted
+i098o,Was the injury accidental?,inj accid,injury,injured accidentally
+i099o,Was the injury or accident self-inflicted?,inj suic,injury,injured by suicide
+i100o,Was the injury or accident intentionally inflicted by someone else?,inj int,injury,injured by homicide
+i104o,Did the baby ever cry?,ever cry,symptom,cried after birth
+i105o,"Did the baby cry immediately after birth, even if only a little bit?",cry little,symptom,cried immediately after birth
+i106a,Was it more than 5 minutes after birth before the baby first cried?,cry 5+m,symptom,more than five minutes after birth before the baby first cried
+i107o,Did the baby stop being able to cry?,cry stop,symptom,stopped being able to cry
+i108a,Did the baby stop crying more than a day before (s)he died?,cry st 1+d,symptom,stopped crying more than a day before death
+i109o,Did the baby ever move?,ever move,symptom,moved after birth
+i110o,Did the baby ever breathe?,ever breathe,symptom,breathed after birth
+i111o,"Did the baby breathe immediately after birth, even a little?",brth little,symptom,breathed immediately after birth
+i112o,Did the baby have a breathing problem?,brth prob,symptom,breathing problem
+i113o,Was the baby given assistance to breathe at birth?,brth assis,symptom,been given assistance to breathe at birth
+i114o,"If the baby didn't show any sign of life, was it born dead?",born dead,symptom,shown no sign of life
+i115o,Were there any bruises or signs of injury on child's body after the birth?,bruised,symptom,bruises or signs of injury on child's body after the birth
+i116o,"Was the baby's body soft, pulpy and discoloured with the skin peeling away?",macerated,symptom,"soft, pulpy and discoloured body with the skin peeling away"
+i120a,Did the final illness last less than 3 weeks?,ill <3w,symptom,final illness last less than 3 weeks
+i120b,Did the final illness last at least 3 weeks?,ill 3+w,symptom,final illness last at least 3 weeks
+i123o,Did (s)he die suddenly?,sudden,symptom,died suddenly
+i125o,Was there any diagnosis by a health professional of tuberculosis?,dia tb,diagnosis,diagnosed tubeculosis
+i127o,Was there any diagnosis by a health professional of HIV/AIDS?,dia HIV,diagnosis,diagnosed HIV
+i128o,Did (s)he have a recent positive test by a health professional for malaria?,dia mal+,diagnosis,diagnosed positive malaria
+i129o,Did (s)he have a recent negative test by a health professional for malaria?,dia mal-,diagnosis,diagnosed negative malaria
+i130o,Was there any diagnosis by a health professional of dengue fever?,dia deng,diagnosis,diagnosed dengue fever
+i131o,Was there any diagnosis by a health professional of measles?,dia meas,diagnosis,diagnosed measles
+i132o,Was there any diagnosis by a health professional of high blood pressure?,dia hypt,diagnosis,diagnosed high blood pressure
+i133o,Was there any diagnosis by a health professional of heart disease?,dia cvd,diagnosis,diagnosed heart disease
+i134o,Was there any diagnosis by a health professional of diabetes?,dia diab,diagnosis,diagnosed diabetes
+i135o,Was there any diagnosis by a health professional of asthma?,dia asth,diagnosis,diagnosed asthma
+i136o,Was there any diagnosis by a health professional of epilepsy?,dia epil,diagnosis,diagnosed epilepsy
+i137o,Was there any diagnosis by a health professional of cancer?,dia canc,diagnosis,diagnosed cancer
+i138o,Was there any diagnosis by a health professional of Chronic Obstructive Pulmonary Disease (COPD)?,dia copd,diagnosis,diagnosed copd
+i139o,Was there any diagnosis by a physician or health worker of dementia?,dia demt,diagnosis,diagnosed dementia
+i140o,Was there any diagnosis by a health professional of depression?,dia depr,diagnosis,diagnosed depression
+i141o,Was there any diagnosis by a health professional of stroke?,dia strk,diagnosis,diagnosed stroke
+i142o,Was there any diagnosis by a health professional of sickle cell disease?,dia scd,diagnosis,diagnosed sickle cell disease
+i143o,Was there any diagnosis by a health professional of kidney disease?,dia kidn,diagnosis,diagnosed kidney disease
+i144o,Was there any diagnosis by a health professional of liver disease?,dia liver,diagnosis,diagnosed liver disease
+i147o,"During the illness that led to death, did (s)he have a fever?",fever,symptom,fever
+i148a,Did the fever last less than a week before death?,fev <1w,symptom,fever for less than one week
+i148b,"Did the fever last at least one week, but less than 2 weeks before death?",fev 1-2w,symptom,fever for one to two weeks
+i148c,Did the fever last at least 2 weeks before death?,fev 2+w,symptom,fever for at least two weeks
+i149o,Did the fever continue until death?,fev death,symptom,fever continue until death
+i150a,Was the fever severe?,fev sev,symptom,severe fever
+i151a,Was the fever continuous?,fev cont,symptom,continuous fever
+i152o,Did (s)he have night sweats?,fev nsw,symptom,fever with night sweats
+i153o,"During the illness that led to death, did (s)he have a cough?",cough,symptom,cough
+i154a,Did the cough last less than 3 weeks before death?,cou <3w,symptom,cough less than 3 weeks
+i154b,Did the cough last at least 3 weeks before death?,cou 3+w,symptom,cough at least 3 weeks
+i155o,"Was the cough productive, with sputum?",cou prod,symptom,productive cough
+i156o,Was the cough very severe?,cou sev,symptom,very severe cough
+i157o,Did (s)he cough up blood?,cou bld,symptom,blood cough
+i158o,Did (s)he make a whooping sound when coughing?,cou whoop,symptom,whooping cough
+i159o,"During the illness that led to death, did (s)he have any difficulty breathing?",dif br,symptom,difficult breathing
+i161a,Did the difficult breathing last for at least 3 days before death?,dif br 3d,symptom,difficult breathing for at least three days
+i165a,Was the difficult breathing continuous during this period?,dif br con,symptom,continous difficult breathing
+i166o,Did (s)he have fast breathing?,br fast,symptom,fast breathing
+i167a,Did the fast breathing last for less than two weeks before death?,br fs <2w,symptom,fast breathing for less than two weeks
+i167b,Did the fast breathing last for at least 2 weeks before death?,br fs 2+w,symptom,fast breathing for at least two weeks
+i168o,Did (s)he have breathlessness?,brless,symptom,breathlessness
+i169a,Did the breathlessness last for less than 2 weeks before death?,brl <2w,symptom,breathlessness for less than two weeks
+i169b,Did the breathlessness last for at least 2 weeks before death?,brl 2+w,symptom,breathlessness for at least two weeks
+i170o,Was (s)he unable to carry out daily routines due to breathlessness?,brl unab,symptom,limitted functionality due to breathlessness
+i171o,Was (s)he breathless while lying flat?,brl flat,symptom,breathless while lyting flat
+i172o,Did you see the lower chest wall/ribs being pulled in as the child breathed?,indraw,symptom,lower chest indraw
+i173a,Did his/her breathing sound like wheezing or grunting?,whz grun,symptom,wheezing grunting
+i174o,"During the illness that led to death, did (s)he have chest pain?",ch pain,symptom,chest pain during the illness led to the death
+i175o,Was the chest pain severe?,chp sev,symptom,severe chest pain
+i176a,Did (s)he experience chest pain at least 3 days before death?,chp 3d,symptom,chest pain for at least three days
+i178a,Did the chest pain last for at least 30 minutes?,chp 30m,symptom,chest pain for at least thirty minutes
+i181o,Did (s)he have diarrhoea?,diarr,symptom,diarrhoea
+i182a,Did (s)he have diarrhoea for less than 2 weeks before death?,drr <2w,symptom,diarrhoea less than two weeks
+i182b,Did (s)he have diarrhoea for at least 2 weeks but less than 4 weeks before death?,drr 2-4w,symptom,diarrhoea at least two weeks
+i182c,Did (s)he have diarrhoea for at least 4 weeks before death?,drr 4+w,symptom,diarrhoea less than four weeks
+i183a,Did the baby or child have at least 4 stools on the day that loose liquid stools were most frequent?,4+ stls,symptom,at least four loose liquid stools
+i184a,Did the frequent loose or liquid stools start at least 3 days before death?,drr 3d,symptom,loose liquid stools at least three days
+i185o,Did the frequent loose or liquid stools continue up until death?,drr to d,symptom,lower chest indraw
+i186o,At any time during the final illness was there blood in the stools?,drr bld,symptom,blood in the stools
+i187o,Was there blood in the stool up until death?,dr bld d,symptom,blood in the stools until death
+i188o,"During the illness that led to death, did (s)he vomit?",vomit,symptom,vomit
+i189o,Did (s)he vomit in the week preceding the death?,vom bd,symptom,vomit in the past week
+i190o,Did (s)he vomit for at least 3 days before death?,vom 3d,symptom,vomit at least three days
+i191o,Was there blood in the vomit?,vom bld,symptom,blood in the vomit
+i192o,Was the vomit black?,vom blck,symptom,black vomit
+i193o,"During the illness that led to death, did (s)he have any abdominal (belly) problem?",abdom,symptom,abdominal problem
+i194o,Did (s)he have abdominal pain?,abd pain,symptom,abdominal pain
+i195o,Was the abdominal pain severe?,abd p sev,symptom,severe abdominal pain
+i197a,Did (s)he have severe abdominal pain for less than 2 weeks before death?,abd p <2w,symptom,severe abdominal pain less than 2 weeks
+i197b,Did (s)he have severe abdominal pain for at least 2 weeks before death?,abd p 2+w,symptom,severe abdominal pain at least 2 weeks
+i199a,Was the pain in the upper abdomen?,abd p up,symptom,upper abdomen pain
+i199b,Was the pain in the lower abdomen?,abd p lo,symptom,lower abdomen pain
+i200o,Did (s)he have a more than usually protruding abdomen?,abd prot,symptom,protruding abdomen
+i201a,Did (s)he have a more than usually protruding abdomen for less than 2 weeks before death?,abd pr <2w,symptom,protruding abdomen less than 2 weeks
+i201b,Did (s)he have a more than usually protruding abdomen for at least 2 weeks before death?,abd pr 2+w,symptom,protruding abdomen at least 2 weeks
+i203a,Did (s)he develop the protruding abdomen rapidly?,abd pr rap,symptom,rapid onset protruding abdomen
+i204o,Did (s)he have any mass in the abdomen?,abd mass,symptom,mass in the abdomen
+i205a,Did (s)he have a mass in the abdomen for less than 2 weeks before death?,ab ms <2w,symptom,mass in the abdomen less than 2 weeks
+i205b,Did (s)he have a mass in the abdomen for at least 2 weeks before death?,ab ms 2+w,symptom,mass in the abdomen at least 2 weeks
+i207o,"During the illness that led to death, did (s)he have a severe headache?",headache,symptom,severe headache
+i208o,"During the illness that led to death, did (s)he have a stiff neck?",st neck,symptom,stiff neck
+i209a,Did (s)he have a stiff neck for less than one week before death?,st n <1w,symptom,stiff neck less than one week
+i209b,Did (s)he have a stiff neck for at least one week before death?,st n 1+w,symptom,stiff neck at least one week
+i210o,"During the illness that led to death, did (s)he have a painful neck?",pain neck,symptom,painful neck
+i211a,Did (s)he have a painful neck for at least one week before death?,pa n 1+w,symptom,painful neck at least one week
+i212o,"During the illness that led to death, did (s)he have mental confusion?",ment conf,symptom,mental confusion
+i213o,Did (s)he have mental confusion for at least 3 months before death?,menc 3+m,symptom,mental confusion at least 3 months
+i214o,"During the illness that led to death, was (s)he unconscious?",uncons,symptom,unconscious during the illness led to the death
+i215o,Was (s)he unconscious for at least 24 hours before death?,unc 24+h,symptom,unconscious for at least 24 hours before death
+i216a,Was (s)he unsconscious for at least 6 hours before death?,unc 6+h,symptom,unconscious for at least 6 hours before death
+i217o,"Did the unconsciousness start suddenly, quickly (at least within a single day)?",unc sudd,symptom,sudden unconsciousness
+i218o,Did the unconsciousness continue until death?,unc to d,symptom,unconsciousness continued unti death
+i219o,"During the illness that led to death, did (s)he have any convulsions?",conv,symptom,convulsion
+i220o,Did (s)he experience any generalized convulsions or fits?,conv gen,symptom,genealized convulsion
+i221a,Did the convulsions last for less than 10 minutes?,conv <10m,symptom,convulsion for less than ten minutes
+i221b,Did the convulsions last for at least 10 minutes?,conv 10+m,symptom,convulsion for at least ten minutes
+i222o,Did (s)he become unconscious immediately after the convulsion?,conv unc,symptom,unconscious immediately after the convulsion
+i223o,"During the illness that led to death, did (s)he have any urine problems?",urine,symptom,urine problem
+i224o,Did (s)he stop urinating?,uri none,symptom,stopped urinating
+i225o,Did (s)he go to urinate more often than usual?,uri more,symptom,frequent urine
+i226o,Did (s)he pass blood in the urine?,uri bld,symptom,blood urine
+i227o,"During the illness that led to death, did (s)he have any sores or ulcers anywhere?",skin,symptom,sores or ulcers 
+i228o,Did (s)he have sores?,sk sores,symptom,sores
+i229o,Did the sores have clear fluid and/or pus?,sk s pus,symptom,sores with clear fluid and/or pus
+i230o,Did (s)he have an ulcer (pit) on the foot?,sk ul ft,symptom,foot ulcer
+i231o,Did any ulcer ooze pus?,sk ul pus,symptom,ulcer ooze pus
+i232a,Did the ulcer ooze pus for at least 2 weeks?,sk ul 2+w,symptom,ulcer ooze pus for at least 2 weeks
+i233o,"During the illness that led to death, did (s)he have any skin rash?",sk rash,symptom,skin rash
+i234a,Did (s)he have the skin rash for less than one week?,sk ra <1w,symptom,skin rash for less than one week
+i234b,Did (s)he have the skin rash for at least one week?,sk ra 1+w,symptom,skin rash for at least one week
+i235a,Did (s)he have a rash on the face?,sk ra face,symptom,rash on face
+i235b,Did (s)he have a rash on the trunk or abdomen?,sk ra abd,symptom,rach on trunk or abdomen
+i235c,Did (s)he have a rash on the extremities?,sk ra ext,symptom,rash on the extremities
+i235d,Did (s)he have a rash everywhere?,sk ra all,symptom,rash everywhere
+i236o,Did (s)he have measles rash?,sk ra meas,symptom,measles rash
+i237o,Did (s)he ever have shingles or herpes zoster?,sk ra herp,symptom,shingles or herpes zoster
+i238o,"During the illness that led to death, did her/his skin flake off in patches?",sk flake,symptom,skin flake off in patches
+i239o,"During the illness that led to death, did he/she have areas of the skin that turned black?",sk black,symptom,skin turned black
+i240o,"During the illness that led to death, did he/she have areas of the skin with redness and swelling?",sk red,symptom,skin turned red
+i241o,"During the illness that led to death, did (s)he bleed from anywhere?",bleed,symptom,bleed from somewhere
+i242o,"Did (s)he bleed from the nose, mouth or anus?",bld orif,symptom,"bleed from the nose, mouth or anus"
+i243o,"During the illness that led to death, did (s)he have noticeable weight loss?",wt loss,symptom,noticeable weight loss
+i244o,Was (s)he severely thin or wasted?,wt waste,symptom,severely thin or wasted
+i245o,"During the illness that led to death, did s/he have a whitish rash inside the mouth or on the tongue?",wht rash,symptom,whitish rash inside the mouth or on the tongue
+i246o,"During the illness that led to death, did (s)he have stiffness of the whole body or was unable to open the mouth?",stiff,symptom,stiffness of the whole body or was unable to open the mouth
+i247o,"During the illness that led to death, did (s)he have puffiness of the face?",sw pu face,symptom,puffiness of the face
+i248a,Did (s)he have puffiness of the face for at least one week before death?,sw p f 1+w,symptom,puffiness of the face for at least one week before death
+i249o,"During the illness that led to death, did (s)he have swollen legs or feet?",sw lg ft,symptom,swollen legs or feet
+i250a,Did the swelling last for at least 3 days before death?,sw lf 3+d,symptom,swelling last for at least three days before death
+i251o,Did (s)he have both feet swollen?,sw lf bth,symptom,both feet swollen
+i252o,"During the illness that led to death, did (s)he have general puffiness all over his/her body?",sw puf all,symptom,general puffiness all over the body
+i253o,"During the illness that led to death, did (s)he have any lumps?",lumps,symptom,lumps
+i254o,Did (s)he have any lumps or lesions in the mouth?,lm mou,symptom,lumps in the mouth
+i255o,Did (s)he have any lumps in the neck?,lm nck,symptom,lumps in the neck
+i256o,Did (s)he have any lumps in the armpit?,lm arm,symptom,lumps in the armpit
+i257o,Did (s)he have any lumps in the groin?,lm grn,symptom,lumps in the groin
+i258o,"During the illness that led to death, was (s)he in any way paralysed?",paral,symptom,paralysed
+i259o,Did (s)he have paralysis of only one side of the body?,par 1 side,symptom,paralysis of only one side of the body
+i260a,Was only the right side of the body paralysed?,par rs,symptom,right side of the body paralysed
+i260b,Was only the left side of the body paralysed?,par ls,symptom,left side of the body paralysed
+i260c,Was only the lower part of the body paralysed?,par lo,symptom,lower side of the body paralysed
+i260d,Was only the upper part of the body paralysed?,par up,symptom,upper side of the body paralysed
+i260e,Was only one leg paralysed?,par leg,symptom,one leg paralysed
+i260f,Was only one arm paralysed?,par arm,symptom,one arm paralysed
+i260g,Was the entire body paralysed?,par all,symptom,entire body paralysed
+i261o,"During the illness that led to death, did (s)he have difficulty swallowing?",swallow,symptom,difficulty swallowing
+i262a,Did (s)he have difficulty swallowing for at least one week before death?,swa 1+w,symptom,difficulty swallowing for at least one week before death
+i263a,Did (s)he have difficulty with swallowing solids?,swa sol,symptom,difficulty swallowing solids
+i263b,Did (s)he have difficulty with swallowing liquids?,swa liq,symptom,difficulty swallowing liquids
+i264o,Did (s)he have pain upon swallowing?,swa pain,symptom,pain upon swallowing
+i265o,"During the illness that led to death, did (s)he have yellow discolouration of the eyes?",yellow,symptom,yellow discolouration of the eyes
+i266a,Did (s)he have the yellow discolouration for at least 3 weeks before death?,yell 3+w,symptom,yellow discolouration for at least 3 weeks before death
+i267o,"During the illness that led to death, did her/his hair change to a reddish or yellowish colour?",hair,symptom,hair change to a reddish or yellowish colour
+i268o,"During the illness that led to death, did (s)he look pale (thinning/lack of blood) or have pale palms, eyes or nail beds?",pale,symptom,"have pale palms, eyes or nail beds"
+i269o,"During the illness that led to death, did (s)he have sunken eyes?",eyes sunk,symptom,sunken eyes
+i270o,"During the illness that led to death, did (s)he drink a lot more water than usual?",drink ++,symptom,drunk a lot more water than usual
+i271o,Was the baby able to suckle or bottle-feed within the first 24 hours after birth?,suckle,symptom,been able to suckle or bottle-feed within the first 24 hours after birth
+i272o,Did the baby ever suckle in a normal way?,suck ev,symptom,suckled in a normal way
+i273o,Did the baby stop suckling?,suck st,symptom,stopped suckling
+i274a,Did the baby stop suckling on the 2nd day of life or later?,suck st d1+,symptom,stopped suckling on the second day of life or later
+i275o,Did the baby have convulsions starting within the first 24 hours of life?,conv d0,symptom,convulsions starting within the first 24 hours of life
+i276o,Did the baby have convulsions starting more than 24 hours after birth?,conv d1+,symptom,convulsions starting more than 24 hours after birth
+i277o,"Did the baby's body become stiff, with the back arched backwards?",stiff,symptom,body become stiff with the back arched backwards
+i278o,"During the illness that led to death, did the baby have a bulging or raised fontanelle?",font up,symptom,a bulging or raised fontanelle
+i279o,"During the illness that led to death, did the baby have a sunken fontanelle?",font lo,symptom,a sunken fontanelle
+i281o,"During the illness that led to death, did the baby become unresponsive or unconscious?",unresp,symptom,become unresponsive or unconscious
+i282o,"Did the baby become unresponsive or unconscious soon after birth, within less than 24 hours?",unc d0,symptom,become unresponsive or unconscious soon after birth within less than 24 hours
+i283o,Did the baby become unresponsive or unconscious more than 24 hours after birth?,unc d1+,symptom,become unresponsive or unconscious more than 24 hours after birth
+i284o,"During the illness that led to death, did the baby become cold to touch?",cold,symptom,become cold to touch
+i285a,Was the baby more than 3 days old when it started feeling cold to touch?,cold 3+d,symptom,been more than 3 days old when it started feeling cold to touch
+i286o,"During the illness that led to death, did the baby become lethargic, after a period of normal activity?",lethargy,symptom,become lethargic after a period of normal activity
+i287o,Did the baby have redness or discharge from the umbilical cord stump?,umbil dis,symptom,redness or discharge from the umbilical cord stump
+i288o,"During the illness that led to death, did the baby have skin ulcer(s) or pits?",sk ulcer,symptom,skin ulcers or pits
+i289o,"During the illness that led to death, did the baby have yellow skin, palms (hand) or soles (foot)?",yellow,symptom,"yellow skin, palms (hand) or soles (foot)"
+i290o,Did the baby or infant appear to be healthy and then just die suddenly?,sudd d,symptom,appearred to be healthy and then just die suddenly
+i294o,"During the illness that led to death, did she have any swelling or lump in the breast?",sw lm bre,symptom,swelling or lump in the breast
+i295o,"During the illness that led to death, did she have any ulcers (pits) in the breast?",sw ul bre,symptom,ulcers (pits) in the breast
+i296o,Did she ever have a period or menstruate?,menstr,symptom,a period or menstruate
+i297o,"During the illness that led to death, did she have excessive vaginal bleeding in between menstrual periods?",men betw,symptom,excessive vaginal bleeding in between menstrual periods
+i298o,Was the bleeding excessive?,men exc,symptom,excessive bleeding
+i299o,Did her menstrual period stop naturally because of menopause?,men mpse,symptom,menstrual period stopped naturally because of menopause
+i300o,Did she have vaginal bleeding after cessation of menstruation?,men mp bl,symptom,vaginal bleeding after cessation of menstruation
+i301o,Was there excessive vaginal bleeding in the week prior to death?,vb <1w,symptom,excessive vaginal bleeding in the week prior to death
+i302o,At the time of death was her period overdue?,men late,symptom,her period overdue at the time of death
+i303a,Had her period been overdue for at least 4 weeks?,men l 4+w,symptom,period overdue for at least 4 weeks
+i304o,Did she have a sharp pain in her abdomen shortly before death?,obs pain,symptom,a sharp pain in her abdomen shortly before death
+i305o,Was she pregnant (incl. in labour) at the time of death?,pregnant,symptom,been pregnant at the time of death
+i306o,"Did she die within 6 weeks of delivery, abortion or miscarriage?",d <6w pend,symptom,"died within 6 weeks of delivery, abortion or miscarriage"
+i309o,"Was she, or had she been, pregnant for less than 6 months when she died?",d <6m pr,symptom,been pregnant for less than 6 months when she died
+i310o,"Please confirm: When she died, she was NEITHER pregnant NOR had recently been pregnant NOR had recently delivered when she died - is that right?",not preg,symptom,been NEITHER pregnant NOR had recently been pregnant NOR had recently delivered when she died
+i312o,Did she die during labour or delivery?,d lab,symptom,died during labour or delivery
+i313o,Did she die after delivering a baby?,d aft del,symptom,died after delivering a baby
+i314o,Did she die within 24 hours after delivery?,d <24h del,symptom,died within 24 hours after delivery
+i315o,Did she die within 6 weeks of childbirth?,d <6w chb,symptom,died within 6 weeks of childbirth
+i316o,Did she give birth to a live baby (within 6 weeks of her death)?,live baby,symptom,given birth to a live baby (within 6 weeks of her death)
+i317o,Did she die during or after a multiple pregnancy?,mult pr,symptom,died during or after a multiple pregnancy
+i318o,Was she breastfeeding the child in the days before death?,br feed,symptom,been breastfeeding the child in the days before death
+i319a,Did she die during or after her first pregnancy?,1st pr,symptom,died during or after her first pregnancy
+i319b,Did she have four or more pregnancies before this one?,4+ pr,symptom,four or more pregnancies before this one
+i320o,Had she had any previous Caesarean section?,prev cs,symptom,previous Caesarean section
+i321o,"During pregnancy, did she suffer from high blood pressure?",pr hypt,symptom,high blood pressure during pregnancy
+i322o,Did she have foul smelling vaginal discharge during pregnancy or after delivery?,pr disch,symptom,foul smelling vaginal discharge during pregnancy or after delivery
+i323o,"During the last 3 months of pregnancy, did she suffer from convulsions?",pr conv,symptom,convulsions during the last 3 months of pregnancy
+i324o,During the last 3 months of pregnancy did she suffer from blurred vision?,pr bl vis,symptom,blurred vision during the last 3 months of pregnancy
+i325o,Did she have excessive bleeding during pregnancy or shortly after delivery?,pr bleed,symptom,excessive bleeding during pregnancy or shortly after delivery
+i326o,Was there vaginal bleeding during the first 6 months of pregnancy?,pr bl <6m,symptom,vaginal bleeding during the first 6 months of pregnancy
+i327o,Was there vaginal bleeding during the last 3 months of pregnancy but before labour started?,pr bl 6+m,symptom,vaginal bleeding during the last 3 months of pregnancy but before labour started
+i328o,"Did she have excessive bleeding during labour, before delivery?",pr bl lab,symptom,"excessive bleeding during labour, before delivery"
+i329o,Did she have excessive bleeding after delivery or abortion?,pr bl ppt,symptom,excessive bleeding after delivery or abortion
+i330o,Was the placenta completely delivered?,plnta del,symptom,delivered the placenta completely
+i331o,Did she deliver or try to deliver an abnormally positioned baby?,del ab pos,symptom,delivered an abnormally positioned baby
+i332a,Did her labour last longer than 24 hours?,lab 24+h,symptom,her labour lasting longer than 24 hours
+i333o,Did she attempt to terminate the pregnancy?,term att,symptom,attemptted to terminate the pregnancy
+i334o,Did she recently have a pregnancy that ended in an abortion (spontaneous or induced)?,abort,symptom,recently had a pregnancy that ended in an abortion (spontaneous or induced)
+i335o,Did she die during an abortion?,d in abort,symptom,died during an abortion
+i336o,Did she die within 6 weeks of having an abortion?,d after ab,symptom,died within 6 weeks of having an abortion
+i337a,Did the mother deliver at a health facility or clinic?,del hfac,symptom,delivered at a health facility or clinic
+i337b,Did the mother deliver at home?,del home,symptom,delivered at home
+i337c,Did the mother deliver elsewhere (not at a health facility nor at home)?,del else,symptom,delivered elsewhere (not at a health facility nor at home)
+i338o,Did she receive professional assistance during the delivery?,del prof,symptom,received professional assistance during the delivery
+i340o,Did she have an operation to remove her uterus shortly before death?,hyster,symptom,an operation to remove her uterus shortly before death
+i342o,"Was the delivery normal vaginal, without forceps or vacuum?",del norm,symptom,"delivery via normal vaginal, without forceps or vacuum"
+i343o,"Was the delivery vaginal, with forceps or vacuum?",del assist,symptom,vaginal delivery with forceps or vacuum
+i344o,Was the delivery a Caesarean section?,del cs,symptom,Caesarean section
+i347o,Was her baby born more than one month early?,del >1m ea,symptom,her baby born more than one month early
+i354o,Was the child part of a multiple  birth?,mult bir,symptom,been part of multiple birth
+i355a,"If the child was part of a multiple birth, was it born first?",mult fir,symptom,been born first in a multiple birth
+i356o,Is the child's mother still alive?,moth aliv,symptom,a mother still alive
+i357o,Did the child's mother die during or shortly after the delivery?,moth d del,symptom,mother died during or shortly after the delivery
+i358a,Did the child's mother die in the baby's first year of life?,moth d y1,symptom,mother die in the baby's first year of life
+i360a,Was the baby born in a health facility or clinic?,born fac,symptom,the baby born in a health facility or clinic
+i360b,Was the baby born at home?,born home,symptom,been born at home
+i360c,Was the baby born somewhere else (e.g. on the way to a clinic)?,born on way,symptom,been born somewhere else (e.g. on the way to a clinic)
+i361o,Did the mother receive professional assistance during the delivery?,born prof,symptom,received professional assistance during the delivery
+i362o,"At birth, was the baby of usual size?",bwt norm,symptom,been of usual size at birth
+i363o,"At birth, was the baby smaller than normal (weighing under 2.5 kg)?",bwt small,symptom,been smaller than normal (weighing under 2.5 kg) at birth
+i364o,"At birth, was the baby very much smaller than usual, (weighing under 1 kg)?",bwt vsmall,symptom,"been very much smaller than usual, (weighing under 1 kg) at birth"
+i365o,"At birth, was the baby larger than normal (weighing over 4.5 kg)?",bwt big,symptom,been larger than normal (weighing over 4.5 kg) at birth
+i367a,Was the baby born during the ninth month (at least 37 weeks) of pregnancy?,gest 9m,symptom,been born during the ninth month (at least 37 weeks) of pregnancy
+i367b,Was the baby born during the eighth month (34 to 37 weeks) of pregnancy?,gest 8m,symptom,been born during the eighth month (34 to 37 weeks) of pregnancy
+i367c,Was the baby born before the eighth month (less than 34 weeks) of pregnancy?,gest 7m,symptom,been born before the eighth month (less than 34 weeks) of pregnancy
+i368o,"Were there any complications in the late part of the pregnancy (defined as the last 3 months), but before labour?",cmp bf lab,symptom,"complications in the late part of the pregnancy (defined as the last 3 months), but before labour"
+i369o,Were there any complications during labour or delivery?,cmp in lab,symptom,complications during labour or delivery
+i370o,"Was any part of the baby physically abnormal at time of delivery? (for example: body part too large or too small, additional growth on body)?",abnorm,symptom,"been physically abnormal at time of delivery, for example body part too large or too small, additional growth on body"
+i371o,Did the baby/child have a swelling or defect on the back?,abn back,symptom,a swelling or defect on the back
+i372o,Did the baby/child have a very large head?,abn lg hd,symptom,a very large head
+i373o,Did the baby/child have a very small head?,abn sm hd,symptom,a very small head
+i376o,Was the baby moving in the last few days before the birth?,bab mov,symptom,been moving in the last few days before the birth
+i377o,Did the baby stop moving in the womb before labour started?,bab st mov,symptom,stopped moving in the womb before labour started
+i382a,Did labour and delivery take more than 24 hours?,lab 24+h,symptom,been in labor for more than 24 hours
+i383o,Was the baby born 24 hours or more after the waters broke?,born 24+h w,symptom,a baby born 24 hours or more after the waters broke
+i384o,Was the liquor foul smelling when the waters broke?,liq smell,symptom,foul smelling liquor when the waters broke
+i385a,Was the liquor a green or brown colour when the waters broke?,liq gr-br,symptom,a green or brown colour liquor when the waters broke
+i387o,"Was the delivery normal vaginal, without forceps or vacuum?",born n del,symptom,normal vaginal delivery without forceps or vacuum
+i388o,"Was the delivery vaginal, with forceps or vacuum?",born as del,symptom,"vaginal delivery, with forceps or vacuum"
+i389o,Was the delivery a Caesarean section?,born cs,symptom,a Caesarean section
+i391o,Did the child's mother receive any vaccinations since reaching adulthood including during this pregnancy?,moth vacc,symptom,mother received vaccinations since reaching adulthood including during this pregnancy
+i393o,Did the mother receive tetanus toxoid (TT) vaccine?,moth ttv,symptom,mother receiving tetanus toxoid (TT) vaccine
+i394a,Was this baby born from the mother's first pregnancy?,born 1st pr,symptom,been born from the mother's first pregnancy
+i394b,Did the baby's mother have four or more births before this one?,born 4+ pr,symptom,a mother having four or more births before this one
+i395o,"During labour, did the baby's mother suffer from fever?",moth fev,symptom,a mother sufferring from fever during labour
+i396o,"During the last 3 months of pregnancy, labour or delivery, did the baby's mother suffer from high blood pressure?",moth hypt,symptom,"a mother suffer from high blood pressure during the last 3 months of pregnancy, labour or delivery"
+i397o,Did the baby's mother have diabetes mellitus?,moth diab,symptom,a mother with diabetes mellitus
+i398o,Did the baby's mother have foul smelling vaginal discharge during pregnancy or after delivery?,moth disch,symptom,a mother having foul smelling vaginal discharge during pregnancy or after delivery
+i399o,"During the last 3 months of pregnancy, labour or delivery, did the baby's mother suffer from convulsions?",moth conv,symptom,"a mother suffer from convulsions during the last 3 months of pregnancy, labour or delivery"
+i400o,During the last 3 months of pregnancy did the baby's mother suffer from blurred vision?,moth bl vis,symptom,a mother suffer from blurred vision during the last 3 months of pregnancy
+i401o,Did the baby's mother have severe anaemia?,moth anaem,symptom,a mother with severe anaemia
+i402o,Did the baby's mother have vaginal bleeding during the last 3 months of pregnancy but before labour started?,moth bleed,symptom,a mother with vaginal bleeding during the last 3 months of pregnancy but before labour started
+i403o,"Did the baby's bottom, feet, arm or hand come out of the vagina before its head?",breech,symptom,"bottom, feet, arm or hand coming out of the vagina before its head"
+i404o,Was the umbilical cord wrapped more than once around the baby's neck at birth?,cord wrap,symptom,umbilical cord wrapped more than once around the neck at birth
+i405o,Was the umbilical cord delivered first?,cord first,symptom,umbilical cord delivered first
+i406o,Was the baby blue in colour at birth?,born blue,symptom,been blue in colour at birth
+i408o,"Before the illness that led to death, was the baby/child growing normally?",grow norm,symptom,been growing normally before the illness that led to death
+i411o,Did (s)he drink alcohol?,alco,behavior,drunk alcohol
+i412o,Did (s)he use tobacco?,tobac,behavior,used tobacco
+i413o,"Did (s)he smoke tobacco (cigarette, cigar, pipe, etc.)?",smoke,behavior,"smoked tobacco (cigarette, cigar, pipe, etc.)"
+i414a,Did (s)he use non-smoking tobacco?,tobac ns,behavior,used non-smoking tobacco
+i415a,Did (s)he smoke at least 10 cigarettes daily?,cigs >10,behavior,been smoking at least 10 cigarettes daily
+i418o,Did (s)he receive any treatment for the illness that led to death?,treat,service,received treatment for the illness that led to death
+i419o,Did (s)he receive oral rehydration salts?,tr ors,service,received oral rehydration salts
+i420o,Did (s)he receive (or need) intravenous fluids (drip) treatment?,tr drip,service,received or needed intravenous fluids (drip) treatment
+i421o,Did (s)he receive (or need) a blood transfusion?,tr blood,service,received a blood transfusion
+i422o,Did (s)he receive (or need) treatment/food through a tube passed through the nose?,tr ngt,service,treatment/food through a tube passed through the nose
+i423o,Did (s)he receive (or need) injectable antibiotics?,tr inj ab,service,received injectable antibiotics
+i424o,Did (s)he receive (or need) antiretroviral therapy (ART)?,tr art,service,received antiretroviral therapy (ART)
+i425o,Did (s)he have (or need) an operation for the illness?,tr oper,service,received or needed an operation for the illness
+i426o,Did (s)he have the operation within 1 month before death?,tr op <1m,service,the operation within 1 month before death
+i427o,Was (s)he discharged from hospital very ill?,tr disc ill,service,been discharged from hospital very ill
+i428o,Did (s)he receive appropriate immunizations?,immun,service,received appropriate immunizations
+i450o,"In the final days before death, did s/he travel to a hospital or health facility?",q trav,service,travelled to a hospital or health facility in the final days before death
+i451o,Did (s)he use motorised transport to get to the hospital or health facility?,q trans,service,used motorised transport to get to the hospital or health facility
+i452o,Were there any problems during admission to the hospital or health facility?,q admit,service,problems during admission to the hospital or health facility
+i453o,"Were there any problems with the way (s)he was treated (medical treatment, procedures, interpersonal attitudes, respect, dignity) in the hospital or health facility?",q treat,service,"problems with the way (s)he was treated (medical treatment, procedures, interpersonal attitudes, respect, dignity) in the hospital or health facility"
+i454o,"Were there any problems getting medications, or diagnostic tests in the hospital or health facility?",q meds,service,"problems getting medications, or diagnostic tests in the hospital or health facility"
+i455o,Does it take more than 2 hours to get to the nearest hospital or health facility from the deceased's household?,q dist,service,taken more than 2 hours to get to the nearest hospital or health facility from the deceased's household
+i456o,"In the final days before death, were there any doubts about whether medical care was needed?",q doubt,service,doubts about whether medical care was needed in the final days before death
+i457o,"In the final days before death, was traditional medicine used?",q tmed,service,used traditional medicine in the final days before death
+i458o,"In the final days before death, did anyone use a telephone or cell phone to call for help?",q phone,service,used a telephone or cell phone to call for help in the final days before death
+i459o,"Over the course of illness, did the total costs of care and treatment prohibit other household payments?",q costs,service,total costs of care and treatment prohibit other household payments over the course of illness

@@ -1,0 +1,524 @@
+"""
+Step 3: Fine-tune a BERT-family model for multiclass cause of death classification.
+
+Input:  train_dataset, label2id, id2label  from prepare_dataset()
+        hyperparams dict
+Output: (model, tokenizer, metadata) — model and tokenizer ready for immediate
+        prediction; all artifacts also saved to output_dir for later reuse
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+import torch
+from sklearn.model_selection import train_test_split as _sklearn_val_split
+from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import Dataset, Subset
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
+)
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+logger = logging.getLogger(__name__)
+
+# Default training hyperparameters (keys match TrainingArguments where applicable)
+DEFAULT_HYPERPARAMS: dict = {
+    "learning_rate": 2e-5,             # AdamW LR; BERT fine-tuning: 1e-5–5e-5; larger models → lower end
+    "batch_size": 16,                  # per-device; 8–32 typical; reduce if GPU OOM
+    "epochs": 3,                       # 3–10; pair with early_stopping_patience for small datasets
+    "weight_decay": 0.01,              # L2 regularisation on non-bias params; 0.01–0.1
+    "warmup_ratio": 0.1,               # fraction of steps for LR warm-up; 0.06–0.1 typical
+    "gradient_accumulation_steps": 1,  # multiply effective batch size; use 2–8 when GPU memory is limited
+    # Regularisation
+    "label_smoothing": 0.0,            # set 0.05–0.1 to reduce overconfidence; recommended for imbalanced classes
+    "max_grad_norm": 1.0,              # gradient clipping; lower to 0.5 if loss spikes on small data
+    # Data loading
+    "dataloader_num_workers": 2,       # parallel CPU workers per GPU; 4–8 on multi-core systems
+    # Layer freezing — active by default for supported architectures (bert, roberta, longformer, bigbird, electra)
+    # Skipped with a warning for unsupported architectures; set 0 to disable entirely
+    "freeze_layers": 2,                # freeze embeddings + bottom N encoder layers; increase to 6 for very small datasets
+    # Optional keys (not active by default — uncomment and set as needed)
+    # "class_weights": "balanced"      # auto-compute from training labels; or list of floats by class ID
+}
+
+# LoRA-specific defaults (only applied when use_lora=True)
+LORA_DEFAULTS: dict = {
+    "lora_r": 16,        # rank of LoRA decomposition; 4–64; higher = more capacity, more params
+    "lora_alpha": 64,    # scaling factor; typically 2–4× lora_r; higher = stronger adaptation
+    "lora_dropout": 0.1, # dropout on LoRA layers; 0.05–0.1; increase for small datasets
+}
+
+# Reference map of well-known model families to canonical HuggingFace model IDs.
+# model_name in train() / predict() / prepare_dataset() accepts any of:
+#   - A value from this dict  (e.g. SUPPORTED_MODELS["biobert"])
+#   - Any HuggingFace Hub ID  (e.g. "username/my-finetuned-bert")
+#   - A local path to a saved model directory  (e.g. "/data/models/my_checkpoint")
+# Architecture groups natively supported by freeze_model_layers():
+#   BERT-family : bert, biobert, bioclinicalbert, bluebert, biomedbert, clinicalbert
+#   RoBERTa     : biomedroberta
+#   ELECTRA     : bioelectra
+#   Long-range  : longformer, bigbird
+SUPPORTED_MODELS: dict[str, str] = {
+    "bert":            "bert-base-uncased",
+    "biobert":         "dmis-lab/biobert-base-cased-v1.2", #dmis-lab/biobert-v1.1
+    "bioclinicalbert": "emilyalsentzer/Bio_ClinicalBERT",
+    "bluebert":        "bionlp/bluebert_pubmed_mimic_uncased_L-12_H-768_A-12",
+    "biomedbert":      "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
+    "clinicalbert":    "medicalai/ClinicalBERT",
+    "biomedroberta":   "allenai/biomed_roberta_base",
+    "bioelectra":      "kamalkraj/bioelectra-base-discriminator-pubmed",
+    "longformer":      "allenai/longformer-base-4096",
+    "bigbird":         "google/bigbird-roberta-base",
+}
+
+# Models not on the HuggingFace Hub — must be fetched via download_model(key).
+# download_model() extracts the archive to a temp directory and returns the
+# local path, which can then be passed directly as model_name.
+REMOTE_MODELS: dict[str, str] = {
+    "roberta-pm": (
+        "https://dl.fbaipublicfiles.com/biolm/"
+        "RoBERTa-base-PM-M3-Voc-distill-hf.tar.gz"
+    ),
+}
+
+
+def download_model(key: str, cache_dir: str | Path | None = None) -> str:
+    """Download and extract a remote model checkpoint from REMOTE_MODELS.
+
+    Downloads the archive to a temporary directory (or cache_dir), extracts
+    it, removes the archive, and returns the local model directory path for
+    use as model_name in train(), predict(), and prepare_dataset().
+
+    Args:
+        key: Key in REMOTE_MODELS (e.g. "roberta-pm").
+        cache_dir: Directory to extract the model into.
+                   Defaults to a new system temp directory (deleted on reboot).
+
+    Returns:
+        Absolute path to the extracted model directory.
+
+    Raises:
+        ValueError: If key is not in REMOTE_MODELS.
+
+    Example:
+        model_path = download_model("roberta-pm")
+        train(..., model_name=model_path)
+    """
+    if key not in REMOTE_MODELS:
+        raise ValueError(
+            f"Unknown remote model key: '{key}'. "
+            f"Available keys: {list(REMOTE_MODELS)}"
+        )
+
+    url = REMOTE_MODELS[key]
+    archive_name = url.rsplit("/", 1)[-1]  # e.g. RoBERTa-base-PM-M3-Voc-distill-hf.tar.gz
+
+    if cache_dir is None:
+        cache_dir = Path(tempfile.mkdtemp(prefix="multimodalva_"))
+    else:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    archive_path = cache_dir / archive_name
+
+    logger.info("Downloading %s ...", url)
+    urllib.request.urlretrieve(url, archive_path)
+    logger.info("Saved archive to %s", archive_path)
+
+    logger.info("Extracting %s ...", archive_path)
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(cache_dir)
+    archive_path.unlink()  # remove archive after extraction
+
+    # The archive extracts to a single subdirectory; find it.
+    subdirs = [p for p in cache_dir.iterdir() if p.is_dir()]
+    model_dir = subdirs[0] if len(subdirs) == 1 else cache_dir
+
+    logger.info("Model ready at: %s", model_dir)
+    return str(model_dir)
+
+
+def _get_dataset_labels(dataset) -> list[int]:
+    """Extract integer labels from a ClassificationDataset or a Subset of one."""
+    if hasattr(dataset, "labels"):
+        return list(dataset.labels)
+    if isinstance(dataset, Subset):
+        return [dataset.dataset.labels[i] for i in dataset.indices]
+    raise AttributeError(
+        f"Cannot extract labels from dataset of type {type(dataset).__name__}. "
+        "Expected ClassificationDataset or torch.utils.data.Subset."
+    )
+
+
+def _val_split(dataset, val_size: float, random_state: int = 42) -> tuple[Subset, Subset]:
+    """Carve a stratified validation subset from dataset, returning (train_subset, val_subset).
+
+    Uses stratified splitting so class proportions are preserved in both subsets.
+    The original dataset is not modified.
+    """
+    labels = _get_dataset_labels(dataset)
+    indices = list(range(len(dataset)))
+    train_idx, val_idx = _sklearn_val_split(
+        indices,
+        test_size=val_size,
+        random_state=random_state,
+        stratify=labels,
+    )
+    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+
+def _find_latest_checkpoint(output_dir: Path) -> Path | None:
+    """Return the latest checkpoint subdirectory in output_dir, or None.
+
+    HuggingFace Trainer saves checkpoints as ``checkpoint-{step}`` directories.
+    Returns the one with the highest step number, or None if none exist.
+    """
+    checkpoints = [
+        p for p in output_dir.iterdir()
+        if p.is_dir() and p.name.startswith("checkpoint-") and p.name.split("-")[-1].isdigit()
+    ]
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=lambda p: int(p.name.split("-")[-1]))
+
+
+def get_device() -> torch.device:
+    """Return the best available device: CUDA, MPS, CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def freeze_model_layers(model, freeze_layers: int):
+    """Freeze the embedding layer and the first N encoder layers.
+
+    Supports BERT, RoBERTa, Longformer, BigBird, and ELECTRA architectures,
+    covering all models in SUPPORTED_MODELS.
+
+    Args:
+        model: A loaded HuggingFace sequence classification model.
+        freeze_layers: Number of encoder layers to freeze (from the bottom).
+                       Set to 0 to freeze only embeddings; negative values are no-ops.
+
+    Returns:
+        model with the requested parameters frozen.
+
+    Raises:
+        ValueError: If the model architecture is not recognised.
+    """
+    encoder, embeddings = None, None
+    for arch in ("bert", "roberta", "longformer", "bigbird", "electra"):
+        backbone = getattr(model, arch, None)
+        if backbone is not None:
+            encoder = backbone.encoder
+            embeddings = backbone.embeddings
+            break
+
+    if encoder is None:
+        raise ValueError(
+            f"Unsupported model architecture for layer freezing: {type(model).__name__}. "
+            "Expected bert, roberta, longformer, bigbird, or electra."
+        )
+
+    if freeze_layers > 0:
+        for param in embeddings.parameters():
+            param.requires_grad = False
+
+    n_layers = min(freeze_layers, len(encoder.layer))
+    for i in range(n_layers):
+        for param in encoder.layer[i].parameters():
+            param.requires_grad = False
+
+    frozen = n_layers + (1 if freeze_layers > 0 else 0)
+    logger.info("Froze embeddings + %d encoder layers.", frozen - 1)
+    return model
+
+
+class WeightedTrainer(Trainer):
+    """Trainer subclass that applies per-class loss weights for class imbalance.
+
+    Also re-applies label_smoothing_factor from TrainingArguments so that
+    both class_weights and label_smoothing work correctly together.
+    Used automatically by train() when hp["class_weights"] is set.
+    """
+
+    def __init__(self, *args, class_weights: torch.Tensor, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        loss_fct = torch.nn.CrossEntropyLoss(
+            weight=self.class_weights.to(logits.device),
+            label_smoothing=self.args.label_smoothing_factor,
+        )
+        loss = loss_fct(
+            logits.view(-1, self.model.config.num_labels),
+            labels.view(-1),
+        )
+        return (loss, outputs) if return_outputs else loss
+
+
+def train(
+    train_dataset: Dataset,
+    label2id: dict,
+    id2label: dict,
+    model_name: str,
+    output_dir: str | Path,
+    hyperparams: dict | None = None,
+    val_size: float | None = 0.1,
+    use_lora: bool = False,
+    gradient_checkpointing: bool = False,
+    early_stopping_patience: int | None = None,
+    resume: bool = True,
+) -> tuple[Trainer, AutoTokenizer, dict]:
+    """Fine-tune a BERT-family model for multiclass classification.
+
+    Saves the following to output_dir:
+        - Fine-tuned model weights and config
+        - Tokenizer
+        - label2id.json / id2label.json
+        - hyperparams.json
+        - training_metadata.json  (full log history + eval metrics)
+
+    When use_lora=True, LoRA weights are merged into the base model before
+    saving so that predict() can reload the model with the standard
+    AutoModelForSequenceClassification.from_pretrained() call.
+
+    Args:
+        train_dataset: Tokenized ClassificationDataset (or Subset) from prepare_dataset().
+        label2id: Label-to-integer mapping from prepare_dataset().
+        id2label: Integer-to-label mapping from prepare_dataset().
+        model_name: HuggingFace model name or local path (e.g. "bert-base-uncased").
+        output_dir: Directory where all outputs are saved.
+        hyperparams: Training hyperparameters. Merged over DEFAULT_HYPERPARAMS.
+                     Core keys: learning_rate, batch_size, epochs, weight_decay,
+                       warmup_ratio, gradient_accumulation_steps.
+                     Regularisation: label_smoothing (0.0–0.1), max_grad_norm.
+                     Hardware: dataloader_num_workers (increase for multi-core/GPU).
+                     Imbalance: class_weights — "balanced" (auto from sklearn) or a
+                       list of floats ordered by class ID.
+                     Optional: freeze_layers (int), lora_r / lora_alpha / lora_dropout
+                       (only used when use_lora=True).
+        val_size: Fraction of train_dataset to hold out as a validation split for
+                  in-training evaluation (loss monitoring, best-checkpoint selection,
+                  early stopping). Stratified by class. Default 0.1.
+                  Set to None to train on all training data with no in-training eval.
+        use_lora: Apply LoRA adapters during training. Default False.
+        gradient_checkpointing: Enable gradient checkpointing to reduce GPU memory.
+                                Default False.
+        early_stopping_patience: Stop training if eval metric does not improve for
+                                  this many epochs. Only active when eval_dataset
+                                  is provided. Default None (disabled).
+        resume: Resume training from the latest checkpoint in output_dir.
+                Default True.
+
+    Returns:
+        trainer:   HuggingFace Trainer with the fine-tuned model at trainer.model.
+                   When load_best_model_at_end=True (i.e. val_size is set), trainer.model
+                   holds the best checkpoint rather than the final epoch's weights.
+        tokenizer: Tokenizer matching the model, ready for DataCollatorWithPadding.
+        metadata:  Dict with keys output_dir, model_name, hyperparams, label2id,
+                   id2label, log_history. Contains everything needed for in-memory
+                   prediction without reloading from disk.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Merge hyperparams over defaults
+    hp = {**DEFAULT_HYPERPARAMS}
+    if use_lora:
+        hp.update(LORA_DEFAULTS)
+    if hyperparams:
+        hp.update(hyperparams)
+
+    num_labels = len(label2id)
+
+    # --- Carve out validation split from training data ---
+    # Test data must never enter train(); it is reserved exclusively for predict().
+    if val_size is not None and val_size > 0.0:
+        train_dataset, val_dataset = _val_split(train_dataset, val_size)
+        has_eval = True
+        logger.info(
+            "Validation split: %d train / %d val (val_size=%.2f).",
+            len(train_dataset), len(val_dataset), val_size,
+        )
+    else:
+        val_dataset = None
+        has_eval = False
+
+    # --- Compute class weights (if requested) ---
+    # Uses the training subset (after val split) so weights reflect actual training labels.
+    class_weights = None
+    raw_cw = hp.get("class_weights")
+    if raw_cw is not None:
+        labels_list = _get_dataset_labels(train_dataset)
+        if raw_cw == "balanced":
+            weights = compute_class_weight(
+                "balanced", classes=np.arange(num_labels), y=labels_list
+            )
+            class_weights = torch.tensor(weights, dtype=torch.float32)
+        else:
+            class_weights = torch.tensor(raw_cw, dtype=torch.float32)
+        logger.info("Class weights: %s", class_weights.tolist())
+
+    # --- Load base model ---
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=num_labels,
+        id2label=id2label,
+        label2id=label2id,
+    )
+
+    # --- Apply LoRA ---
+    if use_lora:
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        peft_config = LoraConfig(
+            r=hp["lora_r"],
+            lora_alpha=hp["lora_alpha"],
+            lora_dropout=hp["lora_dropout"],
+            target_modules=["query", "value"],
+            bias="none",
+            task_type=TaskType.SEQ_CLS,
+        )
+        model = get_peft_model(base_model, peft_config)
+        model.print_trainable_parameters()
+    else:
+        model = base_model
+
+    # --- Freeze layers ---
+    if hp.get("freeze_layers"):
+        try:
+            model = freeze_model_layers(model, hp["freeze_layers"])
+        except ValueError as e:
+            logger.warning("Layer freezing skipped (unsupported architecture): %s", e)
+
+    model.to(get_device())
+
+    # --- Training arguments ---
+    training_args = TrainingArguments(
+        output_dir=str(output_dir),
+        learning_rate=hp["learning_rate"],
+        per_device_train_batch_size=hp["batch_size"],
+        per_device_eval_batch_size=32,
+        num_train_epochs=hp["epochs"],
+        warmup_ratio=hp["warmup_ratio"],
+        weight_decay=hp["weight_decay"],
+        gradient_accumulation_steps=hp["gradient_accumulation_steps"],
+        label_smoothing_factor=hp["label_smoothing"],
+        max_grad_norm=hp["max_grad_norm"],
+        eval_strategy="epoch" if has_eval else "no",
+        save_strategy="epoch",
+        save_total_limit=2,
+        load_best_model_at_end=has_eval,
+        logging_steps=50,
+        report_to="none",
+        fp16=torch.cuda.is_available(),
+        dataloader_num_workers=hp["dataloader_num_workers"],
+        gradient_checkpointing=gradient_checkpointing,
+        disable_tqdm=False,
+    )
+
+    # --- Load tokenizer for DataCollator (needed before Trainer is created) ---
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    callbacks = []
+    if has_eval and early_stopping_patience is not None:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=early_stopping_patience))
+
+    # --- Create trainer ---
+    # DataCollatorWithPadding pads each batch to its own longest sequence,
+    # so train and test batches are handled independently with no length mismatch.
+    # WeightedTrainer is used when class_weights are provided; it applies a
+    # weighted + label-smoothed CrossEntropyLoss to handle class imbalance.
+    if class_weights is not None:
+        trainer = WeightedTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=DataCollatorWithPadding(tokenizer),
+            callbacks=callbacks or None,
+            class_weights=class_weights,
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=DataCollatorWithPadding(tokenizer),
+            callbacks=callbacks or None,
+        )
+    # --- Resolve resume checkpoint ---
+    resume_checkpoint = None
+    if resume:
+        resume_checkpoint = _find_latest_checkpoint(output_dir)
+        if resume_checkpoint is not None:
+            logger.info("Resuming from checkpoint: %s", resume_checkpoint)
+        else:
+            logger.warning(
+                "resume=True but no checkpoints found in %s — starting from scratch.", output_dir
+            )
+    else:
+        existing = _find_latest_checkpoint(output_dir)
+        if existing is not None:
+            logger.warning(
+                "Existing checkpoint found at %s. Pass resume=True to continue from it "
+                "instead of starting from scratch.",
+                existing,
+            )
+
+    # --- Train ---
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
+
+    # --- Merge LoRA weights before saving for inference compatibility ---
+    if use_lora:
+        model = model.merge_and_unload()
+        trainer.model = model
+
+    # --- Save model and tokenizer ---
+    trainer.save_model(str(output_dir))
+    tokenizer.save_pretrained(str(output_dir))
+
+    # --- Save label maps and hyperparams ---
+    with open(output_dir / "label2id.json", "w") as f:
+        json.dump(label2id, f, indent=2)
+    with open(output_dir / "id2label.json", "w") as f:
+        json.dump({str(k): v for k, v in id2label.items()}, f, indent=2)
+    with open(output_dir / "hyperparams.json", "w") as f:
+        json.dump(hp, f, indent=2)
+
+    metadata = {
+        "output_dir": str(output_dir),
+        "model_name": model_name,
+        "hyperparams": hp,
+        "label2id": label2id,
+        "id2label": id2label,
+        "log_history": trainer.state.log_history,
+    }
+    with open(output_dir / "training_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info("Training complete. Artifacts saved to %s", output_dir)
+    return trainer, tokenizer, metadata
