@@ -3,8 +3,8 @@
 Build API documentation for MultimodalVA.
 
 Usage:
-    python scripts/build_docs.py            # update docs/index.html in-place
-    python scripts/build_docs.py --check    # dry-run: exit 1 if changes needed
+    python docs/build_docs.py            # update docs/index.html in-place
+    python docs/build_docs.py --check    # dry-run: exit 1 if changes needed
 
 How it works:
     1. Reads Python source files and extracts function/class signatures and
@@ -770,7 +770,7 @@ def main() -> None:
 
     if check_only:
         if updated != original:
-            print("docs/index.html is out of date. Run: python scripts/build_docs.py", file=sys.stderr)
+            print("docs/index.html is out of date. Run: python docs/build_docs.py", file=sys.stderr)
             sys.exit(1)
         print("docs/index.html is up to date.")
     else:
