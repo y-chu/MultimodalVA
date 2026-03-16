@@ -10,6 +10,7 @@ Covers:
     F. Multi-meta-learner candidate selection (logistic regression vs lightgbm vs random_forest)
     G. Stage-by-stage execution (cross-session pattern: Stage 1 → Stage 2 → Stage 3)
     H. Post-run analysis: OOF meta-features, meta-scores, PredictionResult helpers
+    I. Multimodal: BioClinicalBERT + LightGBM + InSilicoVA (requires pyinsilicova)
 
 Run a single section::
 
@@ -956,6 +957,204 @@ def _show_dir_layout(output_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# I. InSilicoVA as a tabular base model
+# ---------------------------------------------------------------------------
+
+def demo_insilicova_base():
+    """Multimodal stack: BioClinicalBERT (text) + LightGBM + InSilicoVA (tabular).
+
+    Requires:  pip install pyinsilicova
+               BioClinicalBERT downloads automatically from HuggingFace Hub.
+
+    Why this combination:
+        Each base model captures a different signal source in the VA record:
+
+        BioClinicalBERT  — fine-tuned on free-text narratives; captures
+                           phrasing, symptom co-occurrence, and interviewer
+                           descriptions that don't fit a fixed questionnaire.
+
+        LightGBM         — trained on structured symptom indicators; fast,
+                           handles missing values natively, learns non-linear
+                           indicator interactions from data.
+
+        InSilicoVA       — population-calibrated Bayesian algorithm validated
+                           across 40+ LMIC settings; brings prior epidemiological
+                           knowledge that purely data-driven models may not learn
+                           from small training sets.
+
+        A logistic-regression meta-learner combines the three probability
+        vectors, learning which model to trust per cause and per context.
+
+    InSilicoVA notes:
+        - No training phase — uses a fixed WHO 2016 / PHMRC symptom-cause
+          database.  ``use_optimize`` is silently ignored.
+        - Needs raw DataFrame columns, not preprocessed numpy arrays.
+          The stacking pipeline routes insilicova specs automatically.
+        - ``cause_map`` maps your label column values → InSilicoVA output
+          column names.  Omit for auto case-insensitive matching (a warning
+          is logged for any unmatched cause).
+        - ``va_cols`` restricts which columns are passed to InSilicoVA.
+          In a real WHO 2016 study these are the standard indicator columns
+          (i019a, i022a, …).  Omit to pass all feature_cols.
+
+    Meta-feature matrix column layout (n_train × n_models*n_classes):
+        [bert_prob_0..C | lightgbm_prob_0..C | insilicova_prob_0..C]
+        Each block has one column per cause class, ordered by sorted class ID.
+    """
+    from multimodalva.ensemble.stacking import StackingClassifier
+
+    df = make_toy_df(n=300)
+
+    # --- Base model specs ----------------------------------------------------
+
+    # Text: BioClinicalBERT fine-tuned on open narratives
+    text_models = [
+        {
+            "model_name": "emilyalsentzer/Bio_ClinicalBERT",
+            "max_length":  128,        # 512 for real VA narratives
+            "use_lora":    False,
+            "hyperparams": {
+                "learning_rate": 2e-5,
+                "batch_size":    16,
+                "epochs":        3,
+                "freeze_layers": 2,    # freeze embeddings + 2 bottom layers
+                "weight_decay":  0.01,
+            },
+        },
+    ]
+
+    # Tabular feature columns (binary symptom indicators)
+    feature_cols = ["fever", "cough", "diarrhoea", "weight_loss", "bleeding",
+                    "difficulty_breathing", "duration_days"]
+
+    # cause_map: your label column values → InSilicoVA output column names.
+    # In a real WHO 2016 study, InSilicoVA uses its own validated cause list
+    # (e.g. "Acute resp infect incl pneumonia", "HIV/AIDS related death").
+    # The toy dataset labels are chosen to match InSilicoVA names closely, so
+    # auto-mapping (cause_map=None) would also work here.
+    cause_map = {
+        "Malaria":   "Malaria",
+        "Pneumonia": "Acute resp infect incl pneumonia",
+        "HIV/AIDS":  "HIV/AIDS related death",
+        "Diarrhoea": "Diarrhoeal diseases",
+        "Maternal":  "Maternal",
+    }
+
+    tabular_models = [
+        # Discriminative: learns symptom-cause patterns directly from labelled data
+        {
+            "model_name": "lightgbm",
+            "hyperparams": {
+                "n_estimators":  100,
+                "learning_rate": 0.05,
+                "max_depth":     4,
+                "num_leaves":    15,
+            },
+        },
+        # Bayesian VA algorithm: population-calibrated, no training required
+        {
+            "model_name":  "insilicova",
+            "data_type":   "WHO2016",
+            # va_cols not set → InSilicoVA receives all feature_cols
+            "cause_map":   cause_map,
+            "hyperparams": {
+                "n_sim":       4000,
+                "burnin":      2000,
+                "thin":        10,
+                "auto_length": False,  # use cause list as-is; set True to auto-select
+            },
+        },
+    ]
+
+    # --- Classifier ----------------------------------------------------------
+
+    clf = StackingClassifier(
+        text_models=text_models,
+        tabular_models=tabular_models,
+        output_dir="runs/stacking/multimodal_insilicova",
+        # Compare logistic regression vs lightgbm as meta-learner candidates.
+        # The better one (by 3-fold CV on OOF data) is selected automatically.
+        meta_learners=[
+            {"model_name": "logistic_regression",
+             "hyperparams": {"C": 1.0, "max_iter": 1000}},
+            {"model_name": "lightgbm",
+             "hyperparams": {"n_estimators": 50, "max_depth": 3}},
+        ],
+        meta_select_metric="f1_macro",
+        n_folds=3,
+        resume=True,
+    )
+
+    print("Base models  : BioClinicalBERT (text) | LightGBM | InSilicoVA")
+    print("Meta-learner : logistic_regression vs lightgbm  (CV-selected)")
+    print("Requires     : pip install pyinsilicova\n")
+
+    # --- Stage 1: OOF loop ---------------------------------------------------
+    # train_base_models() passes train_df to generate_oof_predictions()
+    # automatically; InSilicoVA fold predictions run on raw val DataFrame rows.
+    clf.train_base_models(
+        df=df,
+        label_col="cause",
+        text_col="open_narrative",
+        feature_cols=feature_cols,
+        test_size=0.2,
+        random_state=42,
+        stratify=True,
+        encode_categoricals="ordinal",
+        val_size=0.1,                      # internal val split for BERT early stopping
+        early_stopping_patience=2,
+        batch_size=32,
+        n_folds=3,
+    )
+
+    print(f"\nOOF meta-feature matrix shape: {clf.oof_meta_X.shape}")
+    print(f"  = {len(df) * 0.8:.0f} train rows  ×  "
+          f"(1 text + 2 tabular) × {len(clf.id2label)} classes")
+
+    # Show meta-feature column names for the first model block
+    oof_dir = Path("runs/stacking/multimodal_insilicova/oof")
+    if (oof_dir / "meta_feature_names.json").exists():
+        with open(oof_dir / "meta_feature_names.json") as fh:
+            names = json.load(fh)
+        nc = len(clf.id2label)
+        print(f"\nMeta-feature columns (first class, one per base model):")
+        print(f"  {names[0]:<55}  ← BioClinicalBERT")
+        print(f"  {names[nc]:<55}  ← LightGBM")
+        print(f"  {names[2 * nc]:<55}  ← InSilicoVA")
+
+    # --- Stage 2: meta-learner selection -------------------------------------
+    clf.train_meta_learner_stage(meta_cv_folds=3)
+    print(f"\nMeta-learner scores (f1_macro, 3-fold CV on OOF):")
+    for name, score in clf.meta_scores.items():
+        marker = " ← selected" if score == max(clf.meta_scores.values()) else ""
+        print(f"  {name:<30} {score:.4f}{marker}")
+
+    # --- Stage 3: test prediction --------------------------------------------
+    predictions = clf.predict_test(top_k=3)
+    top1 = predictions.top1
+    acc  = (top1["true_label"] == top1["predicted_label"]).mean()
+
+    from multimodalva.utils.metrics import score_predictions, log_loss_from_full
+    f1_macro = score_predictions(top1, "f1_macro")
+    csmf_acc = score_predictions(top1, "csmf_accuracy")
+    ll       = log_loss_from_full(predictions.full, clf.id2label)
+
+    print(f"\n=== BioClinicalBERT + LightGBM + InSilicoVA — stacked results ===")
+    print(f"  Accuracy      : {acc:.3f}")
+    print(f"  F1 macro      : {f1_macro:.3f}")
+    print(f"  CSMF accuracy : {csmf_acc:.3f}")
+    print(f"  Log loss      : {ll:.4f}")
+
+    print(f"\nTop-1 sample (5 rows):")
+    print(top1.head(5).to_string(index=False))
+
+    print(f"\nTop-3 sample (3 rows):")
+    print(predictions.topk.head(3).to_string(index=False))
+
+    return clf, predictions
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1024,3 +1223,9 @@ if __name__ == "__main__":
                 break
         else:
             print("No output dir found. Run section D or G first.")
+
+    if section == "I":
+        print("\n" + "=" * 60)
+        print("Section I: InSilicoVA as tabular base model (requires pyinsilicova)")
+        print("=" * 60)
+        demo_insilicova_base()

@@ -72,6 +72,37 @@ Multi-GPU / MPS:
     Tabular models: ``n_jobs=-1`` uses all CPU cores; GPU-capable models
     (lightgbm, catboost, xgboost) activate CUDA when ``use_gpu=True``.
 
+InSilicoVA base model:
+    Any tabular model spec may use ``model_name="insilicova"`` to include
+    PyInSilicoVA as a base model.  Key differences from sklearn tabular models:
+
+    * No training phase — InSilicoVA applies a fixed Bayesian symptom-cause
+      probability database (WHO 2016 or PHMRC), so ``use_optimize`` is ignored.
+    * Raw DataFrame required — ``train_df`` must be supplied to
+      :func:`generate_oof_predictions` (and is passed automatically by
+      :class:`StackingClassifier`).  InSilicoVA needs the original VA indicator
+      columns, not the preprocessed numpy arrays.
+    * Cause mapping — InSilicoVA's output uses its own cause-name strings
+      (e.g. ``"HIV/AIDS related death"``).  Supply ``cause_map`` in the spec
+      to map your label names to InSilicoVA column names::
+
+          {"HIV/AIDS": "HIV/AIDS related death", "Malaria": "Malaria", ...}
+
+      Omit ``cause_map`` for automatic case-insensitive matching (a warning is
+      logged for any unmatched causes, which receive probability 0).
+    * Columns — specify ``va_cols`` in the spec to restrict which indicator
+      columns are passed to InSilicoVA; defaults to ``feature_cols``.
+
+    Spec example::
+
+        {"model_name": "insilicova",
+         "data_type":  "WHO2016",          # "WHO2016" (default) or "PHMRC"
+         "va_cols":    [...],               # optional; defaults to feature_cols
+         "cause_map":  {"HIV/AIDS": "HIV/AIDS related death", ...},  # optional
+         "hyperparams": {"n_sim": 4000, "burnin": 2000, "thin": 10}}
+
+    Requires:  ``pip install pyinsilicova``
+
 Public API:
     generate_oof_predictions(...)
         Standalone k-fold OOF function for advanced users.
@@ -101,6 +132,9 @@ DEFAULT_META_LEARNER: dict = {
     "model_name":  "logistic_regression",
     "hyperparams": {"max_iter": 1000, "C": 1.0},
 }
+
+# Alias used to identify InSilicoVA specs throughout this module
+_INSILICOVA = "insilicova"
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +334,159 @@ def _score_meta_candidate(
 
 
 # ---------------------------------------------------------------------------
+# InSilicoVA integration helpers
+# ---------------------------------------------------------------------------
+
+def _insilicova_save_config(
+    spec: dict,
+    best_hp: dict | None,
+    label2id: dict,
+    id2label: dict,
+    feature_cols: list[str] | None,
+    output_dir: Path,
+) -> None:
+    """Persist InSilicoVA run configuration to *output_dir*.
+
+    InSilicoVA has no trainable weights — it applies a fixed Bayesian symptom-
+    cause probability database at inference time.  This function saves all
+    parameters needed to reproduce the prediction call, and writes a dummy
+    ``training_metadata.json`` so the standard resume-detection logic (which
+    looks for that file) works unchanged.
+
+    Args:
+        spec:          Model spec dict (``model_name="insilicova"``).
+        best_hp:       Hyperparams dict (``n_sim``, ``burnin``, ``thin``, …).
+                       Falls back to ``spec["hyperparams"]`` when ``None``.
+        label2id:      Shared label → integer map.
+        id2label:      Shared integer → label map.
+        feature_cols:  Fallback VA indicator columns when ``spec["va_cols"]``
+                       is absent.
+        output_dir:    Target directory (created if missing).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hp = best_hp or spec.get("hyperparams") or {}
+
+    config: dict = {
+        # cause_map: {user_label_name: InSilicoVA_column_name} or None (auto)
+        "cause_map":   spec.get("cause_map"),
+        # va_cols: raw VA indicator columns to pass to InSilicoVA
+        "va_cols":     spec.get("va_cols", feature_cols),
+        "data_type":   spec.get("data_type", "WHO2016"),
+        "hyperparams": hp,
+        "id2label":    {str(k): v for k, v in id2label.items()},
+        "label2id":    label2id,
+    }
+    with open(output_dir / "insilicova_config.json", "w") as fh:
+        json.dump(config, fh, indent=2)
+
+    # Dummy training_metadata.json — enables resume detection
+    with open(output_dir / "training_metadata.json", "w") as fh:
+        json.dump({"model_name": _INSILICOVA, "hyperparams": hp}, fh, indent=2)
+
+    logger.info("InSilicoVA config saved to %s", output_dir)
+
+
+def _insilicova_predict_df(
+    config_dir: Path,
+    df: pd.DataFrame,
+    sorted_ids: list,
+) -> np.ndarray:
+    """Run InSilicoVA on *df* and return a probability matrix.
+
+    Loads the config saved by :func:`_insilicova_save_config`, calls
+    ``InSilicoVA.run()``, then maps InSilicoVA's built-in cause names to the
+    canonical ``id2label`` ordering shared by all other base models.
+
+    Cause mapping
+    ~~~~~~~~~~~~~
+    InSilicoVA produces ``indiv_prob`` columns named by its internal cause
+    list (e.g. ``"HIV/AIDS related death"``, ``"Malaria"``).  These are mapped
+    to the pipeline's ``id2label`` values via ``cause_map`` (a
+    ``{user_label: insilicova_column}`` dict).  When ``cause_map`` is ``None``
+    in the config, auto-matching is attempted by case-insensitive string
+    comparison; a warning is logged for any unmatched causes, whose columns
+    receive probability 0.  Every row is renormalised to sum to 1.
+
+    Args:
+        config_dir:  Directory containing ``insilicova_config.json``.
+        df:          Raw VA DataFrame (cases × VA indicator columns).
+                     Pass ``reset_index(drop=True)`` so row positions align
+                     with InSilicoVA's output.
+        sorted_ids:  Sorted integer class IDs (from ``sorted(id2label.keys())``).
+
+    Returns:
+        np.ndarray of shape ``(len(df), len(sorted_ids))``.
+
+    Raises:
+        ImportError:  ``pyinsilicova`` is not installed.
+        FileNotFoundError:  ``insilicova_config.json`` missing in *config_dir*.
+    """
+    try:
+        from pyinsilicova.insilicova import InSilicoVA
+    except ImportError as exc:
+        raise ImportError(
+            "pyinsilicova is required for 'insilicova' base models.  "
+            "Install with:  pip install pyinsilicova"
+        ) from exc
+
+    with open(config_dir / "insilicova_config.json") as fh:
+        config = json.load(fh)
+
+    id2label  = {int(k): v for k, v in config["id2label"].items()}
+    cause_map: dict | None = config.get("cause_map")
+    va_cols   = config.get("va_cols")
+    data_type = config.get("data_type", "WHO2016")
+    hp        = {k: v for k, v in (config.get("hyperparams") or {}).items()}
+
+    va_data = df[va_cols].reset_index(drop=True) if va_cols else df.reset_index(drop=True)
+
+    logger.info("Running InSilicoVA on %d cases (data_type=%s) ...", len(va_data), data_type)
+    isva = InSilicoVA(va_data, data_type=data_type, **hp)
+    isva.run()
+    indiv_probs: pd.DataFrame = isva.indiv_prob  # rows = cases, cols = cause names
+
+    # Build cause_map on first call when not provided explicitly
+    if cause_map is None:
+        isva_lower = {c.lower(): c for c in indiv_probs.columns}
+        cause_map  = {}
+        for cid in sorted_ids:
+            label = id2label[cid]
+            if label.lower() in isva_lower:
+                cause_map[label] = isva_lower[label.lower()]
+
+        n_unmatched = len(sorted_ids) - len(cause_map)
+        if n_unmatched > 0:
+            unmatched = [
+                id2label[cid] for cid in sorted_ids
+                if id2label[cid] not in cause_map
+            ]
+            logger.warning(
+                "InSilicoVA: %d/%d cause(s) could not be auto-matched to "
+                "InSilicoVA cause names and will receive probability 0.  "
+                "Provide an explicit 'cause_map' in the spec to suppress this.  "
+                "Unmatched: %s",
+                n_unmatched, len(sorted_ids), unmatched,
+            )
+
+    n         = len(df)
+    n_classes = len(sorted_ids)
+    proba     = np.zeros((n, n_classes), dtype=float)
+
+    for j, cid in enumerate(sorted_ids):
+        label    = id2label[cid]
+        isva_col = cause_map.get(label)
+        if isva_col and isva_col in indiv_probs.columns:
+            proba[:, j] = indiv_probs[isva_col].to_numpy(dtype=float)
+
+    # Renormalise rows — handles unmatched causes and floating-point drift
+    row_sums = proba.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums == 0, 1.0, row_sums)
+    proba   /= row_sums
+
+    return proba
+
+
+# ---------------------------------------------------------------------------
 # Standalone OOF function
 # ---------------------------------------------------------------------------
 
@@ -329,6 +516,9 @@ def generate_oof_predictions(
     # optional pre-computed HP (from HPO stage; one dict per model in spec order)
     text_best_hp: list[dict] | None = None,
     tabular_best_hp: list[dict] | None = None,
+    # InSilicoVA — raw DataFrame needed for pyinsilicova (not numpy arrays)
+    train_df: pd.DataFrame | None = None,
+    feature_cols: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate out-of-fold probability predictions for all base models.
 
@@ -376,6 +566,13 @@ def generate_oof_predictions(
                          training sample i from every base model.
         ``oof_y``:       np.ndarray shape (n_train,) — original integer labels
                          in train-set order (identical to input ``y_train``).
+
+    Note:
+        When any ``tabular_model_specs`` entry has ``model_name="insilicova"``,
+        both ``train_df`` and ``feature_cols`` must be supplied.  InSilicoVA
+        operates on the raw VA DataFrame (not the preprocessed numpy arrays)
+        and has no separate training phase — the fold val rows are passed
+        directly to :func:`_insilicova_predict_df`.
     """
     from sklearn.model_selection import StratifiedKFold
 
@@ -467,32 +664,50 @@ def generate_oof_predictions(
             else:
                 model_dir.mkdir(parents=True, exist_ok=True)
                 model_name = spec["model_name"]
-                hp         = (tabular_best_hp[i] if tabular_best_hp else None) or spec.get("hyperparams")
-
                 logger.info("  [tab_%d fold_%d] Training %s ...", i, fold_idx, model_name)
-                tabular_train(
-                    X_train=X_train[train_idx],
-                    y_train=y_train[train_idx],
-                    label2id=label2id, id2label=id2label,
-                    model_name=model_name,
-                    output_dir=model_dir / "weights",
-                    hyperparams=hp,
-                    random_state=random_state,
-                    n_jobs=n_jobs, use_gpu=use_gpu,
-                )
 
-                result = tabular_predict(
-                    model_dir / "weights",
-                    X_test=X_train[val_idx],
-                    y_test=y_train[val_idx],
-                    top_k=1,
-                )
-                fold_probs = _extract_probs(result, sorted_ids)
+                if model_name == _INSILICOVA:
+                    # InSilicoVA has no training phase — save config, then
+                    # run directly on fold val rows from the raw DataFrame.
+                    if train_df is None:
+                        raise ValueError(
+                            "train_df must be supplied to generate_oof_predictions() "
+                            "when any tabular_model_spec has model_name='insilicova'."
+                        )
+                    hp = (tabular_best_hp[i] if tabular_best_hp else None) or spec.get("hyperparams") or {}
+                    _insilicova_save_config(
+                        spec, hp, label2id, id2label, feature_cols,
+                        model_dir / "weights",
+                    )
+                    fold_probs = _insilicova_predict_df(
+                        model_dir / "weights",
+                        train_df.iloc[val_idx].reset_index(drop=True),
+                        sorted_ids,
+                    )
+                else:
+                    hp = (tabular_best_hp[i] if tabular_best_hp else None) or spec.get("hyperparams")
+                    tabular_train(
+                        X_train=X_train[train_idx],
+                        y_train=y_train[train_idx],
+                        label2id=label2id, id2label=id2label,
+                        model_name=model_name,
+                        output_dir=model_dir / "weights",
+                        hyperparams=hp,
+                        random_state=random_state,
+                        n_jobs=n_jobs, use_gpu=use_gpu,
+                    )
+                    result = tabular_predict(
+                        model_dir / "weights",
+                        X_test=X_train[val_idx],
+                        y_test=y_train[val_idx],
+                        top_k=1,
+                    )
+                    fold_probs = _extract_probs(result, sorted_ids)
+                    if not save_fold_models:
+                        shutil.rmtree(model_dir / "weights", ignore_errors=True)
+
                 np.save(oof_probs_file, fold_probs)
                 logger.info("  [tab_%d fold_%d] OOF probs saved (%d samples)", i, fold_idx, len(val_idx))
-
-                if not save_fold_models:
-                    shutil.rmtree(model_dir / "weights", ignore_errors=True)
 
             col_s = (n_text + i) * n_classes
             oof_meta_X[val_idx, col_s:col_s + n_classes] = fold_probs
@@ -822,19 +1037,27 @@ class StackingClassifier:
 
         for i, spec in enumerate(self.tabular_models):
             if spec.get("use_optimize", False):
-                logger.info("Tabular model %d (%s): running HPO ...", i, spec["model_name"])
-                best_hp, _ = tab_optimize(
-                    X_train=X_train, y_train=y_train,
-                    label2id=label2id, id2label=id2label,
-                    model_name=spec["model_name"],
-                    output_dir=hpo_dir / f"tabular_{i}",
-                    n_trials=spec.get("n_trials", 20),
-                    metric=spec.get("optimize_metric", "f1_macro"),
-                    search_space=spec.get("search_space"),
-                    random_state=random_state,
-                    n_jobs=n_jobs, use_gpu=use_gpu,
-                )
-                self.tabular_best_hp.append(best_hp)
+                if spec["model_name"] == _INSILICOVA:
+                    logger.info(
+                        "Tabular model %d (insilicova): HPO not applicable — "
+                        "InSilicoVA uses a fixed Bayesian cause database.  "
+                        "Using spec hyperparams.", i
+                    )
+                    self.tabular_best_hp.append(spec.get("hyperparams") or {})
+                else:
+                    logger.info("Tabular model %d (%s): running HPO ...", i, spec["model_name"])
+                    best_hp, _ = tab_optimize(
+                        X_train=X_train, y_train=y_train,
+                        label2id=label2id, id2label=id2label,
+                        model_name=spec["model_name"],
+                        output_dir=hpo_dir / f"tabular_{i}",
+                        n_trials=spec.get("n_trials", 20),
+                        metric=spec.get("optimize_metric", "f1_macro"),
+                        search_space=spec.get("search_space"),
+                        random_state=random_state,
+                        n_jobs=n_jobs, use_gpu=use_gpu,
+                    )
+                    self.tabular_best_hp.append(best_hp)
             else:
                 self.tabular_best_hp.append(spec.get("hyperparams"))
 
@@ -869,6 +1092,8 @@ class StackingClassifier:
                 cleanup_fold_files=cleanup_fold_files,
                 text_best_hp=self.text_best_hp    or None,
                 tabular_best_hp=self.tabular_best_hp or None,
+                train_df=self.train_df,
+                feature_cols=feature_cols,
             )
 
         # Save OOF metadata for cross-session handoff
@@ -934,15 +1159,22 @@ class StackingClassifier:
 
             logger.info("Training final tabular model %d/%d: %s",
                         i + 1, len(self.tabular_models), spec["model_name"])
-            tab_train(
-                X_train=X_train, y_train=y_train,
-                label2id=label2id, id2label=id2label,
-                model_name=spec["model_name"],
-                output_dir=model_dir,
-                hyperparams=self.tabular_best_hp[i],
-                preprocessor=preprocessor, feature_names=feature_names,
-                random_state=random_state, n_jobs=n_jobs, use_gpu=use_gpu,
-            )
+
+            if spec["model_name"] == _INSILICOVA:
+                _insilicova_save_config(
+                    spec, self.tabular_best_hp[i], label2id, id2label,
+                    feature_cols, model_dir,
+                )
+            else:
+                tab_train(
+                    X_train=X_train, y_train=y_train,
+                    label2id=label2id, id2label=id2label,
+                    model_name=spec["model_name"],
+                    output_dir=model_dir,
+                    hyperparams=self.tabular_best_hp[i],
+                    preprocessor=preprocessor, feature_names=feature_names,
+                    random_state=random_state, n_jobs=n_jobs, use_gpu=use_gpu,
+                )
 
         logger.info("Stage 1 complete. OOF shape: %s", self.oof_meta_X.shape)
         return {
@@ -1139,10 +1371,15 @@ class StackingClassifier:
         X_test_npy = data_dir / "X_test.npy"
         y_test_npy = data_dir / "y_test.npy"
 
-        if self.tabular_models and X_test_npy.exists():
+        # Only load numpy arrays for sklearn-compatible (non-insilicova) models
+        has_sklearn_tabular = any(
+            s.get("model_name") != _INSILICOVA for s in self.tabular_models
+        )
+        X_test = y_test = None
+        if has_sklearn_tabular and X_test_npy.exists():
             X_test = np.load(X_test_npy)
             y_test = np.load(y_test_npy)
-        elif self.tabular_models:
+        elif has_sklearn_tabular:
             # Reconstruct from test_df (preprocessor re-applied)
             enc = (self._feature_cols and "ordinal") or "ordinal"
             (_, X_test, _, y_test,
@@ -1158,8 +1395,13 @@ class StackingClassifier:
             model_name = spec["model_name"]
 
             logger.info("Predicting test — final tabular model %d (%s) ...", i, model_name)
-            result     = tab_predict(model_dir, X_test, y_test, top_k=1)
-            fold_probs = _extract_probs(result, sorted_ids)
+
+            if model_name == _INSILICOVA:
+                # InSilicoVA runs on the raw test DataFrame, not numpy arrays
+                fold_probs = _insilicova_predict_df(model_dir, test_df, sorted_ids)
+            else:
+                result     = tab_predict(model_dir, X_test, y_test, top_k=1)
+                fold_probs = _extract_probs(result, sorted_ids)
 
             col_s = (len(self.text_models) + i) * n_classes
             meta_X_test[:, col_s:col_s + n_classes] = fold_probs
