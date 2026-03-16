@@ -31,7 +31,10 @@ from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 from sklearn.model_selection import StratifiedShuffleSplit
 
-from ..utils.metrics import csmf_accuracy, score_predictions, sample_hyperparams  # noqa: F401
+from ..utils.metrics import (  # noqa: F401
+    csmf_accuracy, score_predictions, sample_hyperparams,
+    log_loss_from_full, METRIC_DIRECTION,
+)
 from .predict import predict
 from .train import SUPPORTED_MODELS, train
 
@@ -142,9 +145,9 @@ def optimize(
         model_name:     Model alias — one of SUPPORTED_MODELS keys.
         output_dir:     Root directory for trial outputs and study database.
         n_trials:       Total Optuna trials. Default 20.
-        metric:         Metric to maximise — "accuracy", "f1_macro", "f1_weighted",
-                        "csmf_accuracy". Default "accuracy".
-                        Use "csmf_accuracy" or "f1_macro" for imbalanced VA data.
+        metric:         Metric to maximise — "accuracy", "balanced_accuracy",
+                        "f1_macro", "f1_weighted", "csmf_accuracy". Default "accuracy".
+                        Use "balanced_accuracy", "csmf_accuracy", or "f1_macro" for imbalanced VA data.
         search_space:   Custom search space dict. Merged over DEFAULT_SEARCH_SPACES[model_name].
         val_size:       Fraction of X_train for trial evaluation. Default 0.2.
         random_state:   Seed for stratified split and Optuna sampler. Default 42.
@@ -204,12 +207,13 @@ def optimize(
         )
         result = predict(trial_dir, X_opt_val, y_opt_val)
 
-        # Compute all 4 metrics; store as user attributes for traceability.
+        # Compute all metrics; store as user attributes for traceability.
         # Only `metric` drives Optuna's optimisation.
         all_scores = {
             m: score_predictions(result.top1, m)
-            for m in ("accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+            for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
         }
+        all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
         for name, val in all_scores.items():
             trial.set_user_attr(name, val)
 
@@ -221,7 +225,7 @@ def optimize(
         else optuna.pruners.NopPruner()
     )
     study = optuna.create_study(
-        direction="maximize",
+        direction=METRIC_DIRECTION.get(metric, "maximize"),
         sampler=TPESampler(seed=random_state),
         pruner=pruner,
         study_name=study_name,
@@ -344,9 +348,11 @@ def _tabular_ray_trial_fn(
 
     all_scores: dict = {
         "accuracy": 0.0,
+        "balanced_accuracy": 0.0,
         "f1_macro": 0.0,
         "f1_weighted": 0.0,
         "csmf_accuracy": 0.0,
+        "log_loss": float("inf"),  # minimised — inf signals trial failure
     }
     try:
         train(
@@ -363,8 +369,9 @@ def _tabular_ray_trial_fn(
         result = predict(trial_dir, X_opt_val, y_opt_val)
         all_scores = {
             m: score_predictions(result.top1, m)
-            for m in ("accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+            for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
         }
+        all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
     finally:
         # ray.train.report() must always be called so Ray records the outcome
         # rather than leaving the trial in RUNNING state indefinitely.
@@ -460,8 +467,8 @@ def optimize_ray(
         output_dir:     Root directory for all Ray Tune artifacts.  Use a
                         shared filesystem path for multi-node clusters.
         n_trials:       Total number of trials. Default 20.
-        metric:         Metric to maximise — ``"accuracy"``, ``"f1_macro"``,
-                        ``"f1_weighted"``, ``"csmf_accuracy"``. Default ``"accuracy"``.
+        metric:         Metric to maximise — ``"accuracy"``, ``"balanced_accuracy"``,
+                        ``"f1_macro"``, ``"f1_weighted"``, ``"csmf_accuracy"``. Default ``"accuracy"``.
         search_space:   Custom search space dict (same format as
                         :func:`optimize`). Merged over
                         ``DEFAULT_SEARCH_SPACES[model_name]``.
@@ -585,9 +592,10 @@ def optimize_ray(
         )
 
     # --- Search algorithm: OptunaSearch (TPE) ---
+    _ray_mode = "min" if METRIC_DIRECTION.get(metric, "maximize") == "minimize" else "max"
     search_alg: object = OptunaSearch(
         metric=metric,
-        mode="max",
+        mode=_ray_mode,
         seed=random_state,
     )
     if max_concurrent_trials is not None:
@@ -622,7 +630,7 @@ def optimize_ray(
         param_space=ray_space,
         tune_config=tune.TuneConfig(
             metric=metric,
-            mode="max",
+            mode=_ray_mode,
             num_samples=n_trials,
             search_alg=search_alg,
             max_concurrent_trials=max_concurrent_trials,
@@ -642,7 +650,7 @@ def optimize_ray(
     results = tuner.fit()
 
     # --- Extract best result ---
-    best_result = results.get_best_result(metric=metric, mode="max")
+    best_result = results.get_best_result(metric=metric, mode=_ray_mode)
     best_hyperparams = best_result.config
 
     with open(output_dir / "best_hyperparams_ray.json", "w") as fh:

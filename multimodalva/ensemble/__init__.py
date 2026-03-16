@@ -47,7 +47,7 @@ Usage quick-start::
     results = clf.run(df, text_col="narrative", feature_cols=[...], label_col="cause")
 """
 
-from .data_fusion import DataFusionClassifier
+from .data_fusion import DataFusionClassifier, qdesc_feature_overlap
 from .feature_fusion import FeatureFusionClassifier
 from .voting import SoftVotingClassifier
 from .stacking import StackingClassifier
@@ -59,4 +59,5 @@ __all__ = [
     "FeatureFusionClassifier",
     "SoftVotingClassifier",
     "StackingClassifier",
+    "qdesc_feature_overlap",
 ]

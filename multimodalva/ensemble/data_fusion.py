@@ -33,6 +33,9 @@ Question descriptions (qdesc):
 Public API:
     load_qdesc(path)
         — load qdesc.csv from utils/ (or a custom path)
+    qdesc_feature_overlap(feature_cols, qdesc, qdesc_path, detail, plot)
+        — compare feature columns against qdesc indic values; reports coverage
+          before a data-fusion run
     tabular_to_text(row, feature_cols, qdesc, templates, binary_map,
                     with_neg, prefix_cols, yes_no_map, group_symptoms)
         — convert one DataFrame row's features to a natural-language string
@@ -139,6 +142,154 @@ def _get_default_qdesc() -> pd.DataFrame | None:
             )
             return None
     return _QDESC_CACHE
+
+
+def qdesc_feature_overlap(
+    feature_cols: list[str],
+    qdesc: "pd.DataFrame | None" = None,
+    *,
+    qdesc_path: "str | Path | None" = None,
+    detail: bool = False,
+    plot: bool = True,
+) -> dict:
+    """Compare feature columns against qdesc indicator names.
+
+    Useful before a data-fusion run: shows which tabular columns will be
+    converted to natural language (overlap), which will be silently skipped by
+    ``tabular_to_text()`` (only in data — add ``templates=`` to cover these),
+    and which qdesc entries have no matching data column (only in qdesc).
+
+    Args:
+        feature_cols: Column names present in the tabular DataFrame.
+        qdesc:        qdesc DataFrame with at least an ``indic`` column.
+                      When ``None``, auto-loaded from ``utils/qdesc.csv``
+                      (same cached copy used by ``tabular_to_text()``).
+                      Pass the result of ``load_qdesc()`` to use a custom file.
+        qdesc_path:   Path to a qdesc CSV or Excel file.  Only used when
+                      ``qdesc`` is ``None`` and the default path is wrong.
+        detail:       When ``True``, the returned dict also includes
+                      ``only_data`` (sorted list) and ``only_qdesc_df``
+                      (DataFrame with ``sdesc`` / ``type`` columns when
+                      available).  Default ``False``.
+        plot:         Show a bar chart of the three set sizes.  Default True.
+
+    Returns:
+        dict with keys:
+
+            ``n_features``   — number of feature columns supplied
+            ``n_qdesc``      — number of unique indic values in qdesc
+            ``n_overlap``    — columns present in both
+            ``n_only_data``  — columns present in data but not in qdesc
+            ``n_only_qdesc`` — qdesc indicators absent from data
+            ``overlap_df``   — DataFrame (``indicator``, ``sdesc``, ``type``)
+                               for the overlapping indicators
+
+            When ``detail=True``, also:
+
+            ``only_data``     — sorted list of columns only in the data
+            ``only_qdesc_df`` — DataFrame (``indicator``, ``sdesc``, ``type``)
+                                for qdesc entries absent from the data
+
+    Raises:
+        ValueError: If qdesc cannot be loaded or has no ``indic`` column.
+
+    Example::
+
+        from multimodalva.ensemble.data_fusion import load_qdesc, qdesc_feature_overlap
+
+        # Quick summary + bar chart (auto-loads qdesc.csv)
+        result = qdesc_feature_overlap(feature_cols)
+
+        # Inspect unmapped columns before building templates=
+        result = qdesc_feature_overlap(feature_cols, detail=True, plot=False)
+        print(result["only_data"])       # → add these to templates= in build_fused_text
+        print(result["overlap_df"])      # → these will be rendered via qdesc
+    """
+    # ── Load qdesc ──────────────────────────────────────────────────────────
+    if qdesc is None:
+        if qdesc_path is not None:
+            qdesc = load_qdesc(qdesc_path)
+        else:
+            qdesc = _get_default_qdesc()
+            if qdesc is None:
+                raise ValueError(
+                    "utils/qdesc.csv not found.  "
+                    "Pass the DataFrame directly via qdesc= or supply qdesc_path=."
+                )
+
+    if "indic" not in qdesc.columns:
+        raise ValueError(
+            f"qdesc DataFrame must contain an 'indic' column.  "
+            f"Found columns: {list(qdesc.columns)}."
+        )
+
+    # ── Build sets ──────────────────────────────────────────────────────────
+    feat_set  = set(feature_cols)
+    qdesc_set = set(qdesc["indic"].dropna().astype(str))
+
+    overlap       = sorted(feat_set & qdesc_set)
+    only_in_data  = sorted(feat_set - qdesc_set)
+    only_in_qdesc = sorted(qdesc_set - feat_set)
+
+    logger.info(
+        "Feature columns: %d  |  qdesc indic: %d  |  "
+        "Overlap: %d  |  Only in data: %d  |  Only in qdesc: %d",
+        len(feat_set), len(qdesc_set),
+        len(overlap), len(only_in_data), len(only_in_qdesc),
+    )
+
+    # ── Build DataFrames ────────────────────────────────────────────────────
+    qdesc_indexed = qdesc.set_index("indic")
+    extra_cols    = [c for c in ("sdesc", "type") if c in qdesc_indexed.columns]
+
+    def _build_df(keys: list[str]) -> pd.DataFrame:
+        valid = [k for k in keys if k in qdesc_indexed.index]
+        if not valid:
+            return pd.DataFrame(columns=["indicator"] + extra_cols)
+        sub = qdesc_indexed.loc[valid, extra_cols].reset_index()
+        return sub.rename(columns={"indic": "indicator"})[["indicator"] + extra_cols]
+
+    overlap_df = _build_df(overlap)
+
+    # ── Plot ────────────────────────────────────────────────────────────────
+    if plot:
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
+        labels  = ["Overlap\n(both)", "Only in\ndata", "Only in\nqdesc"]
+        counts  = [len(overlap), len(only_in_data), len(only_in_qdesc)]
+        colours = ["steelblue", "orange", "grey"]
+
+        _, ax = plt.subplots(figsize=(6, 4))
+        bars = ax.bar(labels, counts, color=colours, edgecolor="white", width=0.5)
+        for bar, cnt in zip(bars, counts):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(counts) * 0.01,
+                str(cnt),
+                ha="center", va="bottom", fontsize=11, fontweight="bold",
+            )
+        ax.set_ylabel("Number of indicators")
+        ax.set_title(
+            f"qdesc / feature-column overlap\n"
+            f"({len(feat_set)} feature cols · {len(qdesc_set)} qdesc indic)"
+        )
+        ax.grid(True, axis="y", alpha=0.35)
+        plt.tight_layout()
+        plt.show()
+
+    # ── Return ──────────────────────────────────────────────────────────────
+    result: dict = {
+        "n_features":   len(feat_set),
+        "n_qdesc":      len(qdesc_set),
+        "n_overlap":    len(overlap),
+        "n_only_data":  len(only_in_data),
+        "n_only_qdesc": len(only_in_qdesc),
+        "overlap_df":   overlap_df,
+    }
+    if detail:
+        result["only_data"]     = only_in_data
+        result["only_qdesc_df"] = _build_df(only_in_qdesc)
+    return result
 
 
 def _is_positive(val) -> bool:

@@ -29,7 +29,10 @@ from optuna.samplers import TPESampler
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
 
-from ..utils.metrics import csmf_accuracy, score_predictions, sample_hyperparams  # noqa: F401
+from ..utils.metrics import (  # noqa: F401
+    csmf_accuracy, score_predictions, sample_hyperparams,
+    log_loss_from_full, METRIC_DIRECTION,
+)
 from .predict import predict
 from .train import _get_dataset_labels, train
 
@@ -84,6 +87,25 @@ DEFAULT_SEARCH_SPACE: dict = {
     "freeze_layers": ("categorical", [0, 2, 4, 6]),
 }
 
+# Focal loss search space (merged in when use_focal=True).
+# loss_type is fixed to "focal" — only the tunable focal parameters are searched.
+# Recommended HPO metric when using focal: "f1_macro", "balanced_accuracy",
+# or "csmf_accuracy".  Avoid "log_loss" (focal loss distorts calibration).
+FOCAL_SEARCH_SPACE: dict = {
+    # Focus strength γ — how aggressively easy examples are down-weighted.
+    # γ=0 reduces to standard CE.  γ=2 is the RetinaNet default and covers
+    # most VA imbalance settings.  γ>3 is rarely beneficial and can cause
+    # gradient instability on very small classes.
+    "focal_gamma": ("float", 0.5, 5.0),
+
+    # Per-class alpha weights (α) — rebalances the gradient contribution
+    # across classes before the focal term is applied.
+    # "effective_n" (Cui et al. 2019) is recommended when any class has
+    # fewer than ~10 training samples; it prevents weight blow-up.
+    # "balanced" (sklearn) is adequate for moderate imbalance.
+    "class_weights": ("categorical", ["balanced", "effective_n"]),
+}
+
 # Additional LoRA search space entries (merged in when use_lora=True)
 LORA_SEARCH_SPACE: dict = {
     # Rank of the LoRA low-rank decomposition — controls adapter capacity.
@@ -115,6 +137,7 @@ def optimize(
     random_state: int = 42,
     study_name: str = "text_hpo",
     use_lora: bool = False,
+    use_focal: bool = False,
     gradient_checkpointing: bool = False,
     early_stopping_patience: int | None = 3,
     storage_path: str | None = None,
@@ -140,16 +163,22 @@ def optimize(
         model_name: HuggingFace model name or local path.
         output_dir: Root directory for all trial outputs.
         n_trials: Total number of Optuna trials to run. Default 20.
-        metric: Metric to maximise — "accuracy", "f1_macro", "f1_weighted",
-                "csmf_accuracy". Default "accuracy".
-                Use "csmf_accuracy" or "f1_macro" for imbalanced VA data.
+        metric: Metric to maximise — "accuracy", "balanced_accuracy",
+                "f1_macro", "f1_weighted", "csmf_accuracy". Default "accuracy".
+                Use "balanced_accuracy", "csmf_accuracy", or "f1_macro" for imbalanced VA data.
         search_space: Dict defining parameter ranges. Defaults to DEFAULT_SEARCH_SPACE
-                      (plus LORA_SEARCH_SPACE when use_lora=True).
+                      (plus LORA_SEARCH_SPACE when use_lora=True, plus
+                      FOCAL_SEARCH_SPACE when use_focal=True).
         val_size: Fraction of train_dataset held out for trial evaluation. Default 0.2.
         random_state: Seed for the internal stratified split and Optuna sampler.
                       Default 42.
         study_name: Name for the Optuna study. Default "text_hpo".
         use_lora: Apply LoRA adapters during each trial. Default False.
+        use_focal: Use focal loss during each trial.  When True, merges
+                   FOCAL_SEARCH_SPACE (focal_gamma, class_weights) and fixes
+                   loss_type="focal" in every trial's hyperparams.
+                   Recommended for severe class imbalance; pair with
+                   metric="f1_macro" or "balanced_accuracy". Default False.
         gradient_checkpointing: Enable gradient checkpointing per trial. Default False.
         early_stopping_patience: Early stopping patience passed to each trial's train().
                                   Set to None to disable. Default 3.
@@ -176,6 +205,8 @@ def optimize(
     active_space = dict(DEFAULT_SEARCH_SPACE)
     if use_lora:
         active_space.update(LORA_SEARCH_SPACE)
+    if use_focal:
+        active_space.update(FOCAL_SEARCH_SPACE)
     if search_space:
         active_space.update(search_space)
 
@@ -200,6 +231,8 @@ def optimize(
         import torch
 
         hp = sample_hyperparams(trial, active_space)
+        if use_focal:
+            hp["loss_type"] = "focal"
         trial_dir = output_dir / f"trial_{trial.number}"
 
         try:
@@ -226,8 +259,9 @@ def optimize(
             # in study.trials_dataframe() as user_attrs_* columns.
             all_scores = {
                 m: score_predictions(result.top1, m)
-                for m in ("accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
             }
+            all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
             for name, val in all_scores.items():
                 trial.set_user_attr(name, val)
             score = all_scores[metric]
@@ -246,7 +280,7 @@ def optimize(
         else optuna.pruners.NopPruner()
     )
     study = optuna.create_study(
-        direction="maximize",
+        direction=METRIC_DIRECTION.get(metric, "maximize"),
         sampler=TPESampler(seed=random_state),
         pruner=pruner,
         study_name=study_name,
@@ -340,6 +374,7 @@ def _ray_trial_fn(
     id2label: dict,
     model_name: str,
     use_lora: bool,
+    use_focal: bool,
     gradient_checkpointing: bool,
     early_stopping_patience: int | None,
 ) -> None:
@@ -366,11 +401,16 @@ def _ray_trial_fn(
 
     trial_dir = Path(_ray_train.get_context().get_trial_dir())
 
+    if use_focal:
+        config = {**config, "loss_type": "focal"}
+
     all_scores: dict = {
         "accuracy": 0.0,
+        "balanced_accuracy": 0.0,
         "f1_macro": 0.0,
         "f1_weighted": 0.0,
         "csmf_accuracy": 0.0,
+        "log_loss": float("inf"),  # minimised — inf signals trial failure
     }
     try:
         train(
@@ -393,8 +433,9 @@ def _ray_trial_fn(
         result = predict(trial_dir, opt_val)
         all_scores = {
             m: score_predictions(result.top1, m)
-            for m in ("accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+            for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
         }
+        all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
     finally:
         # Free GPU/MPS memory before Ray marks the trial slot as available.
         torch.cuda.empty_cache()
@@ -417,6 +458,7 @@ def optimize_ray(
     val_size: float = 0.2,
     random_state: int = 42,
     use_lora: bool = False,
+    use_focal: bool = False,
     gradient_checkpointing: bool = False,
     early_stopping_patience: int | None = 3,
     # ---- Ray cluster / resource settings --------------------------------
@@ -503,17 +545,20 @@ def optimize_ray(
                     shared filesystem when running on a multi-node cluster.
                     S3/GCS URIs are also accepted (requires ``pyarrow``).
         n_trials: Total number of trials. Default 20.
-        metric: Metric to maximise — ``"accuracy"``, ``"f1_macro"``,
-                ``"f1_weighted"``, ``"csmf_accuracy"``. Default ``"accuracy"``.
-                Use ``"csmf_accuracy"`` or ``"f1_macro"`` for imbalanced VA data.
+        metric: Metric to maximise — ``"accuracy"``, ``"balanced_accuracy"``,
+                ``"f1_macro"``, ``"f1_weighted"``, ``"csmf_accuracy"``. Default ``"accuracy"``.
+                Use ``"balanced_accuracy"``, ``"csmf_accuracy"``, or ``"f1_macro"`` for imbalanced VA data.
         search_space: Same ``(type, *args)`` format as :func:`optimize`.
                       Defaults to :data:`DEFAULT_SEARCH_SPACE` (plus
-                      :data:`LORA_SEARCH_SPACE` when ``use_lora=True``).
+                      :data:`LORA_SEARCH_SPACE` when ``use_lora=True``, plus
+                      :data:`FOCAL_SEARCH_SPACE` when ``use_focal=True``).
         val_size: Fraction of train_dataset held out for trial evaluation.
                   Default 0.2.
         random_state: Seed for the stratified split and OptunaSearch sampler.
                       Default 42.
         use_lora: Apply LoRA adapters during each trial. Default False.
+        use_focal: Use focal loss during each trial.  Merges FOCAL_SEARCH_SPACE
+                   and fixes loss_type="focal" per trial.  Default False.
         gradient_checkpointing: Enable gradient checkpointing. Default False.
         early_stopping_patience: Early stopping patience per trial. Default 3.
         ray_address: Ray cluster address.
@@ -564,6 +609,8 @@ def optimize_ray(
     active_space = dict(DEFAULT_SEARCH_SPACE)
     if use_lora:
         active_space.update(LORA_SEARCH_SPACE)
+    if use_focal:
+        active_space.update(FOCAL_SEARCH_SPACE)
     if search_space:
         active_space.update(search_space)
     ray_space = _to_ray_space(active_space)
@@ -615,9 +662,10 @@ def optimize_ray(
     # --- Search algorithm: OptunaSearch (TPE) ---
     # OptunaSearch shares the acquisition function across parallel workers so
     # the search remains sample-efficient even with many concurrent trials.
+    _ray_mode = "min" if METRIC_DIRECTION.get(metric, "maximize") == "minimize" else "max"
     search_alg: object = OptunaSearch(
         metric=metric,
-        mode="max",
+        mode=_ray_mode,
         seed=random_state,
     )
     if max_concurrent_trials is not None:
@@ -639,6 +687,7 @@ def optimize_ray(
         id2label=id2label,
         model_name=model_name,
         use_lora=use_lora,
+        use_focal=use_focal,
         gradient_checkpointing=gradient_checkpointing,
         early_stopping_patience=early_stopping_patience,
     )
@@ -655,7 +704,7 @@ def optimize_ray(
         param_space=ray_space,
         tune_config=tune.TuneConfig(
             metric=metric,
-            mode="max",
+            mode=_ray_mode,
             num_samples=n_trials,
             search_alg=search_alg,
             # max_concurrent_trials=None lets Ray fill all available GPU slots
@@ -679,7 +728,7 @@ def optimize_ray(
     results = tuner.fit()
 
     # --- Extract best result ---
-    best_result = results.get_best_result(metric=metric, mode="max")
+    best_result = results.get_best_result(metric=metric, mode=_ray_mode)
     best_hyperparams = best_result.config
 
     with open(output_dir / "best_hyperparams_ray.json", "w") as fh:

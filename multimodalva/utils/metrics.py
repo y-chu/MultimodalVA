@@ -6,14 +6,25 @@ Public API:
     csmf_accuracy(y_true, y_pred)           — WHO/InsilicoVA population-level metric
     cccsmf_accuracy(y_true, y_pred)         — chance-corrected CSMF accuracy
     score_predictions(top1_df, metric)      — scalar score from a top1 DataFrame
+    log_loss_from_full(full_df, id2label)   — log loss from a full probability DataFrame
     sample_hyperparams(trial, search_space) — Optuna trial → hyperparameter dict
+
+Constants:
+    METRIC_DIRECTION  — maps metric name → "minimize" | "maximize" for study creation
 """
 
 from __future__ import annotations
 
 import numpy as np
 import optuna
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+
+# Metrics where lower is better.  All others default to "maximize".
+# Used by text/hpo.py and tabular/hpo.py when creating Optuna studies and
+# configuring Ray Tune's search direction.
+METRIC_DIRECTION: dict[str, str] = {
+    "log_loss": "minimize",
+}
 
 
 def csmf_accuracy(y_true, y_pred) -> float:
@@ -97,7 +108,8 @@ def score_predictions(top1_df, metric: str) -> float:
     Args:
         top1_df: DataFrame with columns ``true_label`` and ``predicted_label``.
                  Pass ``result.top1`` from a PredictionResult.
-        metric:  One of "accuracy", "f1_macro", "f1_weighted", "csmf_accuracy".
+        metric:  One of "accuracy", "balanced_accuracy", "f1_macro",
+                 "f1_weighted", "csmf_accuracy".
 
     Returns:
         Scalar score (higher is better for all supported metrics).
@@ -109,6 +121,8 @@ def score_predictions(top1_df, metric: str) -> float:
     y_pred = top1_df["predicted_label"]
     if metric == "accuracy":
         return accuracy_score(y_true, y_pred)
+    if metric == "balanced_accuracy":
+        return balanced_accuracy_score(y_true, y_pred)
     if metric == "f1_macro":
         return f1_score(y_true, y_pred, average="macro", zero_division=0)
     if metric == "f1_weighted":
@@ -117,8 +131,67 @@ def score_predictions(top1_df, metric: str) -> float:
         return csmf_accuracy(y_true, y_pred)
     raise ValueError(
         f"Unknown metric '{metric}'. "
-        "Choose from: accuracy, f1_macro, f1_weighted, csmf_accuracy."
+        "Choose from: accuracy, balanced_accuracy, f1_macro, f1_weighted, csmf_accuracy, log_loss."
+        "  Note: log_loss requires the full probability DataFrame — use log_loss_from_full()."
     )
+
+
+def log_loss_from_full(full_df: "pd.DataFrame", id2label: dict) -> float:
+    """Compute log loss (cross-entropy) from a full probability DataFrame.
+
+    Measures calibration quality: how well the predicted probability
+    distributions match the true labels.  **Lower is better**; 0.0 is perfect.
+
+    Unlike accuracy / F1 / CSMF, which only look at the argmax prediction,
+    log loss penalises overconfident wrong predictions heavily.  This makes it
+    especially important for ensemble methods (soft voting, stacking) that
+    consume the raw probability matrix — poorly calibrated probabilities
+    degrade ensemble performance even when individual top-1 accuracy is high.
+
+    Args:
+        full_df:   The ``full`` DataFrame from a ``PredictionResult``.
+                   Expected columns: ``true_label``, ``prob_0``, ``prob_1``, …
+                   Pass ``result.full`` directly.
+        id2label:  Integer class ID → label string mapping.
+                   Keys may be ``int`` or ``str`` (both handled).
+
+    Returns:
+        Log loss (cross-entropy) as a float ≥ 0.  Lower is better.
+
+    Raises:
+        ValueError: If ``full_df`` has no ``prob_*`` columns or lacks
+                    ``true_label``, or if ``id2label`` is missing an entry.
+    """
+    import pandas as pd  # noqa: PLC0415
+    from sklearn.metrics import log_loss  # noqa: PLC0415
+
+    if "true_label" not in full_df.columns:
+        raise ValueError("full_df must contain a 'true_label' column.")
+
+    prob_cols = sorted(
+        [c for c in full_df.columns if str(c).startswith("prob_")],
+        key=lambda x: int(str(x).split("_")[1]),
+    )
+    if not prob_cols:
+        raise ValueError(
+            "full_df has no prob_* columns.  Pass result.full directly."
+        )
+
+    y_true  = full_df["true_label"]
+    y_proba = full_df[prob_cols].values
+
+    # Build ordered label list matching the prob column order
+    labels = []
+    for i in range(len(prob_cols)):
+        label = id2label.get(i, id2label.get(str(i)))
+        if label is None:
+            raise ValueError(
+                f"id2label has no entry for class index {i}.  "
+                f"Available keys: {list(id2label.keys())[:10]}."
+            )
+        labels.append(label)
+
+    return float(log_loss(y_true, y_proba, labels=labels))
 
 
 def sample_hyperparams(trial: optuna.Trial, search_space: dict) -> dict:

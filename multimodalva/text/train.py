@@ -45,15 +45,22 @@ DEFAULT_HYPERPARAMS: dict = {
     "warmup_ratio": 0.1,               # fraction of steps for LR warm-up; 0.06–0.1 typical
     "gradient_accumulation_steps": 1,  # multiply effective batch size; use 2–8 when GPU memory is limited
     # Regularisation
-    "label_smoothing": 0.0,            # set 0.05–0.1 to reduce overconfidence; recommended for imbalanced classes
+    "label_smoothing": 0.0,            # set 0.05–0.1 to reduce overconfidence; set 0.0 when using focal loss
     "max_grad_norm": 1.0,              # gradient clipping; lower to 0.5 if loss spikes on small data
     # Data loading
     "dataloader_num_workers": 2,       # parallel CPU workers per GPU; 4–8 on multi-core systems
     # Layer freezing — active by default for supported architectures (bert, roberta, longformer, bigbird, electra)
     # Skipped with a warning for unsupported architectures; set 0 to disable entirely
     "freeze_layers": 2,                # freeze embeddings + bottom N encoder layers; increase to 6 for very small datasets
-    # Optional keys (not active by default — uncomment and set as needed)
-    # "class_weights": "balanced"      # auto-compute from training labels; or list of floats by class ID
+    # Optional keys (not active by default — set as needed)
+    # "loss_type": "focal"             # "cross_entropy" (default) | "focal" — use focal for severe class imbalance
+    # "focal_gamma": 2.0               # focal loss focus strength; 2.0 is the standard (Lin et al. 2017)
+    #                                  # higher γ (3–5) suppresses easy examples more aggressively
+    # "class_weights": "balanced"      # "balanced" (sklearn), "effective_n" (Cui et al. 2019, recommended
+    #                                  # for extreme imbalance), or list of floats ordered by class ID.
+    #                                  # "effective_n" prevents weight blow-up when any class has < 5 samples.
+    #                                  # Recommended combination for severe VA imbalance: loss_type="focal" +
+    #                                  # class_weights="effective_n" + label_smoothing=0.0 + metric="f1_macro"
 }
 
 # LoRA-specific defaults (only applied when use_lora=True)
@@ -251,19 +258,59 @@ def freeze_model_layers(model, freeze_layers: int):
     return model
 
 
+def _compute_effective_n_weights(
+    labels_list: list[int],
+    num_labels: int,
+    beta: float = 0.9999,
+) -> np.ndarray:
+    """Compute per-class weights using the effective number of samples formula.
+
+    Cui et al. (2019) "Class-Balanced Loss Based on Effective Number of Samples"
+    (https://arxiv.org/abs/1901.05555).
+
+    The effective number of samples for a class with n training examples is:
+        E_n = (1 - beta^n) / (1 - beta)
+
+    For small n, E_n ≈ n (no correction needed).  For large n, E_n saturates,
+    preventing the weight for common classes from collapsing to near zero.
+
+    Compared to sklearn's "balanced" (weight = N / (C * n_c)):
+    - Prevents weight blow-up when any class has very few samples (< 5)
+    - More numerically stable for the long-tailed VA cause distribution
+    - beta=0.9999 is the standard value for datasets of 5 000–50 000 samples
+
+    Args:
+        labels_list: Integer class labels from the training set.
+        num_labels:  Total number of classes (including unseen ones).
+        beta:        Smoothing factor in (0, 1).  0.9999 suits most VA datasets.
+                     Lower values (0.99) for very small datasets (< 500 samples).
+
+    Returns:
+        Array of shape (num_labels,) with per-class weights, normalised so the
+        mean weight equals 1.0 (preserves the overall gradient scale).
+    """
+    counts = np.bincount(labels_list, minlength=num_labels).astype(float)
+    counts = np.maximum(counts, 1.0)          # avoid division by zero for unseen classes
+    effective_n = (1.0 - beta ** counts) / (1.0 - beta)
+    weights = 1.0 / effective_n
+    weights = weights / weights.mean()        # normalise: mean weight = 1.0
+    return weights
+
+
 class WeightedTrainer(Trainer):
     """Trainer subclass that applies per-class loss weights for class imbalance.
 
     Also re-applies label_smoothing_factor from TrainingArguments so that
     both class_weights and label_smoothing work correctly together.
-    Used automatically by train() when hp["class_weights"] is set.
+    Used automatically by train() when hp["class_weights"] is set and
+    hp["loss_type"] is not "focal".
     """
 
     def __init__(self, *args, class_weights: torch.Tensor, **kwargs):
         super().__init__(*args, **kwargs)
         self.class_weights = class_weights
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    def compute_loss(self, model, inputs, return_outputs=False, **_kwargs):
         labels = inputs.get("labels")
         outputs = model(**inputs)
         logits = outputs.logits
@@ -275,6 +322,86 @@ class WeightedTrainer(Trainer):
             logits.view(-1, self.model.config.num_labels),
             labels.view(-1),
         )
+        return (loss, outputs) if return_outputs else loss
+
+
+class FocalLossTrainer(Trainer):
+    """Trainer subclass implementing softmax focal loss for severe class imbalance.
+
+    Focal loss (Lin et al. 2017, RetinaNet) down-weights easy, well-classified
+    examples so the model focuses training budget on hard or rare cases:
+
+        FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    where ``p_t`` is the softmax probability assigned to the true class,
+    ``gamma`` controls the focus strength, and ``alpha_t`` is an optional
+    per-class weight (same role as class_weights in WeightedTrainer).
+
+    Compared to WeightedTrainer (weighted cross-entropy):
+    - Re-weights within each class based on prediction confidence, not just
+      across classes — benefits both rare and hard majority-class examples
+    - Requires a good alpha initialisation (class_weights) to be most effective
+    - Should not be combined with label_smoothing (set label_smoothing=0.0)
+
+    Recommended configuration for severe VA imbalance:
+        hp["loss_type"]     = "focal"
+        hp["focal_gamma"]   = 2.0          # standard; tune 1.0–5.0 via HPO
+        hp["class_weights"] = "effective_n" # Cui et al. 2019; better than "balanced"
+                                            # for classes with < 5 training samples
+        hp["label_smoothing"] = 0.0        # do not combine with focal loss
+        optimize_metric       = "f1_macro" # or "balanced_accuracy" / "csmf_accuracy"
+
+    Used automatically by train() when hp["loss_type"] == "focal".
+    """
+
+    def __init__(
+        self,
+        *args,
+        focal_gamma: float = 2.0,
+        class_weights: "torch.Tensor | None" = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.focal_gamma   = focal_gamma
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False, **_kwargs):
+        labels  = inputs.get("labels")
+        outputs = model(**inputs)
+        logits  = outputs.logits
+
+        num_labels  = logits.size(-1)
+        logits_flat = logits.view(-1, num_labels)
+        labels_flat = labels.view(-1)
+
+        # Cast to float32 for numerical stability under fp16 training.
+        logits_f = logits_flat.float()
+
+        # p_t: softmax probability of the true class — used only for the
+        # focal modulating factor.  Detached so gradients do not flow through
+        # the weight term (standard focal loss practice).
+        with torch.no_grad():
+            probs = torch.nn.functional.softmax(logits_f, dim=-1)
+            p_t   = probs.gather(1, labels_flat.unsqueeze(1)).squeeze(1)
+            focal_weight = (1.0 - p_t) ** self.focal_gamma   # shape: (batch,)
+
+        # Per-sample CE (alpha applied here as class-level weight).
+        # label_smoothing intentionally left at 0.0 when using focal loss;
+        # the focal term already acts as a soft regulariser.
+        alpha = (
+            self.class_weights.to(logits_f.device)
+            if self.class_weights is not None
+            else None
+        )
+        ce_per_sample = torch.nn.functional.cross_entropy(
+            logits_f,
+            labels_flat,
+            weight=alpha,
+            reduction="none",
+            label_smoothing=self.args.label_smoothing_factor,
+        )
+
+        loss = (focal_weight * ce_per_sample).mean()
         return (loss, outputs) if return_outputs else loss
 
 
@@ -377,9 +504,24 @@ def train(
                 "balanced", classes=np.arange(num_labels), y=labels_list
             )
             class_weights = torch.tensor(weights, dtype=torch.float32)
+        elif raw_cw == "effective_n":
+            weights = _compute_effective_n_weights(labels_list, num_labels)
+            class_weights = torch.tensor(weights, dtype=torch.float32)
         else:
             class_weights = torch.tensor(raw_cw, dtype=torch.float32)
-        logger.info("Class weights: %s", class_weights.tolist())
+        logger.info("Class weights (%s): %s", raw_cw, class_weights.tolist())
+
+    # Warn if label_smoothing is set alongside focal loss — the combination is
+    # not recommended since focal loss already acts as an implicit regulariser.
+    loss_type = hp.get("loss_type", "cross_entropy")
+    focal_gamma = float(hp.get("focal_gamma", 2.0))
+    if loss_type == "focal" and hp.get("label_smoothing", 0.0) > 0.0:
+        logger.warning(
+            "label_smoothing=%.2f is set with loss_type='focal'.  "
+            "Combining focal loss with label smoothing is not recommended — "
+            "consider setting label_smoothing=0.0.",
+            hp["label_smoothing"],
+        )
 
     # --- Load base model ---
     base_model = AutoModelForSequenceClassification.from_pretrained(
@@ -449,27 +591,33 @@ def train(
     # --- Create trainer ---
     # DataCollatorWithPadding pads each batch to its own longest sequence,
     # so train and test batches are handled independently with no length mismatch.
-    # WeightedTrainer is used when class_weights are provided; it applies a
-    # weighted + label-smoothed CrossEntropyLoss to handle class imbalance.
-    if class_weights is not None:
-        trainer = WeightedTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            data_collator=DataCollatorWithPadding(tokenizer),
-            callbacks=callbacks or None,
+    #
+    # Dispatch rules:
+    #   loss_type="focal"        → FocalLossTrainer (focal loss + optional alpha weights)
+    #   class_weights set        → WeightedTrainer  (weighted cross-entropy + label smoothing)
+    #   otherwise                → standard Trainer (cross-entropy)
+    _trainer_kwargs = dict(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=DataCollatorWithPadding(tokenizer),
+        callbacks=callbacks or None,
+    )
+    if loss_type == "focal":
+        logger.info(
+            "Using FocalLossTrainer  gamma=%.1f  class_weights=%s",
+            focal_gamma, raw_cw,
+        )
+        trainer = FocalLossTrainer(
+            **_trainer_kwargs,
+            focal_gamma=focal_gamma,
             class_weights=class_weights,
         )
+    elif class_weights is not None:
+        trainer = WeightedTrainer(**_trainer_kwargs, class_weights=class_weights)
     else:
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            data_collator=DataCollatorWithPadding(tokenizer),
-            callbacks=callbacks or None,
-        )
+        trainer = Trainer(**_trainer_kwargs)
     # --- Resolve resume checkpoint ---
     resume_checkpoint = None
     if resume:

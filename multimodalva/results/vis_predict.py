@@ -40,7 +40,12 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from ..utils.metrics import log_loss_from_full
+
 logger = logging.getLogger(__name__)
+
+# Metrics that require a full probability DataFrame rather than predicted labels.
+_PROB_METRICS: frozenset[str] = frozenset({"log_loss"})
 
 # ---------------------------------------------------------------------------
 # Metric registry
@@ -92,6 +97,8 @@ def performance_leaderboard(
     sort_by: str = "f1_macro",
     ascending: bool = False,
     percentage: bool = True,
+    prob_dfs: "dict[str, pd.DataFrame] | None" = None,
+    id2label: dict | None = None,
 ) -> pd.DataFrame:
     """Build a multi-model performance leaderboard from a wide prediction DataFrame.
 
@@ -106,21 +113,46 @@ def performance_leaderboard(
     Metrics are computed for each model column against ``true_col`` and returned
     as a single ranked DataFrame.
 
+    To include ``"log_loss"`` (case-level calibration), pass ``prob_dfs`` and
+    ``id2label`` alongside the prediction DataFrame::
+
+        prob_dfs = {
+            "pred_bert":     bert_result.full,
+            "pred_lightgbm": lgbm_result.full,
+        }
+        board = performance_leaderboard(
+            df, "true_label",
+            metrics=[*_DEFAULT_METRICS, "log_loss"],
+            prob_dfs=prob_dfs,
+            id2label=bert_result.id2label,
+            sort_by="log_loss", ascending=True,
+        )
+
     Args:
         df:          DataFrame containing true labels and one or more model
                      prediction columns.
         true_col:    Name of the ground-truth label column.
         model_cols:  Columns to evaluate.  If ``None``, all columns except
                      ``true_col`` and ``"id"`` are used.
-        metrics:     Metrics to compute.  Default: all 10 metrics —
+        metrics:     Metrics to compute.  Default: all 10 label-based metrics —
                      ``accuracy``, ``balanced_accuracy``,
                      ``f1_macro``, ``f1_weighted``,
                      ``precision_macro``, ``precision_weighted``,
                      ``recall_macro``, ``recall_weighted``,
                      ``csmf_accuracy``, ``cccsmf_accuracy``.
+                     Add ``"log_loss"`` explicitly to include calibration (requires
+                     ``prob_dfs`` and ``id2label``).
         sort_by:     Metric to sort the leaderboard by.  Default ``"f1_macro"``.
+                     Use ``ascending=True`` when sorting by ``"log_loss"``.
         ascending:   Sort direction.  Default ``False`` (highest first).
-        percentage:  Multiply metric values by 100 for readability.  Default True.
+        percentage:  Multiply label-based metric values by 100 for readability.
+                     Default True.  **Not applied to** ``log_loss`` (it is not
+                     bounded to [0, 1]).
+        prob_dfs:    Dict mapping model column name → ``result.full`` DataFrame
+                     (columns: ``true_label``, ``prob_0``, ``prob_1``, …).
+                     Required when ``"log_loss"`` is in ``metrics``.
+        id2label:    Integer class ID → label string mapping shared across all
+                     models.  Required when ``"log_loss"`` is in ``metrics``.
 
     Returns:
         DataFrame indexed by model name with one column per metric, sorted by
@@ -141,11 +173,15 @@ def performance_leaderboard(
     metrics = metrics or _DEFAULT_METRICS
     registry = _make_metric_registry()
 
-    unknown = [m for m in metrics if m not in registry]
+    label_metrics = [m for m in metrics if m not in _PROB_METRICS]
+    prob_metrics  = [m for m in metrics if m in _PROB_METRICS]
+
+    unknown = [m for m in label_metrics if m not in registry]
     if unknown:
         raise ValueError(
             f"Unknown metric(s): {unknown}.  "
-            f"Available: {list(registry)}."
+            f"Available label-based: {list(registry)}.  "
+            f"Probability-based (requires prob_dfs + id2label): {sorted(_PROB_METRICS)}."
         )
 
     if sort_by not in metrics:
@@ -153,22 +189,44 @@ def performance_leaderboard(
             f"sort_by={sort_by!r} must be in the requested metrics list: {metrics}."
         )
 
+    if prob_metrics and (prob_dfs is None or id2label is None):
+        logger.warning(
+            "Metrics %s require prob_dfs and id2label — these columns will be NaN.  "
+            "Pass prob_dfs={model_col: result.full, ...} and id2label=result.id2label.",
+            prob_metrics,
+        )
+
     y_true = df[true_col]
     rows = []
     for col in model_cols:
         y_pred = df[col]
         row: dict = {"model": col, "n": len(y_true)}
-        for m in metrics:
+
+        for m in label_metrics:
             try:
                 val = registry[m](y_true, y_pred)
                 row[m] = round(val * 100, 2) if percentage else round(val, 4)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not compute %s for model %r: %s", m, col, exc)
                 row[m] = float("nan")
+
+        for m in prob_metrics:
+            if m == "log_loss":
+                if prob_dfs is not None and col in prob_dfs and id2label is not None:
+                    try:
+                        row[m] = round(log_loss_from_full(prob_dfs[col], id2label), 4)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Could not compute log_loss for model %r: %s", col, exc)
+                        row[m] = float("nan")
+                else:
+                    row[m] = float("nan")
+
         rows.append(row)
 
     board = pd.DataFrame(rows).set_index("model")
-    board = board.sort_values(sort_by, ascending=ascending)
+    # Reorder columns to match the requested metrics order
+    col_order = [m for m in metrics if m in board.columns]
+    board = board[["n"] + col_order].sort_values(sort_by, ascending=ascending)
     return board
 
 

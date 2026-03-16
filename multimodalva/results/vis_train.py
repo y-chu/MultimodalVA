@@ -37,6 +37,7 @@ Public API
     loss_curve_diagnostics(log_history, warmup_steps)
         Quantitative checks on a loss curve: post-warmup slope, stabilisation,
         and train/eval gap — returns a diagnostics dict without plotting.
+
 """
 
 from __future__ import annotations
