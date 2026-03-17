@@ -47,7 +47,8 @@ Usage quick-start::
     results = clf.run(df, text_col="narrative", feature_cols=[...], label_col="cause")
 """
 
-from .data_fusion import DataFusionClassifier, qdesc_feature_overlap
+from .data_fusion_classifier import DataFusionClassifier
+from .data_fusion import qdesc_feature_overlap
 from .feature_fusion import FeatureFusionClassifier
 from .voting import SoftVotingClassifier
 from .stacking import StackingClassifier

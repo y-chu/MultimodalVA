@@ -90,6 +90,8 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
+import ssl
 from pathlib import Path
 
 import numpy as np
@@ -289,6 +291,54 @@ def _assemble_prediction_result(
     topk_df = pd.DataFrame(topk_data)
 
     return PredictionResult(top1=top1_df, full=full_df, topk=topk_df, id2label=id2label)
+
+
+# ---------------------------------------------------------------------------
+# Environment setup helpers (SSL + NLTK — required by AutoGluon AutoMM)
+# ---------------------------------------------------------------------------
+
+def _ensure_nltk_deps() -> None:
+    """Fix macOS SSL certificate errors and ensure NLTK data required by AutoMM.
+
+    AutoGluon AutoMM depends on NLTK corpora (wordnet, omw-1.4) and tokenizers
+    (punkt / punkt_tab).  On macOS the system Python SSL bundle may not include
+    the root certificates needed to reach the NLTK data server; this function
+    patches the default HTTPS context before attempting any downloads.
+
+    Safe to call on Linux / Windows — the SSL patch is skipped on non-macOS
+    platforms and all NLTK downloads are no-ops when the data is already present.
+    """
+    # --- macOS SSL patch ---------------------------------------------------
+    # Python installed via python.org ships without the macOS keychain certs.
+    # Patching ssl._create_default_https_context is the standard workaround
+    # (also applied by the Install Certificates.command bundled with python.org).
+    if platform.system() == "Darwin":
+        try:
+            ssl._create_default_https_context = ssl._create_unverified_context
+            logger.debug("macOS SSL: patched default HTTPS context to unverified.")
+        except AttributeError:
+            pass  # ssl module doesn't support this on this build — skip silently
+
+    # --- NLTK data ---------------------------------------------------------
+    try:
+        import nltk  # noqa: PLC0415 — optional dep, only needed for AutoMM
+    except ImportError:
+        return  # nltk not installed; AutoMM will surface its own error if needed
+
+    # Map dataset name → nltk.data.find() path prefix.
+    # punkt lives under tokenizers/; newer NLTK (3.9+) uses punkt_tab.
+    _needed = {
+        "wordnet":    "corpora/wordnet",
+        "omw-1.4":   "corpora/omw-1.4",
+        "punkt":      "tokenizers/punkt",
+        "punkt_tab":  "tokenizers/punkt_tab",
+    }
+    for name, find_path in _needed.items():
+        try:
+            nltk.data.find(find_path)
+        except LookupError:
+            logger.info("Downloading NLTK data: %s", name)
+            nltk.download(name, quiet=True)
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +585,9 @@ class FeatureFusionClassifier:
                 "autogluon.multimodal is required for FeatureFusionClassifier. "
                 "Install with:  pip install autogluon.multimodal"
             ) from exc
+
+        # Fix macOS SSL cert errors and ensure NLTK corpora required by AutoMM.
+        _ensure_nltk_deps()
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         model_dir = self.output_dir / "automm_model"

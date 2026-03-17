@@ -1,36 +1,92 @@
 [build-system]
+# setuptools>=68 bundles its own distutils, required for Python 3.12+
+# (stdlib distutils was removed in Python 3.12).
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "multimodalva"
 version = "0.1.0"
 description = "Cause of death classification using text and tabular data from verbal autopsies"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 dependencies = [
-    "torch>=2.0",
+    # Python 3.12+ minimum versions — see notes below.
+    # torch 2.1: first release with Python 3.12 wheels (Oct 2023).
+    "torch>=2.1",
+    # transformers 4.35: pure Python, compatible with 3.12.
     "transformers>=4.35",
+    # accelerate is required by transformers Trainer (since ~4.31).
+    # Without it, `from transformers import Trainer` raises ModuleNotFoundError.
+    # accelerate 0.26: first release with Python 3.12 wheels (Nov 2023).
+    "accelerate>=0.26",
+    # datasets 2.14: pure Python, compatible with 3.12.
     "datasets>=2.14",
-    "scikit-learn>=1.3",
-    "pandas>=1.5",
-    "numpy>=1.24",
-    "optuna>=3.3",
+    # scikit-learn 1.3.2: first release with official 3.12 classifiers (Nov 2023).
+    "scikit-learn>=1.3.2",
+    # pandas 2.1: first release with official 3.12 classifiers (Aug 2023).
+    # pandas 1.x never supported 3.12.
+    "pandas>=2.1",
+    # numpy 1.26: first release with Python 3.12 wheels (Sep 2023).
+    "numpy>=1.26",
+    # optuna 3.4: first release with Python 3.12 classifiers (Nov 2023).
+    "optuna>=3.4",
+    # joblib 1.3: pure Python, compatible with 3.12.
     "joblib>=1.3",
-    "matplotlib>=3.7",
-    "seaborn>=0.12",
+    # matplotlib 3.8: first release to drop distutils (removed in 3.12) and
+    # officially support Python 3.12 (Sep 2023). 3.7 fails on 3.12.
+    "matplotlib>=3.8",
+    # seaborn 0.13: first release to support Python 3.12 (Sep 2023).
+    # 0.12 depended on deprecated matplotlib APIs that 3.8 removed.
+    "seaborn>=0.13",
 ]
 
 [project.optional-dependencies]
+# --- Tabular ML models (sklearn-compatible) ---
+# Install with: pip install multimodalva[tabular]
 tabular = [
-    "lightgbm>=4.0",
+    # lightgbm 4.1: first release with Python 3.12 wheels (Oct 2023).
+    "lightgbm>=4.1",
+    # xgboost 2.0: released Oct 2023 alongside Python 3.12, includes 3.12 wheels.
     "xgboost>=2.0",
-    "catboost>=1.2",
+    # catboost 1.2.2: first release with Python 3.12 wheels (Dec 2023).
+    "catboost>=1.2.2",
 ]
+
+# --- LoRA fine-tuning (parameter-efficient text training) ---
+# Install with: pip install multimodalva[lora]
 lora = ["peft>=0.6"]
-feature_fusion = ["autogluon.multimodal>=1.0"]
-ray = ["ray[tune]>=2.7", "optuna-integration>=3.3"]
+
+# --- Ensemble strategy 2: AutoGluon AutoMM feature fusion ---
+# Install with: pip install multimodalva[feature_fusion]
+# autogluon 1.1: first release to officially support Python 3.12.
+feature_fusion = ["autogluon.multimodal>=1.1"]
+
+# --- Distributed HPO with Ray Tune ---
+# Install with: pip install multimodalva[ray]
+# ray 2.9: first release with official Python 3.12 support.
+# optuna-integration 3.4: mirrors optuna versioning, 3.12 classifiers added in 3.4.
+ray = ["ray[tune]>=2.9", "optuna-integration>=3.4"]
+
+# --- Ensemble strategy 4: InSilicoVA base model in stacking ---
+# Install with: pip install multimodalva[insilicova]
+# Enables model_name="insilicova" in StackingClassifier tabular_models specs.
+insilicova = ["pyinsilicova>=1.0"]
+
+# --- Install everything (recommended for research / full functionality) ---
+# pip install multimodalva[all]
+all = [
+    "lightgbm>=4.1",
+    "xgboost>=2.0",
+    "catboost>=1.2.2",
+    "peft>=0.6",
+    "autogluon.multimodal>=1.1",
+    "ray[tune]>=2.9",
+    "optuna-integration>=3.4",
+    "pyinsilicova>=1.0",
+]
+
 dev = ["pytest", "pytest-cov"]
 
 [project.urls]

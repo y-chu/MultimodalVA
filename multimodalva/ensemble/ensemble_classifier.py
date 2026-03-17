@@ -83,7 +83,7 @@ from typing import Any
 
 import pandas as pd
 
-from .data_fusion import DataFusionClassifier
+from .data_fusion_classifier import DataFusionClassifier
 from .feature_fusion import FeatureFusionClassifier
 from .voting import SoftVotingClassifier
 from .stacking import StackingClassifier

@@ -20,23 +20,51 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import optuna
-from optuna.pruners import MedianPruner
-from optuna.samplers import TPESampler
+if TYPE_CHECKING:
+    import optuna
+
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
 
-from ..utils.metrics import (  # noqa: F401
-    csmf_accuracy, score_predictions, sample_hyperparams,
-    log_loss_from_full, METRIC_DIRECTION,
+# from ..utils.metrics import (  # noqa: F401
+#     csmf_accuracy, score_predictions, sample_hyperparams,
+#     log_loss_from_full, METRIC_DIRECTION,
+# )
+# from .predict import predict
+# from .train import _get_dataset_labels, train
+
+import sys
+
+# -----------------------
+# Package root resolution
+# -----------------------
+# __file__ = multimodalva/text/hpo.py  →  parent.parent.parent = project root (MultimodalVA/)
+# Must point to the directory that *contains* the multimodalva/ package folder so that
+# "from multimodalva.xxx import ..." resolves correctly when scripts are run directly.
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent  # MultimodalVA/
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+# -----------------------
+# Internal imports
+# -----------------------
+from multimodalva.utils.metrics import (
+    csmf_accuracy,
+    score_predictions,
+    sample_hyperparams,
+    log_loss_from_full,
+    METRIC_DIRECTION,
 )
-from .predict import predict
-from .train import _get_dataset_labels, train
+from multimodalva.text.train import train, _get_dataset_labels
+from multimodalva.text.predict import predict
 
 logger = logging.getLogger(__name__)
+
 
 # Default search space: (type, *args)
 #   float_log  — log-uniform float:  (low, high)       best for scale-sensitive params like LR
@@ -198,6 +226,22 @@ def optimize(
                           Can be passed directly to train(hyperparams=best_hyperparams).
         study: The completed Optuna study object (for further analysis / visualisation).
     """
+    try:
+        import optuna
+        from optuna.pruners import MedianPruner
+        from optuna.samplers import TPESampler
+    except ImportError as exc:
+        raise ImportError(
+            "optuna is required for optimize(). "
+            "Install with:  pip install 'optuna>=3.4'"
+        ) from exc
+
+    _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
+    if metric not in _VALID_METRICS:
+        raise ValueError(
+            f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
+        )
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -212,7 +256,8 @@ def optimize(
 
     if storage_path is None:
         safe_name = model_name.replace("/", "_")
-        storage_path = f"sqlite:///{output_dir}/hpo_{safe_name}.db"
+        # Use resolved absolute path so the DB is always found regardless of CWD.
+        storage_path = f"sqlite:///{output_dir.resolve()}/hpo_{safe_name}.db"
 
     # --- Stratified internal split ---
     all_labels = _get_dataset_labels(train_dataset)
@@ -293,7 +338,9 @@ def optimize(
     )
     remaining = n_trials - completed
     if remaining > 0:
-        study.optimize(objective, n_trials=remaining)
+        # catch=(Exception,) lets Optuna mark a failed trial as FAILED and continue
+        # with remaining trials instead of crashing the whole HPO run (e.g. on OOM).
+        study.optimize(objective, n_trials=remaining, catch=(Exception,))
     else:
         logger.info("All %d trials already completed. Skipping optimization.", n_trials)
 
@@ -303,7 +350,15 @@ def optimize(
     best_trial_dir = output_dir / f"trial_{study.best_trial.number}"
     best_output_dir = output_dir / "best_trial"
     if best_trial_dir.exists():
-        shutil.copytree(best_trial_dir, best_output_dir, dirs_exist_ok=True)
+        # Remove stale artifacts from any previous run before copying to avoid
+        # silently mixing weights from two different trials when resuming.
+        if best_output_dir.exists():
+            shutil.rmtree(best_output_dir)
+        shutil.copytree(best_trial_dir, best_output_dir)
+    else:
+        logger.warning(
+            "Best trial directory not found at %s — best_trial/ not updated.", best_trial_dir
+        )
 
     with open(output_dir / "best_hyperparams.json", "w") as f:
         json.dump(best_hyperparams, f, indent=2)
@@ -364,7 +419,9 @@ def _to_ray_space(search_space: dict) -> dict:
             )
     return ray_space
 
-
+# -----------------------
+# Ray Trainable: Single trial
+# -----------------------
 def _ray_trial_fn(
     config: dict,
     *,
@@ -378,74 +435,97 @@ def _ray_trial_fn(
     gradient_checkpointing: bool,
     early_stopping_patience: int | None,
 ) -> None:
-    """Single-trial trainable for Ray Tune.
+    """Single trial for Ray Tune — fully compatible with Ray 2.x / Python 3.13.
 
-    Called once per trial by a Ray worker process.  Runs ``train()`` followed
-    by ``predict()`` and reports all four evaluation metrics to the Ray runtime
-    via ``ray.train.report()``.
+    Ray 2.x API used:
+      - ``ray.train.get_context().get_trial_dir()`` for the trial artifact directory
+        (replaces deprecated ``tune.get_trial_dir()`` / ``ctx.logdir``).
+      - ``ray.train.report(metrics_dict)`` for metric reporting
+        (replaces deprecated ``tune.report(**kwargs)``).
 
-    Large dataset objects (``opt_train``, ``opt_val``) are passed through the
-    Ray object store via ``tune.with_parameters()`` — they are referenced by
-    pointer, not re-serialised for every trial.
-
-    ``config`` contains the hyperparameter values sampled by the search
-    algorithm and is forwarded verbatim to ``train()`` as ``hyperparams``.
-
-    This function must be defined at module level (not nested) so that Ray can
-    serialise it by reference when dispatching to remote workers.  The package
-    must be installed (``pip install -e .``) on every worker node so that the
-    relative imports resolve correctly.
+    Imports of ``multimodalva`` sub-modules are deferred to function body so that
+    Ray worker processes resolve them correctly regardless of how the package was
+    launched (installed wheel, editable install, or direct script execution).
     """
     import torch
-    from ray import train as _ray_train
+    # ray.tune.get_context() is the correct API for function trainables passed to
+    # Ray Tune (ray.train.get_context() is deprecated in that context per
+    # https://github.com/ray-project/ray/issues/49454).
+    # ray.train.report() remains the canonical reporting call for both Tune and Train.
+    from ray import tune as _ray_tune
+    import ray.train as _ray_train
 
-    trial_dir = Path(_ray_train.get_context().get_trial_dir())
+    # --- Ensure multimodalva is importable in the worker process ---
+    # Each Ray worker is a fresh Python process; insert the project root into
+    # sys.path so absolute imports resolve even without a formal pip install.
+    import sys as _sys
+    _project_root = str(Path(__file__).resolve().parent.parent.parent)
+    if _project_root not in _sys.path:
+        _sys.path.insert(0, _project_root)
+
+    # Import inside the function body to avoid the name collision that occurs when
+    # ``from ray import train`` is used at the top of the file, which would shadow
+    # ``multimodalva.text.train.train``.
+    from multimodalva.text.train import train as _train
+    from multimodalva.text.predict import predict as _predict
+    from multimodalva.utils.metrics import score_predictions, log_loss_from_full
+
+    # --- Trial artifact directory (Ray 2.x Tune API) ---
+    ctx = _ray_tune.get_context()
+    trial_dir = Path(ctx.get_trial_dir())
+    trial_dir.mkdir(parents=True, exist_ok=True)
 
     if use_focal:
         config = {**config, "loss_type": "focal"}
 
-    all_scores: dict = {
+    all_scores: dict[str, float] = {
         "accuracy": 0.0,
         "balanced_accuracy": 0.0,
         "f1_macro": 0.0,
         "f1_weighted": 0.0,
         "csmf_accuracy": 0.0,
-        "log_loss": float("inf"),  # minimised — inf signals trial failure
+        "log_loss": float("inf"),
     }
+
     try:
-        train(
+        # --- Train ---
+        _train(
             train_dataset=opt_train,
             label2id=label2id,
             id2label=id2label,
             model_name=model_name,
             output_dir=trial_dir,
             hyperparams=config,
-            # val_size=0.1: train() carves an internal eval split from opt_train
-            # for early stopping / best-checkpoint selection.  This is separate
-            # from opt_val, which scores the trial below.
             val_size=0.1,
             use_lora=use_lora,
             gradient_checkpointing=gradient_checkpointing,
             early_stopping_patience=early_stopping_patience,
-            # Never resume from another trial's checkpoint.
             resume=False,
         )
-        result = predict(trial_dir, opt_val)
-        all_scores = {
-            m: score_predictions(result.top1, m)
-            for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
-        }
+
+        # --- Evaluate ---
+        result = _predict(trial_dir, opt_val)
+        all_scores.update(
+            {
+                m: score_predictions(result.top1, m)
+                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+            }
+        )
         all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
+
     finally:
-        # Free GPU/MPS memory before Ray marks the trial slot as available.
+        # --- Free GPU / MPS memory before the next trial ---
         torch.cuda.empty_cache()
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
-        # ray.train.report() must always be called, even on failure, so Ray
-        # records the trial outcome rather than leaving it in RUNNING state.
+
+        # Ray 2.x: report metrics as a plain dict — tune.report(**kwargs) is deprecated.
         _ray_train.report(all_scores)
 
 
+# -----------------------
+# Main Ray HPO function
+# -----------------------
 def optimize_ray(
     train_dataset,
     label2id: dict,
@@ -461,151 +541,29 @@ def optimize_ray(
     use_focal: bool = False,
     gradient_checkpointing: bool = False,
     early_stopping_patience: int | None = 3,
-    # ---- Ray cluster / resource settings --------------------------------
     ray_address: str | None = None,
     num_gpus_per_trial: float = 1.0,
     num_cpus_per_trial: int = 4,
     max_concurrent_trials: int | None = None,
-    # ---- Output ---------------------------------------------------------
     save_trials_csv: bool = True,
 ) -> tuple[dict, "ray.tune.ResultGrid"]:
-    """Run distributed HPO with Ray Tune across multiple GPUs or cluster nodes.
+    """Distributed HPO using Ray Tune."""
+    _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
+    if metric not in _VALID_METRICS:
+        raise ValueError(
+            f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
+        )
 
-    Mirrors the interface of :func:`optimize` (Optuna backend) but executes
-    trials **concurrently** across all available GPUs and/or cluster nodes
-    using the Ray distributed runtime.
-
-    When to use this over :func:`optimize`
-    ---------------------------------------
-    * You have **multiple GPUs** on one machine and want N parallel trials
-      simultaneously (one GPU each).
-    * You are on a **cluster** (SLURM, Kubernetes, AWS, GCP, …) and want to
-      spread trials across nodes — pass ``ray_address="auto"`` after starting
-      a Ray cluster with ``ray start --head``.
-    * You need **fault tolerance** — Ray automatically restarts failed trials
-      and checkpoints progress so a node failure does not restart everything.
-
-    Trial-level vs. intra-trial parallelism
-    ----------------------------------------
-    ``num_gpus_per_trial=1.0`` (default) allocates one whole GPU per trial.
-    Ray schedules as many concurrent trials as total GPUs permit.  For
-    example, on a 4-GPU node you get 4 concurrent trials.
-
-    To use multiple GPUs *within* a single trial (data-parallel training),
-    set ``num_gpus_per_trial > 1`` and configure ``train()`` for distributed
-    data parallelism (``torch.distributed`` / ``accelerate``).
-
-    Fractional GPUs (e.g. ``num_gpus_per_trial=0.5``) allow packing two
-    trials onto one GPU — only safe when GPU memory permits.
-
-    Cluster setup
-    -------------
-    .. code-block:: bash
-
-        # On the head node (4 GPUs):
-        ray start --head --num-gpus=4
-
-        # On each worker node (4 GPUs):
-        ray start --address=<HEAD_IP>:6379 --num-gpus=4
-
-    Then pass ``ray_address="auto"`` (or ``"<HEAD_IP>:6379"`` explicitly).
-
-    For **shared-filesystem clusters** (NFS / Lustre), set ``output_dir`` to a
-    path accessible by all nodes — Ray writes trial artifacts there.  For
-    cloud storage (S3 / GCS), pass an ``s3://`` / ``gs://`` URI as
-    ``output_dir`` (requires ``pyarrow`` and the relevant cloud SDK).
-
-    The package must be installed on every worker node so remote workers can
-    import ``multimodalva``.  On SLURM clusters, activate the same conda/venv
-    environment on all nodes before launching the Ray cluster.
-
-    Search algorithm
-    ----------------
-    Uses ``OptunaSearch`` (Tree-structured Parzen Estimator — the same sampler
-    as :func:`optimize`).  The acquisition function is shared across all
-    parallel workers, so the search is sample-efficient even at high
-    concurrency.
-
-    Note on intra-trial ASHA pruning
-    ---------------------------------
-    Ray Tune's ``ASHAScheduler`` can kill underperforming trials mid-training
-    (epoch-level), freeing GPUs sooner.  This requires the training loop to
-    call ``ray.train.report({...})`` after each epoch — i.e. the HuggingFace
-    ``Trainer`` needs a ``TuneReportCheckpointCallback`` from
-    ``ray.tune.integration.huggingface``.  Adding an ``extra_callbacks``
-    parameter to ``train()`` would unlock this.  Without it, all trials run to
-    completion (no intra-trial pruning), which is still fully parallel.
-
-    Args:
-        train_dataset: Tokenised ClassificationDataset from prepare_dataset().
-        label2id: Label-to-integer mapping from prepare_dataset().
-        id2label: Integer-to-label mapping from prepare_dataset().
-        model_name: HuggingFace model name or local path.
-        output_dir: Root directory for all Ray Tune artifacts.  Must be on a
-                    shared filesystem when running on a multi-node cluster.
-                    S3/GCS URIs are also accepted (requires ``pyarrow``).
-        n_trials: Total number of trials. Default 20.
-        metric: Metric to maximise — ``"accuracy"``, ``"balanced_accuracy"``,
-                ``"f1_macro"``, ``"f1_weighted"``, ``"csmf_accuracy"``. Default ``"accuracy"``.
-                Use ``"balanced_accuracy"``, ``"csmf_accuracy"``, or ``"f1_macro"`` for imbalanced VA data.
-        search_space: Same ``(type, *args)`` format as :func:`optimize`.
-                      Defaults to :data:`DEFAULT_SEARCH_SPACE` (plus
-                      :data:`LORA_SEARCH_SPACE` when ``use_lora=True``, plus
-                      :data:`FOCAL_SEARCH_SPACE` when ``use_focal=True``).
-        val_size: Fraction of train_dataset held out for trial evaluation.
-                  Default 0.2.
-        random_state: Seed for the stratified split and OptunaSearch sampler.
-                      Default 42.
-        use_lora: Apply LoRA adapters during each trial. Default False.
-        use_focal: Use focal loss during each trial.  Merges FOCAL_SEARCH_SPACE
-                   and fixes loss_type="focal" per trial.  Default False.
-        gradient_checkpointing: Enable gradient checkpointing. Default False.
-        early_stopping_patience: Early stopping patience per trial. Default 3.
-        ray_address: Ray cluster address.
-                     ``None``         — start / connect to a local Ray instance.
-                     ``"auto"``       — auto-discover an existing cluster via the
-                                        ``RAY_ADDRESS`` environment variable.
-                     ``"<ip>:<port>"`` — connect to an explicit head node.
-                     Default None.
-        num_gpus_per_trial: GPUs allocated to each trial. Default 1.0.
-                            ``0``   — CPU-only mode (no GPU required).
-                            ``> 1`` — multi-GPU per trial (requires distributed
-                                      training setup inside ``train()``).
-                            ``0 < x < 1`` — fractional GPU (pack multiple
-                                      trials onto one GPU; use with care).
-        num_cpus_per_trial: CPU cores per trial. Default 4.
-        max_concurrent_trials: Maximum trials running simultaneously.
-                               ``None`` → Ray auto-determines from available
-                               resources (recommended). Default None.
-        save_trials_csv: Save all trial metrics to
-                         ``output_dir/hpo_trials_ray.csv``. Default True.
-
-    Returns:
-        best_hyperparams: Dict of best trial hyperparameters.  Can be passed
-                          directly to ``train(hyperparams=best_hyperparams)``.
-        results: ``ray.tune.ResultGrid`` — full results for analysis.
-                 ``results.get_dataframe()`` → trial-level pandas DataFrame.
-                 ``results.get_best_result(metric, mode)`` → best trial.
-                 ``results.get_best_result().path`` → best trial artifact dir.
-
-    Raises:
-        ImportError: If ``ray[tune]`` is not installed.
-    """
-    try:
-        import ray
-        from ray import tune, air
-        from ray.tune.search.optuna import OptunaSearch
-        from ray.tune.search import ConcurrencyLimiter
-    except ImportError as exc:
-        raise ImportError(
-            "Ray Tune and Optuna are required for optimize_ray(). "
-            "Install with: pip install 'ray[tune]' optuna"
-        ) from exc
+    import ray
+    from ray import tune
+    from ray.train import RunConfig  # ray.air.RunConfig is deprecated in Ray 2.7+
+    from ray.tune.search.optuna import OptunaSearch
+    from ray.tune.search import ConcurrencyLimiter
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Build effective search space (same logic as optimize()) ---
+    # --- Build effective search space ---
     active_space = dict(DEFAULT_SEARCH_SPACE)
     if use_lora:
         active_space.update(LORA_SEARCH_SPACE)
@@ -615,70 +573,36 @@ def optimize_ray(
         active_space.update(search_space)
     ray_space = _to_ray_space(active_space)
 
-    # --- Stratified internal split (mirrors optimize()) ---
+    # --- Stratified split ---
     all_labels = _get_dataset_labels(train_dataset)
     indices = list(range(len(train_dataset)))
     opt_train_idx, opt_val_idx = train_test_split(
-        indices,
-        test_size=val_size,
-        stratify=all_labels,
-        random_state=random_state,
+        indices, test_size=val_size, stratify=all_labels, random_state=random_state
     )
     opt_train = Subset(train_dataset, opt_train_idx)
     opt_val = Subset(train_dataset, opt_val_idx)
 
-    # --- Initialise Ray (idempotent if already running) ---
+    # --- Initialise Ray ---
     if not ray.is_initialized():
         ray.init(address=ray_address, ignore_reinit_error=True)
-        logger.info(
-            "Ray initialised.  Cluster resources: %s",
-            ray.cluster_resources(),
-        )
+        logger.info("Ray initialised. Cluster resources: %s", ray.cluster_resources())
     elif ray_address is not None:
-        logger.warning(
-            "Ray is already initialised; ray_address=%r ignored.",
-            ray_address,
-        )
+        logger.warning("Ray already initialised; ignoring ray_address=%r", ray_address)
 
-    # Warn early if no GPUs are available but trials request one.
     available_gpus = ray.cluster_resources().get("GPU", 0)
     if num_gpus_per_trial > 0 and available_gpus == 0:
         logger.warning(
-            "num_gpus_per_trial=%.1f but the Ray cluster reports 0 GPUs. "
-            "Trials will queue indefinitely. "
-            "Set num_gpus_per_trial=0 for CPU-only mode.",
-            num_gpus_per_trial,
-        )
-    else:
-        max_parallel = int(available_gpus // num_gpus_per_trial) if num_gpus_per_trial > 0 else None
-        logger.info(
-            "Ray cluster: %.0f GPU(s) available — up to %s concurrent trials "
-            "at %.1f GPU(s)/trial.",
-            available_gpus,
-            max_parallel if max_parallel is not None else "unlimited",
+            "num_gpus_per_trial=%.1f but no GPUs detected; trials will queue indefinitely.",
             num_gpus_per_trial,
         )
 
-    # --- Search algorithm: OptunaSearch (TPE) ---
-    # OptunaSearch shares the acquisition function across parallel workers so
-    # the search remains sample-efficient even with many concurrent trials.
     _ray_mode = "min" if METRIC_DIRECTION.get(metric, "maximize") == "minimize" else "max"
-    search_alg: object = OptunaSearch(
-        metric=metric,
-        mode=_ray_mode,
-        seed=random_state,
-    )
-    if max_concurrent_trials is not None:
-        # ConcurrencyLimiter prevents the search algorithm from suggesting too
-        # many points before receiving feedback, keeping TPE effective.
-        search_alg = ConcurrencyLimiter(
-            search_alg, max_concurrent=max_concurrent_trials
-        )
 
-    # --- Trainable: bind fixed arguments via the Ray object store ---
-    # tune.with_parameters() stores opt_train / opt_val in the Ray object
-    # store once; workers receive a lightweight reference rather than a
-    # serialised copy, which is critical for large tokenised datasets.
+    search_alg = OptunaSearch(metric=metric, mode=_ray_mode, seed=random_state)
+    if max_concurrent_trials is not None:
+        search_alg = ConcurrencyLimiter(search_alg, max_concurrent=max_concurrent_trials)
+
+    # --- Trainable ---
     trainable = tune.with_parameters(
         _ray_trial_fn,
         opt_train=opt_train,
@@ -690,12 +614,11 @@ def optimize_ray(
         use_focal=use_focal,
         gradient_checkpointing=gradient_checkpointing,
         early_stopping_patience=early_stopping_patience,
+        # output_dir is NOT passed here — _ray_trial_fn derives the trial directory
+        # from ray.train.get_context().get_trial_dir() (Ray 2.x API).
     )
-    # Attach resource requirements so the Ray scheduler knows how many GPUs /
-    # CPUs to reserve before launching each trial.
     trainable = tune.with_resources(
-        trainable,
-        resources={"cpu": num_cpus_per_trial, "gpu": num_gpus_per_trial},
+        trainable, resources={"cpu": num_cpus_per_trial, "gpu": num_gpus_per_trial}
     )
 
     # --- Tuner ---
@@ -707,52 +630,50 @@ def optimize_ray(
             mode=_ray_mode,
             num_samples=n_trials,
             search_alg=search_alg,
-            # max_concurrent_trials=None lets Ray fill all available GPU slots
-            # automatically; set an explicit value to leave GPUs for other work.
             max_concurrent_trials=max_concurrent_trials,
         ),
-        run_config=air.RunConfig(
-            # Ray writes trial subdirectories inside storage_path/name/.
-            # Use a shared filesystem or cloud URI for multi-node clusters.
-            storage_path=str(output_dir),
-            name="text_hpo_ray",
-            log_to_file=True,
-        ),
+        run_config=RunConfig(storage_path=str(output_dir), name="text_hpo_ray"),
     )
 
-    logger.info(
-        "optimize_ray: launching %d trials  metric=%s  "
-        "gpus/trial=%.1f  cpus/trial=%d",
-        n_trials, metric, num_gpus_per_trial, num_cpus_per_trial,
-    )
-    results = tuner.fit()
+    logger.info("Launching %d trials, metric=%s, gpus/trial=%.1f, cpus/trial=%d",
+                n_trials, metric, num_gpus_per_trial, num_cpus_per_trial)
 
-    # --- Extract best result ---
+    # AutoGluon sets RAY_AIR_NEW_OUTPUT=1, which changes Ray's verbose handling.
+    # Ray internally passes verbose="auto" (a string) but the new output path
+    # in get_air_verbosity() expects int or AirVerbosity enum → AttributeError.
+    # Force RAY_AIR_NEW_OUTPUT=0 for our HPO run to use the stable output path,
+    # then restore the caller's value so AutoGluon's own runs are unaffected.
+    _prev_ray_output = os.environ.get("RAY_AIR_NEW_OUTPUT")
+    os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
+    try:
+        results = tuner.fit()
+    finally:
+        if _prev_ray_output is None:
+            os.environ.pop("RAY_AIR_NEW_OUTPUT", None)
+        else:
+            os.environ["RAY_AIR_NEW_OUTPUT"] = _prev_ray_output
+
     best_result = results.get_best_result(metric=metric, mode=_ray_mode)
     best_hyperparams = best_result.config
 
     with open(output_dir / "best_hyperparams_ray.json", "w") as fh:
         json.dump(best_hyperparams, fh, indent=2)
 
-    logger.info("Best hyperparams (Ray Tune): %s", best_hyperparams)
-    logger.info(
-        "Best %s (Ray Tune): %.4f",
-        metric,
-        best_result.metrics.get(metric, float("nan")),
-    )
-    logger.info("Best trial artifacts: %s", best_result.path)
-
-    # --- Copy best trial artifacts to a predictable location ---
+    # --- Copy best trial artifacts ---
     best_trial_path = Path(best_result.path)
     best_output_dir = output_dir / "best_trial"
     if best_trial_path.exists():
-        shutil.copytree(best_trial_path, best_output_dir, dirs_exist_ok=True)
-        logger.info("Copied best trial artifacts to %s", best_output_dir)
+        # Remove stale artifacts from any previous run before copying.
+        if best_output_dir.exists():
+            shutil.rmtree(best_output_dir)
+        shutil.copytree(best_trial_path, best_output_dir)
+    else:
+        logger.warning(
+            "Best trial path not found at %s — best_trial/ not updated.", best_trial_path
+        )
 
-    # --- Save all trial results as CSV ---
+    # --- Save trial CSV ---
     if save_trials_csv:
-        trials_csv_path = output_dir / "hpo_trials_ray.csv"
-        results.get_dataframe().to_csv(trials_csv_path, index=False)
-        logger.info("Saved Ray trial results to %s", trials_csv_path)
+        results.get_dataframe().to_csv(output_dir / "hpo_trials_ray.csv", index=False)
 
     return best_hyperparams, results

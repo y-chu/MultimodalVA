@@ -25,8 +25,12 @@ from transformers import (
     TrainingArguments,
 )
 
-from ..utils.types import PredictionResult
-from .train import _get_dataset_labels, get_device
+# from ..utils.types import PredictionResult
+# from .train import _get_dataset_labels, get_device
+
+from multimodalva.utils.types import PredictionResult
+from multimodalva.text.train import _get_dataset_labels, get_device
+
 
 logger = logging.getLogger(__name__)
 
@@ -114,25 +118,36 @@ def predict(
     model.eval()
 
     # TrainingArguments requires an output_dir string.
-    # Use a temp dir when predicting in-memory (the dir is never written to).
-    args_output_dir = str(output_dir) if output_dir is not None else tempfile.mkdtemp()
+    # Use a TemporaryDirectory when predicting in-memory (the dir is never written to)
+    # so it is cleaned up automatically instead of leaking across calls.
+    _tmp_dir: tempfile.TemporaryDirectory | None = None
+    if output_dir is not None:
+        args_output_dir = str(output_dir)
+    else:
+        _tmp_dir = tempfile.TemporaryDirectory()
+        args_output_dir = _tmp_dir.name
 
-    # Minimal TrainingArguments — only output_dir and batch size are meaningful here
-    inference_args = TrainingArguments(
-        output_dir=args_output_dir,
-        per_device_eval_batch_size=batch_size,
-        report_to="none",
-        disable_tqdm=False,
-    )
-    # DataCollatorWithPadding matches the collator used during training,
-    # padding each batch to its own longest sequence.
-    trainer = Trainer(
-        model=model,
-        args=inference_args,
-        data_collator=DataCollatorWithPadding(tokenizer),
-    )
+    try:
+        # Minimal TrainingArguments — only output_dir and batch size are meaningful here
+        inference_args = TrainingArguments(
+            output_dir=args_output_dir,
+            per_device_eval_batch_size=batch_size,
+            report_to="none",
+            disable_tqdm=False,
+        )
+        # DataCollatorWithPadding matches the collator used during training,
+        # padding each batch to its own longest sequence.
+        trainer = Trainer(
+            model=model,
+            args=inference_args,
+            data_collator=DataCollatorWithPadding(tokenizer),
+        )
 
-    test_predictions = trainer.predict(test_dataset)
+        test_predictions = trainer.predict(test_dataset)
+    finally:
+        if _tmp_dir is not None:
+            _tmp_dir.cleanup()
+
     logits = test_predictions.predictions  # shape: (n_samples, n_classes)
 
     # Softmax probabilities (float32 cast avoids nan/inf on MPS with float16 logits)

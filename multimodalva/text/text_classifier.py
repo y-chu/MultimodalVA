@@ -11,11 +11,16 @@ from pathlib import Path
 
 import pandas as pd
 
-from ..utils.split import split
-from .dataset import prepare_dataset
-from .train import train
-from .predict import predict, PredictionResult
-from .hpo import optimize
+# from ..utils.split import split
+# from .dataset import prepare_dataset
+# from .train import train
+# from .predict import predict, PredictionResult
+# from .hpo import optimize
+
+from multimodalva.utils.split import split
+from multimodalva.text.dataset import prepare_dataset
+from multimodalva.text.train import train
+from multimodalva.text.predict import predict, PredictionResult
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +161,7 @@ class TextClassifier:
 
         # --- Step 3: optional HPO ---
         if use_optimize:
+            from multimodalva.text.hpo import optimize  # noqa: PLC0415
             self.best_hyperparams, self.study = optimize(
                 train_dataset=self.train_dataset,
                 label2id=self.label2id,

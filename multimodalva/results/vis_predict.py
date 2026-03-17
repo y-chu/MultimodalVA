@@ -3,8 +3,11 @@ Result summary and visualization for predictions.
 
 Public API
 ----------
-    performance_leaderboard(df, true_col, model_cols, metrics, sort_by)
+    performance_leaderboard(df, true_col, model_cols, metrics, sort_by,
+                            topk_dfs, top_k)
         Multi-model metric table from a wide prediction DataFrame.
+        Pass ``topk_dfs`` and ``top_k`` (default 3) to append
+        ``top2_accuracy`` and ``top3_accuracy`` columns.
 
     hpo_leaderboard(source, sort_by, top_n, ascending)
         Formatted HPO trial table from an Optuna study or trials DataFrame.
@@ -35,7 +38,6 @@ Public API
 from __future__ import annotations
 
 import logging
-from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -99,6 +101,8 @@ def performance_leaderboard(
     percentage: bool = True,
     prob_dfs: "dict[str, pd.DataFrame] | None" = None,
     id2label: dict | None = None,
+    topk_dfs: "dict[str, pd.DataFrame] | None" = None,
+    top_k: int = 3,
 ) -> pd.DataFrame:
     """Build a multi-model performance leaderboard from a wide prediction DataFrame.
 
@@ -128,6 +132,20 @@ def performance_leaderboard(
             sort_by="log_loss", ascending=True,
         )
 
+    To include top-k accuracy columns (``top2_accuracy``, ``top3_accuracy``, …),
+    pass ``topk_dfs`` with a topk DataFrame per model (from ``result.topk`` or
+    :func:`topk_from_full`) and set ``top_k``::
+
+        topk_dfs = {
+            "pred_bert":     bert_result.topk,
+            "pred_lightgbm": topk_from_full(lgbm_result.full, lgbm_result.id2label, k=3),
+        }
+        board = performance_leaderboard(
+            df, "true_label",
+            topk_dfs=topk_dfs,
+            top_k=3,   # adds top2_accuracy and top3_accuracy columns
+        )
+
     Args:
         df:          DataFrame containing true labels and one or more model
                      prediction columns.
@@ -144,6 +162,8 @@ def performance_leaderboard(
                      ``prob_dfs`` and ``id2label``).
         sort_by:     Metric to sort the leaderboard by.  Default ``"f1_macro"``.
                      Use ``ascending=True`` when sorting by ``"log_loss"``.
+                     Also accepts ``"top2_accuracy"``, ``"top3_accuracy"``, etc.
+                     when ``topk_dfs`` is provided.
         ascending:   Sort direction.  Default ``False`` (highest first).
         percentage:  Multiply label-based metric values by 100 for readability.
                      Default True.  **Not applied to** ``log_loss`` (it is not
@@ -153,10 +173,21 @@ def performance_leaderboard(
                      Required when ``"log_loss"`` is in ``metrics``.
         id2label:    Integer class ID → label string mapping shared across all
                      models.  Required when ``"log_loss"`` is in ``metrics``.
+        topk_dfs:    Dict mapping model column name → topk DataFrame
+                     (``result.topk`` or output of :func:`topk_from_full`).
+                     When provided, columns ``top2_accuracy`` through
+                     ``top{top_k}_accuracy`` are appended to the leaderboard.
+                     Models absent from ``topk_dfs`` will show ``NaN`` for these
+                     columns.
+        top_k:       Highest rank to include in top-k accuracy columns.
+                     Default 3 → adds ``top2_accuracy`` and ``top3_accuracy``.
+                     Set to 1 to skip top-k columns even when ``topk_dfs`` is
+                     provided.  Ignored when ``topk_dfs`` is ``None``.
 
     Returns:
         DataFrame indexed by model name with one column per metric, sorted by
-        ``sort_by``.
+        ``sort_by``.  Top-k accuracy columns (if any) are appended after the
+        requested ``metrics`` columns.
 
     Raises:
         ValueError: If ``true_col`` is not in ``df`` or an unknown metric is
@@ -184,9 +215,18 @@ def performance_leaderboard(
             f"Probability-based (requires prob_dfs + id2label): {sorted(_PROB_METRICS)}."
         )
 
-    if sort_by not in metrics:
+    # Top-k accuracy column names that will be appended (k=2..top_k)
+    topk_metric_names: list[str] = (
+        [f"top{k}_accuracy" for k in range(2, top_k + 1)]
+        if topk_dfs is not None and top_k >= 2
+        else []
+    )
+
+    all_valid_sort_targets = set(metrics) | set(topk_metric_names)
+    if sort_by not in all_valid_sort_targets:
         raise ValueError(
-            f"sort_by={sort_by!r} must be in the requested metrics list: {metrics}."
+            f"sort_by={sort_by!r} must be in the requested metrics list or a "
+            f"top-k accuracy column.  Available: {sorted(all_valid_sort_targets)}."
         )
 
     if prob_metrics and (prob_dfs is None or id2label is None):
@@ -221,11 +261,32 @@ def performance_leaderboard(
                 else:
                     row[m] = float("nan")
 
+        # Top-k accuracy (k = 2 .. top_k)
+        if topk_metric_names:
+            if topk_dfs is not None and col in topk_dfs:
+                try:
+                    acc_df = topk_accuracy(topk_dfs[col], max_k=top_k)
+                    # acc_df rows: k=1,2,...,top_k — index by k
+                    acc_by_k: dict[int, float] = dict(
+                        zip(acc_df["k"].tolist(), acc_df["accuracy"].tolist())
+                    )
+                    for k in range(2, top_k + 1):
+                        metric_name = f"top{k}_accuracy"
+                        val = acc_by_k.get(k, float("nan"))
+                        row[metric_name] = round(val * 100, 2) if percentage else round(val, 4)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not compute top-k accuracy for model %r: %s", col, exc)
+                    for metric_name in topk_metric_names:
+                        row[metric_name] = float("nan")
+            else:
+                for metric_name in topk_metric_names:
+                    row[metric_name] = float("nan")
+
         rows.append(row)
 
     board = pd.DataFrame(rows).set_index("model")
-    # Reorder columns to match the requested metrics order
-    col_order = [m for m in metrics if m in board.columns]
+    # Reorder columns: requested metrics first, then top-k accuracy columns
+    col_order = [m for m in metrics if m in board.columns] + topk_metric_names
     board = board[["n"] + col_order].sort_values(sort_by, ascending=ascending)
     return board
 
@@ -521,6 +582,14 @@ def _draw_group_annotations(
         raise ValueError(
             "group_boundaries and group_labels must have the same length."
         )
+
+    for i, boundary in enumerate(group_boundaries):
+        if not (hasattr(boundary, "__len__") and len(boundary) == 2):
+            raise ValueError(
+                f"group_boundaries[{i}] must be a 2-element (start, end) tuple, "
+                f"got {boundary!r} with {len(boundary) if hasattr(boundary, '__len__') else 'unknown'} elements. "
+                "Example: group_boundaries=[(0.5, 1.5), (2.5, 3.5)]"
+            )
 
     transform = ax.get_xaxis_transform()  # x=data coords, y=axes fraction
     y_line = -0.05   # just below the axes bottom edge (axes fraction)

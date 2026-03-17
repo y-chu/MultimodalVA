@@ -321,9 +321,10 @@ def demo_performance_leaderboard() -> None:
     Demonstrates:
     - Default metrics (accuracy, balanced_accuracy, f1_macro, f1_weighted, csmf_accuracy)
     - Custom metric subset
+    - Top-k accuracy columns (top2_accuracy, top3_accuracy) via topk_dfs
     - Building the wide DataFrame from individual PredictionResults
     """
-    from multimodalva.results import performance_leaderboard
+    from multimodalva.results import performance_leaderboard, topk_from_full
 
     print("\n" + "=" * 60)
     print("C. Performance Leaderboard")
@@ -333,9 +334,9 @@ def demo_performance_leaderboard() -> None:
     print(f"  Predictions DataFrame: {len(pred_df)} samples, "
           f"models: {[c for c in pred_df.columns if c != 'true_label']}")
 
-    # C1: default — all 5 metrics, sort by f1_macro
+    # C1: default — all 10 metrics, sort by f1_macro
     board = performance_leaderboard(pred_df, true_col="true_label")
-    print("\n  C1: Default leaderboard (all 5 metrics, sorted by f1_macro):")
+    print("\n  C1: Default leaderboard (all 10 metrics, sorted by f1_macro):")
     print(board.to_string())
 
     # C2: custom metric subset
@@ -358,8 +359,43 @@ def demo_performance_leaderboard() -> None:
     print("\n  C3: Raw proportions (percentage=False):")
     print(board_raw.to_string())
 
-    # C4: building wide df from PredictionResult objects
-    print("\n  C4: Building wide df from PredictionResults (pattern):")
+    # C4: top-k accuracy columns — top2 and top3 appended after default metrics
+    # Build one full probability DataFrame per model (simulates result.full)
+    full_bert     = _make_full_proba_df(n=300, seed=42)
+    full_lightgbm = _make_full_proba_df(n=300, seed=7)
+    full_ensemble = _make_full_proba_df(n=300, seed=99)
+
+    # Derive top-3 topk DataFrames from full probability matrices
+    topk_dfs = {
+        "pred_bert":     topk_from_full(full_bert,     ID2LABEL, k=3),
+        "pred_lightgbm": topk_from_full(full_lightgbm, ID2LABEL, k=3),
+        "pred_ensemble": topk_from_full(full_ensemble, ID2LABEL, k=3),
+    }
+
+    board_topk = performance_leaderboard(
+        pred_df,
+        true_col="true_label",
+        metrics=["accuracy", "f1_macro", "csmf_accuracy"],
+        topk_dfs=topk_dfs,
+        top_k=3,   # appends top2_accuracy and top3_accuracy columns
+    )
+    print("\n  C4: With top-k accuracy (top2 and top3) appended:")
+    print(board_topk.to_string())
+
+    # C5: sort by top3_accuracy
+    board_by_top3 = performance_leaderboard(
+        pred_df,
+        true_col="true_label",
+        metrics=["accuracy", "f1_macro"],
+        topk_dfs=topk_dfs,
+        top_k=3,
+        sort_by="top3_accuracy",
+    )
+    print("\n  C5: Sorted by top3_accuracy:")
+    print(board_by_top3.to_string())
+
+    # C6: building wide df from PredictionResult objects
+    print("\n  C6: Building wide df from PredictionResults (pattern):")
     print("""
     # After running text and tabular classifiers:
     pred_wide = pd.DataFrame({
@@ -368,7 +404,15 @@ def demo_performance_leaderboard() -> None:
         "pred_lightgbm": tabular_result.top1["predicted_label"],
         "pred_ensemble": ensemble_result.top1["predicted_label"],
     })
-    board = performance_leaderboard(pred_wide, true_col="true_label")
+    topk_dfs = {
+        "pred_bert":     text_result.topk,
+        "pred_lightgbm": tabular_result.topk,
+        "pred_ensemble": ensemble_result.topk,
+    }
+    board = performance_leaderboard(
+        pred_wide, true_col="true_label",
+        topk_dfs=topk_dfs, top_k=3,
+    )
     """)
 
 

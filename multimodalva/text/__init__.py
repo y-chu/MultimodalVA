@@ -10,6 +10,7 @@ Sub-modules:
     - text_classifier: TextClassifier wrapper — user-facing API (step 6)
 """
 
-from .text_classifier import TextClassifier
+#from .text_classifier import TextClassifier
+from multimodalva.text.text_classifier import TextClassifier
 
 __all__ = ["TextClassifier"]

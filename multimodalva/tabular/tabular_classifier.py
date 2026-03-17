@@ -15,7 +15,6 @@ import pandas as pd
 from ..utils.split import split
 from ..utils.types import PredictionResult
 from .dataset import prepare_dataset
-from .hpo import optimize
 from .predict import predict
 from .train import train
 
@@ -165,6 +164,7 @@ class TabularClassifier:
 
         # --- Step 3: optional HPO ---
         if use_optimize:
+            from multimodalva.tabular.hpo import optimize  # noqa: PLC0415
             self.best_hyperparams, self.study = optimize(
                 X_train=self.X_train,
                 y_train=self.y_train,

@@ -22,14 +22,27 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import optuna
 
 import numpy as np
-import optuna
-from optuna.pruners import MedianPruner
-from optuna.samplers import TPESampler
 from sklearn.model_selection import StratifiedShuffleSplit
+
+# -----------------------
+# Package root resolution (mirrors text/hpo.py)
+# -----------------------
+# __file__ = multimodalva/tabular/hpo.py  →  parent.parent.parent = project root
+# Inserted into sys.path so that "from multimodalva.xxx import ..." resolves
+# correctly in direct-script and Ray worker contexts.
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent  # MultimodalVA/
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
 
 from ..utils.metrics import (  # noqa: F401
     csmf_accuracy, score_predictions, sample_hyperparams,
@@ -166,6 +179,22 @@ def optimize(
     Raises:
         ValueError: If model_name is not supported or metric is invalid.
     """
+    try:
+        import optuna
+        from optuna.pruners import MedianPruner
+        from optuna.samplers import TPESampler
+    except ImportError as exc:
+        raise ImportError(
+            "optuna is required for optimize(). "
+            "Install with:  pip install 'optuna>=3.4'"
+        ) from exc
+
+    _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
+    if metric not in _VALID_METRICS:
+        raise ValueError(
+            f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
+        )
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -180,7 +209,8 @@ def optimize(
         active_space.update(search_space)
 
     if storage_path is None:
-        storage_path = f"sqlite:///{output_dir}/hpo_{model_name}.db"
+        # Use resolved absolute path so the DB is always found regardless of CWD.
+        storage_path = f"sqlite:///{output_dir.resolve()}/hpo_{model_name}.db"
 
     # Stratified internal split — never uses the held-out test set
     sss = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)
@@ -236,17 +266,26 @@ def optimize(
     completed = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
     remaining = n_trials - completed
     if remaining > 0:
-        study.optimize(objective, n_trials=remaining)
+        # catch=(Exception,) lets Optuna mark a failed trial as FAILED and continue
+        # with remaining trials instead of crashing the whole HPO run (e.g. on OOM).
+        study.optimize(objective, n_trials=remaining, catch=(Exception,))
     else:
         logger.info("All %d trials already completed. Skipping optimization.", n_trials)
 
     best_hyperparams = study.best_params
 
-    # Copy best trial artifacts
+    # Copy best trial artifacts — remove stale artifacts first so resume never
+    # silently merges weights from two different best trials.
     best_trial_dir = output_dir / f"trial_{study.best_trial.number}"
     best_output_dir = output_dir / "best_trial"
     if best_trial_dir.exists():
-        shutil.copytree(best_trial_dir, best_output_dir, dirs_exist_ok=True)
+        if best_output_dir.exists():
+            shutil.rmtree(best_output_dir)
+        shutil.copytree(best_trial_dir, best_output_dir)
+    else:
+        logger.warning(
+            "Best trial directory not found at %s — best_trial/ not updated.", best_trial_dir
+        )
 
     with open(output_dir / "best_hyperparams.json", "w") as f:
         json.dump(
@@ -327,7 +366,7 @@ def _tabular_ray_trial_fn(
     """Single-trial trainable for Ray Tune (tabular pipeline).
 
     Called once per trial by a Ray worker process.  Runs ``train()`` followed
-    by ``predict()`` and reports all four evaluation metrics to the Ray runtime
+    by ``predict()`` and reports all six evaluation metrics to the Ray runtime
     via ``ray.train.report()``.
 
     Numpy arrays (``X_opt_train``, ``y_opt_train``, ``X_opt_val``,
@@ -339,12 +378,37 @@ def _tabular_ray_trial_fn(
     variants (CatBoost, LightGBM, XGBoost) manage their own device memory and
     release it when the model object goes out of scope.
 
+    Ray 2.x API used:
+      - ``ray.tune.get_context().get_trial_dir()``  — trial artifact directory
+        (``ray.train.get_context()`` is deprecated for function trainables per
+        https://github.com/ray-project/ray/issues/49454).
+      - ``ray.train.report(metrics_dict)``           — metric reporting.
+
     This function must be defined at module level (not nested) so that Ray can
     serialise it by reference when dispatching to remote workers.
     """
-    from ray import train as _ray_train
+    # ----- Ray 2.x API -----
+    # ray.tune.get_context() is correct for function trainables passed to tune.Tuner.
+    # ray.train.get_context() is deprecated in that context (Ray issue #49454).
+    from ray import tune as _ray_tune
+    import ray.train as _ray_train
 
-    trial_dir = Path(_ray_train.get_context().get_trial_dir())
+    # ----- Ensure multimodalva is importable in the worker process -----
+    # Each Ray worker is a fresh Python subprocess; insert the project root into
+    # sys.path so absolute imports resolve even without a formal pip install.
+    import sys as _sys
+    _project_root = str(Path(__file__).resolve().parent.parent.parent)
+    if _project_root not in _sys.path:
+        _sys.path.insert(0, _project_root)
+
+    from multimodalva.tabular.train import train as _train
+    from multimodalva.tabular.predict import predict as _predict
+    from multimodalva.utils.metrics import score_predictions, log_loss_from_full
+
+    # ----- Trial artifact directory (Ray 2.x Tune API) -----
+    ctx = _ray_tune.get_context()
+    trial_dir = Path(ctx.get_trial_dir())
+    trial_dir.mkdir(parents=True, exist_ok=True)
 
     all_scores: dict = {
         "accuracy": 0.0,
@@ -355,7 +419,7 @@ def _tabular_ray_trial_fn(
         "log_loss": float("inf"),  # minimised — inf signals trial failure
     }
     try:
-        train(
+        _train(
             X_opt_train, y_opt_train,
             label2id=label2id,
             id2label=id2label,
@@ -366,7 +430,7 @@ def _tabular_ray_trial_fn(
             n_jobs=n_jobs,
             use_gpu=use_gpu,
         )
-        result = predict(trial_dir, X_opt_val, y_opt_val)
+        result = _predict(trial_dir, X_opt_val, y_opt_val)
         all_scores = {
             m: score_predictions(result.top1, m)
             for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
@@ -510,9 +574,16 @@ def optimize_ray(
         ValueError:  If model_name is not in SUPPORTED_MODELS.
         ImportError: If ``ray[tune]`` is not installed.
     """
+    _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
+    if metric not in _VALID_METRICS:
+        raise ValueError(
+            f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
+        )
+
     try:
         import ray
-        from ray import tune, air
+        from ray import tune
+        from ray.train import RunConfig  # ray.air.RunConfig deprecated in Ray 2.7+
         from ray.tune.search.optuna import OptunaSearch
         from ray.tune.search import ConcurrencyLimiter
     except ImportError as exc:
@@ -635,10 +706,9 @@ def optimize_ray(
             search_alg=search_alg,
             max_concurrent_trials=max_concurrent_trials,
         ),
-        run_config=air.RunConfig(
+        run_config=RunConfig(
             storage_path=str(output_dir),
             name="tabular_hpo_ray",
-            log_to_file=True,
         ),
     )
 
@@ -647,7 +717,20 @@ def optimize_ray(
         "cpus/trial=%d  gpus/trial=%.1f",
         n_trials, model_name, metric, num_cpus_per_trial, num_gpus_per_trial,
     )
-    results = tuner.fit()
+    # AutoGluon sets RAY_AIR_NEW_OUTPUT=1, which changes Ray's verbose handling.
+    # Ray internally passes verbose="auto" (a string) but the new output path
+    # in get_air_verbosity() expects int or AirVerbosity enum → AttributeError.
+    # Force RAY_AIR_NEW_OUTPUT=0 for our HPO run to use the stable output path,
+    # then restore the caller's value so AutoGluon's own runs are unaffected.
+    _prev_ray_output = os.environ.get("RAY_AIR_NEW_OUTPUT")
+    os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
+    try:
+        results = tuner.fit()
+    finally:
+        if _prev_ray_output is None:
+            os.environ.pop("RAY_AIR_NEW_OUTPUT", None)
+        else:
+            os.environ["RAY_AIR_NEW_OUTPUT"] = _prev_ray_output
 
     # --- Extract best result ---
     best_result = results.get_best_result(metric=metric, mode=_ray_mode)
@@ -668,11 +751,18 @@ def optimize_ray(
     logger.info("Best trial artifacts: %s", best_result.path)
 
     # --- Copy best trial artifacts to a predictable location ---
+    # Remove stale artifacts first so resume never silently merges two trials.
     best_trial_path = Path(best_result.path)
     best_output_dir = output_dir / "best_trial"
     if best_trial_path.exists():
-        shutil.copytree(best_trial_path, best_output_dir, dirs_exist_ok=True)
+        if best_output_dir.exists():
+            shutil.rmtree(best_output_dir)
+        shutil.copytree(best_trial_path, best_output_dir)
         logger.info("Copied best trial artifacts to %s", best_output_dir)
+    else:
+        logger.warning(
+            "Best trial path not found at %s — best_trial/ not updated.", best_trial_path
+        )
 
     # --- Save all trial results as CSV ---
     if save_trials_csv:
