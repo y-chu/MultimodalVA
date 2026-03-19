@@ -78,10 +78,11 @@ class TextClassifier:
         max_length: int = 512,
         hyperparams: dict | None = None,
         use_optimize: bool = False,
-        n_trials: int = 20,
+        n_trials: int = 30,
         optimize_metric: str = "accuracy",
         search_space: dict | None = None,
         batch_size: int = 32,
+        use_lora: bool = True,
     ) -> dict:
         """Run the full text classification pipeline.
 
@@ -116,11 +117,16 @@ class TextClassifier:
                          freeze_layers. See train() for the full list.
             use_optimize: Run Optuna HPO before final training. Default False.
             n_trials: Number of Optuna trials (only used when use_optimize=True).
+                      Default 30.
             optimize_metric: Metric to maximize during HPO — "accuracy", "f1_macro",
                              "f1_weighted", "csmf_accuracy". Default "accuracy".
             search_space: Custom Optuna search space dict (only used when
                           use_optimize=True). Merged over DEFAULT_SEARCH_SPACE.
             batch_size: Inference batch size for predict(). Default 32.
+            use_lora: Apply LoRA adapters for parameter-efficient fine-tuning.
+                      Reduces GPU memory and improves generalisation on small datasets.
+                      When True, LoRA hyperparameters (lora_r, lora_alpha, lora_dropout)
+                      are also searched during HPO. Default True.
 
         Returns:
             results: Dict with keys:
@@ -172,6 +178,7 @@ class TextClassifier:
                 metric=optimize_metric,
                 search_space=search_space,
                 random_state=random_state,
+                use_lora=use_lora,
             )
             final_hyperparams = self.best_hyperparams
             # HPO already determined epochs; train on full training data.
@@ -191,6 +198,7 @@ class TextClassifier:
             output_dir=self.output_dir / "final",
             hyperparams=final_hyperparams,
             val_size=final_val_size,
+            use_lora=use_lora,
         )
 
         # --- Step 5: predict on test set ---

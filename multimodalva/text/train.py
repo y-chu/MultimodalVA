@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tarfile
 import tempfile
 import urllib.request
@@ -417,6 +418,7 @@ def train(
     gradient_checkpointing: bool = False,
     early_stopping_patience: int | None = None,
     resume: bool = True,
+    cleanup_checkpoints: bool = False,
 ) -> tuple[Trainer, AutoTokenizer, dict]:
     """Fine-tune a BERT-family model for multiclass classification.
 
@@ -458,6 +460,13 @@ def train(
                                   is provided. Default None (disabled).
         resume: Resume training from the latest checkpoint in output_dir.
                 Default True.
+        cleanup_checkpoints: Delete intermediate ``checkpoint-*/`` subdirectories
+                             from output_dir after training completes successfully.
+                             These checkpoints are only needed to resume an interrupted
+                             run; once training is done they consume significant disk
+                             space (equal to the full model size per checkpoint, up to
+                             ``save_total_limit=2``).  The final model weights saved
+                             directly in output_dir are unaffected.  Default False.
 
     Returns:
         trainer:   HuggingFace Trainer with the fine-tuned model at trainer.model.
@@ -524,11 +533,31 @@ def train(
         )
 
     # --- Load base model ---
+    # classifier_dropout overrides the model config's dropout on the classification head.
+    # Set via hp["classifier_dropout"] (float, 0.0–0.5); None = use model default (~0.1).
+    # Not all architectures expose this kwarg (e.g. Longformer uses hidden_dropout_prob).
+    # Auto-detect support via the config class __init__ signature to avoid TypeError.
+    _extra_model_kwargs = {}
+    if "classifier_dropout" in hp and hp["classifier_dropout"] is not None:
+        import inspect
+        from transformers import AutoConfig
+        _cfg_cls = type(AutoConfig.from_pretrained(model_name))
+        if "classifier_dropout" in inspect.signature(_cfg_cls.__init__).parameters:
+            _extra_model_kwargs["classifier_dropout"] = hp["classifier_dropout"]
+        else:
+            logger.warning(
+                "Model '%s' (%s) does not support 'classifier_dropout' — "
+                "ignoring hp['classifier_dropout']=%.3f.  "
+                "To control head dropout for this architecture, pass the appropriate "
+                "config key (e.g. hidden_dropout_prob) via the hyperparams dict.",
+                model_name, _cfg_cls.__name__, hp["classifier_dropout"],
+            )
     base_model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=num_labels,
         id2label=id2label,
         label2id=label2id,
+        **_extra_model_kwargs,
     )
 
     # --- Apply LoRA ---
@@ -648,6 +677,20 @@ def train(
     # --- Save model and tokenizer ---
     trainer.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
+
+    # --- Optionally remove intermediate checkpoints ---
+    # checkpoint-* dirs are only needed to resume an interrupted training run.
+    # After successful completion the final weights are in output_dir; the
+    # checkpoint copies are redundant and can be several hundred MB each.
+    if cleanup_checkpoints:
+        for ckpt in output_dir.iterdir():
+            if (
+                ckpt.is_dir()
+                and ckpt.name.startswith("checkpoint-")
+                and ckpt.name.split("-")[-1].isdigit()
+            ):
+                shutil.rmtree(ckpt)
+                logger.info("Removed checkpoint: %s", ckpt)
 
     # --- Save label maps and hyperparams ---
     with open(output_dir / "label2id.json", "w") as f:

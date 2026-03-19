@@ -10,6 +10,7 @@ Covers:
     F. confusion_heatmap         — per-model heatmap with count / row-normalised / abbreviated variants
     G. cause_accuracy_heatmap    — cause × model accuracy grid; top-1 or top-k; column grouping
     H. cause_accuracy_diff_heatmap — difference vs. a baseline model; diverging colormap centred at 0
+    I. plot_topk_accuracy          — single-model bar, multi-model grouped, multi-model facet (2-col grid)
 
 All sections use synthetic data so no model training is required.
 
@@ -898,6 +899,86 @@ def demo_cause_accuracy_diff_heatmap() -> None:
 
 
 # ---------------------------------------------------------------------------
+# I. plot_topk_accuracy — bar charts (single, grouped, facet)
+# ---------------------------------------------------------------------------
+
+def demo_plot_topk_accuracy() -> None:
+    """Section I: top-k accuracy bar charts.
+
+    Demonstrates:
+    - I1: single-model bar chart (one colour per k)
+    - I2: multi-model grouped bar chart (one bundle per k, models side by side)
+    - I3: multi-model facet bar chart (2 × 2 grid, shared y-axis)
+    """
+    import matplotlib.pyplot as plt
+    from multimodalva.results import topk_from_full, plot_topk_accuracy
+
+    print("\n" + "=" * 60)
+    print("I. plot_topk_accuracy — bar charts")
+    print("=" * 60)
+
+    # Synthetic full-prob DataFrames for four mock models
+    rng = np.random.default_rng(0)
+
+    def _make_topk(n: int = 300, seed: int = 0) -> "pd.DataFrame":
+        rng_  = np.random.default_rng(seed)
+        full_ = _make_full_proba_df(n=n)
+        return topk_from_full(full_, ID2LABEL, k=3)
+
+    topk_bert  = _make_topk(seed=0)
+    topk_lgbm  = _make_topk(seed=1)
+    topk_df_   = _make_topk(seed=2)
+    topk_stack = _make_topk(seed=3)
+
+    # I1: Single-model bar chart
+    print("\n  I1: Single-model bar chart")
+    fig, ax = plot_topk_accuracy(
+        topk_bert,
+        max_k=3,
+        model_label="BioBERT (adults)",
+        save_path="/tmp/topk_single.png",
+    )
+    print("  Saved to /tmp/topk_single.png")
+    plt.show()
+
+    # I2: Multi-model grouped bar chart
+    print("\n  I2: Multi-model grouped bar chart")
+    fig, ax = plot_topk_accuracy(
+        {
+            "BioBERT":    topk_bert,
+            "LightGBM":   topk_lgbm,
+            "Data Fusion": topk_df_,
+            "Stacking":   topk_stack,
+        },
+        max_k=3,
+        kind="grouped",
+        title="Top-k Accuracy Comparison",
+        save_path="/tmp/topk_grouped.png",
+    )
+    print("  Saved to /tmp/topk_grouped.png")
+    plt.show()
+
+    # I3: Multi-model facet bar chart (2 × 2 grid)
+    print("\n  I3: Multi-model facet bar chart (2 cols × 2 rows)")
+    fig, axes = plot_topk_accuracy(
+        {
+            "BioBERT":    topk_bert,
+            "LightGBM":   topk_lgbm,
+            "Data Fusion": topk_df_,
+            "Stacking":   topk_stack,
+        },
+        max_k=3,
+        kind="facet",
+        ncols=2,
+        title="Top-k Accuracy by Model",
+        save_path="/tmp/topk_facet.png",
+    )
+    print(f"  axes shape: {axes.shape}")
+    print("  Saved to /tmp/topk_facet.png")
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -913,6 +994,7 @@ if __name__ == "__main__":
         "F": demo_confusion_heatmap,
         "G": demo_cause_accuracy_heatmap,
         "H": demo_cause_accuracy_diff_heatmap,
+        "I": demo_plot_topk_accuracy,
     }
 
     # Run a specific section if passed as argument, else run all

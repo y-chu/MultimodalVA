@@ -87,7 +87,7 @@ class TabularClassifier:
         scale_numeric: bool = False,
         hyperparams: dict | None = None,
         use_optimize: bool = False,
-        n_trials: int = 20,
+        n_trials: int = 50,
         optimize_metric: str = "accuracy",
         search_space: dict | None = None,
         top_k: int = 3,
@@ -116,7 +116,7 @@ class TabularClassifier:
             num_cols:         Numeric feature columns. Auto-detected if None.
             hyperparams:      Fixed hyperparameter dict. Ignored when use_optimize=True.
             use_optimize:     Run Optuna HPO before final training. Default False.
-            n_trials:         Optuna trial count (use_optimize=True only). Default 20.
+            n_trials:         Optuna trial count (use_optimize=True only). Default 50.
             optimize_metric:  Metric to maximise during HPO. Default "accuracy".
                               Options: "accuracy", "f1_macro", "f1_weighted", "csmf_accuracy".
             search_space:     Custom Optuna search space dict (use_optimize=True only).

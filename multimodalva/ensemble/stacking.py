@@ -344,34 +344,38 @@ def _insilicova_save_config(
     id2label: dict,
     feature_cols: list[str] | None,
     output_dir: Path,
+    label_col: str = "cause",
 ) -> None:
     """Persist InSilicoVA run configuration to *output_dir*.
 
-    InSilicoVA has no trainable weights — it applies a fixed Bayesian symptom-
-    cause probability database at inference time.  This function saves all
-    parameters needed to reproduce the prediction call, and writes a dummy
-    ``training_metadata.json`` so the standard resume-detection logic (which
-    looks for that file) works unchanged.
+    InSilicoVA uses ``data_type="customize"``: it learns symptom-cause
+    probabilities from the training data at inference time.  The output
+    ``indiv_prob`` columns are named directly by the user's cause labels
+    from the training data — no cause mapping is needed.
+
+    A dummy ``training_metadata.json`` is written so the standard
+    resume-detection logic (which looks for that file) works unchanged.
 
     Args:
         spec:          Model spec dict (``model_name="insilicova"``).
-        best_hp:       Hyperparams dict (``n_sim``, ``burnin``, ``thin``, …).
+        best_hp:       Hyperparams dict (``Nsim``, ``burnin``, ``thin``, …).
                        Falls back to ``spec["hyperparams"]`` when ``None``.
         label2id:      Shared label → integer map.
         id2label:      Shared integer → label map.
         feature_cols:  Fallback VA indicator columns when ``spec["va_cols"]``
                        is absent.
         output_dir:    Target directory (created if missing).
+        label_col:     Column name in training DataFrame containing cause labels.
+                       Passed to InSilicoVA as ``causes_train``. Default "cause".
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     hp = best_hp or spec.get("hyperparams") or {}
 
     config: dict = {
-        # cause_map: {user_label_name: InSilicoVA_column_name} or None (auto)
-        "cause_map":   spec.get("cause_map"),
-        # va_cols: raw VA indicator columns to pass to InSilicoVA
+        # va_cols: raw VA indicator columns to pass to InSilicoVA (excludes label)
         "va_cols":     spec.get("va_cols", feature_cols),
-        "data_type":   spec.get("data_type", "WHO2016"),
+        # label_col: cause column in training DataFrame (used as causes_train)
+        "label_col":   spec.get("label_col", label_col),
         "hyperparams": hp,
         "id2label":    {str(k): v for k, v in id2label.items()},
         "label2id":    label2id,
@@ -390,36 +394,40 @@ def _insilicova_predict_df(
     config_dir: Path,
     df: pd.DataFrame,
     sorted_ids: list,
+    train_df: pd.DataFrame | None = None,
 ) -> np.ndarray:
-    """Run InSilicoVA on *df* and return a probability matrix.
+    """Run InSilicoVA (customize mode) on *df* and return a probability matrix.
 
-    Loads the config saved by :func:`_insilicova_save_config`, calls
-    ``InSilicoVA.run()``, then maps InSilicoVA's built-in cause names to the
-    canonical ``id2label`` ordering shared by all other base models.
+    Uses ``data_type="customize"``: passes *train_df* (with the cause column)
+    as the training reference so InSilicoVA learns symptom-cause probabilities
+    from the actual training data rather than the fixed WHO database.  The
+    ``indiv_prob`` columns returned by InSilicoVA are then named by the user's
+    own cause labels — no cause mapping is required.
 
-    Cause mapping
-    ~~~~~~~~~~~~~
-    InSilicoVA produces ``indiv_prob`` columns named by its internal cause
-    list (e.g. ``"HIV/AIDS related death"``, ``"Malaria"``).  These are mapped
-    to the pipeline's ``id2label`` values via ``cause_map`` (a
-    ``{user_label: insilicova_column}`` dict).  When ``cause_map`` is ``None``
-    in the config, auto-matching is attempted by case-insensitive string
-    comparison; a warning is logged for any unmatched causes, whose columns
-    receive probability 0.  Every row is renormalised to sum to 1.
+    Equivalent R call::
+
+        codeVA(data = df, data.type = "customize", model = "InSilicoVA",
+               data.train = train_df, causes.train = label_col,
+               Nchain = 3, Nsim = 10000, auto.length = TRUE)
 
     Args:
         config_dir:  Directory containing ``insilicova_config.json``.
-        df:          Raw VA DataFrame (cases × VA indicator columns).
-                     Pass ``reset_index(drop=True)`` so row positions align
-                     with InSilicoVA's output.
+        df:          VA DataFrame of cases to classify (symptom columns only,
+                     no label).  Pass ``reset_index(drop=True)`` so row
+                     positions align with InSilicoVA's output.
         sorted_ids:  Sorted integer class IDs (from ``sorted(id2label.keys())``).
+        train_df:    Training DataFrame including the cause label column.
+                     Required for ``data_type="customize"``.  For OOF, pass
+                     the fold's training rows; for test prediction, pass the
+                     full training set.
 
     Returns:
         np.ndarray of shape ``(len(df), len(sorted_ids))``.
 
     Raises:
-        ImportError:  ``pyinsilicova`` is not installed.
-        FileNotFoundError:  ``insilicova_config.json`` missing in *config_dir*.
+        ImportError:       ``pyinsilicova`` is not installed.
+        FileNotFoundError: ``insilicova_config.json`` missing in *config_dir*.
+        ValueError:        *train_df* is None (required for customize mode).
     """
     try:
         from pyinsilicova.insilicova import InSilicoVA
@@ -433,55 +441,57 @@ def _insilicova_predict_df(
         config = json.load(fh)
 
     id2label  = {int(k): v for k, v in config["id2label"].items()}
-    cause_map: dict | None = config.get("cause_map")
     va_cols   = config.get("va_cols")
-    data_type = config.get("data_type", "WHO2016")
+    label_col = config.get("label_col", "cause")
     hp        = {k: v for k, v in (config.get("hyperparams") or {}).items()}
 
-    va_data = df[va_cols].reset_index(drop=True) if va_cols else df.reset_index(drop=True)
+    if train_df is None:
+        raise ValueError(
+            "train_df is required for InSilicoVA (data_type='customize').  "
+            "Pass the fold training rows for OOF, or the full training set "
+            "for test prediction."
+        )
 
-    logger.info("Running InSilicoVA on %d cases (data_type=%s) ...", len(va_data), data_type)
-    isva = InSilicoVA(va_data, data_type=data_type, **hp)
+    # Extract VA indicator columns (exclude label from train_df)
+    val_va   = df[va_cols].reset_index(drop=True)   if va_cols else df.reset_index(drop=True)
+    train_va = train_df[va_cols + [label_col]].reset_index(drop=True) if va_cols else train_df.reset_index(drop=True)
+
+    logger.info(
+        "Running InSilicoVA (customize) on %d cases with %d training samples ...",
+        len(val_va), len(train_va),
+    )
+    isva = InSilicoVA(
+        val_va,
+        data_type="customize",
+        train_data=train_va,
+        causes_train=label_col,
+        **hp,
+    )
     isva.run()
-    indiv_probs: pd.DataFrame = isva.indiv_prob  # rows = cases, cols = cause names
+    indiv_probs: pd.DataFrame = isva.indiv_prob   # cols = user's cause labels
 
-    # Build cause_map on first call when not provided explicitly
-    if cause_map is None:
-        isva_lower = {c.lower(): c for c in indiv_probs.columns}
-        cause_map  = {}
-        for cid in sorted_ids:
-            label = id2label[cid]
-            if label.lower() in isva_lower:
-                cause_map[label] = isva_lower[label.lower()]
-
-        n_unmatched = len(sorted_ids) - len(cause_map)
-        if n_unmatched > 0:
-            unmatched = [
-                id2label[cid] for cid in sorted_ids
-                if id2label[cid] not in cause_map
-            ]
-            logger.warning(
-                "InSilicoVA: %d/%d cause(s) could not be auto-matched to "
-                "InSilicoVA cause names and will receive probability 0.  "
-                "Provide an explicit 'cause_map' in the spec to suppress this.  "
-                "Unmatched: %s",
-                n_unmatched, len(sorted_ids), unmatched,
-            )
-
+    # Direct column lookup — output column names match user's cause labels
     n         = len(df)
     n_classes = len(sorted_ids)
     proba     = np.zeros((n, n_classes), dtype=float)
 
+    missing = []
     for j, cid in enumerate(sorted_ids):
-        label    = id2label[cid]
-        isva_col = cause_map.get(label)
-        if isva_col and isva_col in indiv_probs.columns:
-            proba[:, j] = indiv_probs[isva_col].to_numpy(dtype=float)
+        label = id2label[cid]
+        if label in indiv_probs.columns:
+            proba[:, j] = indiv_probs[label].to_numpy(dtype=float)
+        else:
+            missing.append(label)
 
-    # Renormalise rows — handles unmatched causes and floating-point drift
-    row_sums = proba.sum(axis=1, keepdims=True)
-    row_sums = np.where(row_sums == 0, 1.0, row_sums)
-    proba   /= row_sums
+    if missing:
+        logger.warning(
+            "InSilicoVA: %d cause(s) not found in indiv_prob output: %s.  "
+            "These columns receive probability 0 and rows are renormalised.",
+            len(missing), missing,
+        )
+        row_sums = proba.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums == 0, 1.0, row_sums)
+        proba   /= row_sums
 
     return proba
 
@@ -519,6 +529,7 @@ def generate_oof_predictions(
     # InSilicoVA — raw DataFrame needed for pyinsilicova (not numpy arrays)
     train_df: pd.DataFrame | None = None,
     feature_cols: list[str] | None = None,
+    label_col: str = "cause",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate out-of-fold probability predictions for all base models.
 
@@ -557,6 +568,12 @@ def generate_oof_predictions(
         text_best_hp:         Pre-computed HP dicts for text models (from HPO).
                               ``None`` → use ``spec["hyperparams"]`` as-is.
         tabular_best_hp:      Pre-computed HP dicts for tabular models.
+        train_df:             Full training DataFrame (required when any spec
+                              has ``model_name="insilicova"``).
+        feature_cols:         VA indicator columns for InSilicoVA.
+        label_col:            Cause label column name in *train_df*.
+                              Passed to InSilicoVA as ``causes_train``.
+                              Default "cause".
 
     Returns:
         Tuple ``(oof_meta_X, oof_y)`` where:
@@ -667,8 +684,8 @@ def generate_oof_predictions(
                 logger.info("  [tab_%d fold_%d] Training %s ...", i, fold_idx, model_name)
 
                 if model_name == _INSILICOVA:
-                    # InSilicoVA has no training phase — save config, then
-                    # run directly on fold val rows from the raw DataFrame.
+                    # InSilicoVA (customize mode): learns symptom-cause probs
+                    # from the fold training rows; predicts on fold val rows.
                     if train_df is None:
                         raise ValueError(
                             "train_df must be supplied to generate_oof_predictions() "
@@ -678,11 +695,13 @@ def generate_oof_predictions(
                     _insilicova_save_config(
                         spec, hp, label2id, id2label, feature_cols,
                         model_dir / "weights",
+                        label_col=label_col,
                     )
                     fold_probs = _insilicova_predict_df(
                         model_dir / "weights",
                         train_df.iloc[val_idx].reset_index(drop=True),
                         sorted_ids,
+                        train_df=train_df.iloc[train_idx].reset_index(drop=True),
                     )
                 else:
                     hp = (tabular_best_hp[i] if tabular_best_hp else None) or spec.get("hyperparams")
@@ -783,14 +802,19 @@ class StackingClassifier:
         meta_select_metric: str = "f1_macro",
         n_folds: int = 5,
         resume: bool = True,
+        load_oof_from: str | Path | None = None,
     ):
         """Initialise StackingClassifier.
 
         Args:
             text_models:          List of text base-model spec dicts.
                                   Same format as SoftVotingClassifier.
+                                  When ``load_oof_from`` is set, list **only
+                                  the new models** to add — do not repeat
+                                  models already in the source run.
             tabular_models:       List of tabular base-model spec dicts.
-            output_dir:           Root output directory.
+                                  Same rule as ``text_models``.
+            output_dir:           Root output directory for this run.
             meta_learners:        One meta-learner spec dict, or a list of
                                   candidates (the best by CV score is chosen).
                                   Default: logistic regression (C=1.0).
@@ -800,6 +824,26 @@ class StackingClassifier:
                                   ``f1_weighted``, ``csmf_accuracy``.
             n_folds:              CV folds for the OOF loop. Default 5.
             resume:               Resume interrupted training. Default True.
+            load_oof_from:        Path to an existing stacking ``output_dir``
+                                  whose OOF predictions should be reused.
+                                  When set:
+
+                                  * The train/test split from that run is
+                                    reused verbatim (row alignment is required).
+                                  * OOF is only computed for the models in
+                                    *this* ``text_models`` / ``tabular_models``
+                                    (the newly added ones).
+                                  * The combined OOF matrix
+                                    ``[inherited | new]`` feeds Stage 2.
+                                  * ``predict_test()`` draws final-model
+                                    weights from the original run for inherited
+                                    models and from ``output_dir/final/`` for
+                                    new models.
+                                  * Chaining is supported: the source run may
+                                    itself have been created with
+                                    ``load_oof_from``.
+
+                                  Default ``None`` (standard full training).
         """
         if not text_models and not tabular_models:
             raise ValueError("At least one text or tabular model spec is required.")
@@ -817,6 +861,7 @@ class StackingClassifier:
         self.meta_select_metric = meta_select_metric
         self.n_folds            = n_folds
         self.resume             = resume
+        self.load_oof_from      = Path(load_oof_from) if load_oof_from else None
 
         # Populated after train_base_models()
         self.train_df:       pd.DataFrame | None = None
@@ -953,16 +998,98 @@ class StackingClassifier:
         self._feature_cols = feature_cols
         self._label_col   = label_col
 
-        # --- Step 1: split --------------------------------------------------
-        self.train_df, self.test_df = split(
-            df, label_col=label_col, text_col=text_col,
-            test_size=test_size, random_state=random_state, stratify=stratify,
-        )
-        logger.info("Split: %d train / %d test", len(self.train_df), len(self.test_df))
-
-        # Save splits for predict_test() in future sessions
         data_dir = self.output_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Inherited OOF loading (load_oof_from) --------------------------
+        # When load_oof_from is set:
+        #   • Reuse the exact train/test split from the source run (row alignment).
+        #   • Only run OOF for the NEW models listed in text_models/tabular_models.
+        #   • Concatenate [inherited_oof | new_oof] column-wise.
+        #   • Store absolute final_dir paths in model_sources so predict_test()
+        #     can locate weights for both old and new models across sessions.
+        inherited_oof_X: np.ndarray | None = None
+        inherited_model_sources: list[dict] = []
+
+        if self.load_oof_from:
+            _src = self.load_oof_from
+            _ioof_file = _src / "oof" / "oof_meta_X.npy"
+            if not _ioof_file.exists():
+                raise FileNotFoundError(
+                    f"oof_meta_X.npy not found in {_src / 'oof'}.  "
+                    "Run train_base_models() on the source stacking run first."
+                )
+            inherited_oof_X = np.load(_ioof_file)
+            logger.info(
+                "load_oof_from: loaded inherited OOF matrix %s from %s",
+                inherited_oof_X.shape, _src,
+            )
+
+            # Reuse the source split — OOF row i must mean the same training
+            # sample in both inherited and new matrices.
+            _src_data = _src / "data"
+            if not (_src_data / "train_df.csv").exists():
+                raise FileNotFoundError(
+                    f"train_df.csv not found in {_src_data}.  "
+                    "The source run must have been completed with train_base_models()."
+                )
+            logger.info(
+                "load_oof_from: reusing train/test split from %s to guarantee "
+                "OOF row alignment.  The df argument is still used to prepare "
+                "features for the new models.", _src,
+            )
+            self.train_df = pd.read_csv(_src_data / "train_df.csv")
+            self.test_df  = pd.read_csv(_src_data / "test_df.csv")
+
+            if inherited_oof_X.shape[0] != len(self.train_df):
+                raise ValueError(
+                    f"Inherited OOF has {inherited_oof_X.shape[0]} rows but "
+                    f"train_df.csv has {len(self.train_df)} rows — shape mismatch.  "
+                    "Ensure load_oof_from points to the correct source run."
+                )
+
+            # Load model_sources from source metadata (supports chaining)
+            _src_meta_path = _src / "oof" / "oof_metadata.json"
+            if _src_meta_path.exists():
+                with open(_src_meta_path) as _f:
+                    _src_meta = json.load(_f)
+                if "model_sources" in _src_meta:
+                    inherited_model_sources = _src_meta["model_sources"]
+                else:
+                    # Backward compat: construct from old flat metadata fields
+                    _old_text    = _src_meta.get("text_specs", [])
+                    _old_tabular = _src_meta.get("tabular_specs", [])
+                    _old_nc      = _src_meta.get("n_classes", 1)
+                    _col = 0
+                    for _j, _spec in enumerate(_old_text):
+                        inherited_model_sources.append({
+                            "type": "text", "local_index": _j, "spec": _spec,
+                            "final_dir": str((_src / "final" / f"text_{_j}").resolve()),
+                            "col_start": _col, "n_cols": _old_nc,
+                        })
+                        _col += _old_nc
+                    for _j, _spec in enumerate(_old_tabular):
+                        inherited_model_sources.append({
+                            "type": "tabular", "local_index": _j, "spec": _spec,
+                            "final_dir": str((_src / "final" / f"tabular_{_j}").resolve()),
+                            "col_start": _col, "n_cols": _old_nc,
+                        })
+                        _col += _old_nc
+            else:
+                logger.warning(
+                    "No oof_metadata.json found in %s — cannot reconstruct "
+                    "inherited model_sources.  predict_test() may fail for "
+                    "inherited models.", _src / "oof",
+                )
+        else:
+            # --- Step 1: split ----------------------------------------------
+            self.train_df, self.test_df = split(
+                df, label_col=label_col, text_col=text_col,
+                test_size=test_size, random_state=random_state, stratify=stratify,
+            )
+            logger.info("Split: %d train / %d test", len(self.train_df), len(self.test_df))
+
+        # Save (or re-save) splits for predict_test() in future sessions
         self.train_df.to_csv(data_dir / "train_df.csv", index=False)
         self.test_df.to_csv(data_dir  / "test_df.csv",  index=False)
 
@@ -1063,14 +1190,26 @@ class StackingClassifier:
 
         # --- Step 4: k-fold OOF loop ----------------------------------------
         oof_dir = self.output_dir / "oof"
+        n_inherited_cols = inherited_oof_X.shape[1] if inherited_oof_X is not None else 0
+        n_new_models     = len(self.text_models) + len(self.tabular_models)
+        expected_cols    = n_inherited_cols + n_new_models * n_classes
 
-        # Resume check: if assembled OOF matrix already exists, skip loop
-        if self.resume and (oof_dir / "oof_meta_X.npy").exists():
+        # Resume check: skip loop only when assembled matrix has the right shape.
+        # If load_oof_from was used and the file exists but has only new-model
+        # columns (incomplete previous run), re-generate and re-combine.
+        _oof_file = oof_dir / "oof_meta_X.npy"
+        _skip_oof = (
+            self.resume
+            and _oof_file.exists()
+            and np.load(_oof_file, mmap_mode="r").shape[1] == expected_cols
+        )
+
+        if _skip_oof:
             logger.info("OOF meta-features already assembled — skipping OOF loop.")
-            self.oof_meta_X = np.load(oof_dir / "oof_meta_X.npy")
+            self.oof_meta_X = np.load(_oof_file)
             self.oof_y      = np.load(oof_dir / "oof_y.npy")
         else:
-            self.oof_meta_X, self.oof_y = generate_oof_predictions(
+            new_oof_X, self.oof_y = generate_oof_predictions(
                 text_model_specs=self.text_models,
                 tabular_model_specs=self.tabular_models,
                 train_text_dataset=train_text_ds if self.text_models else None,
@@ -1096,10 +1235,58 @@ class StackingClassifier:
                 feature_cols=feature_cols,
             )
 
+            # Prepend inherited columns (if any) and overwrite the file.
+            if inherited_oof_X is not None:
+                self.oof_meta_X = np.concatenate([inherited_oof_X, new_oof_X], axis=1)
+                logger.info(
+                    "Combined inherited OOF %s + new OOF %s → %s",
+                    inherited_oof_X.shape, new_oof_X.shape, self.oof_meta_X.shape,
+                )
+            else:
+                self.oof_meta_X = new_oof_X
+
+            # generate_oof_predictions() already saved new_oof_X; overwrite with
+            # the combined matrix so future resume picks up the full matrix.
+            oof_dir.mkdir(parents=True, exist_ok=True)
+            np.save(_oof_file,            self.oof_meta_X)
+            np.save(oof_dir / "oof_y.npy", self.oof_y)
+
+        # Build model_sources — flat list of all models (inherited + new) in
+        # column order.  Absolute final_dir paths survive across sessions and
+        # across directories, enabling predict_test() to find weights for both
+        # inherited models (in the source run) and new models (in output_dir).
+        final_dir = self.output_dir / "final"
+        col_offset = n_inherited_cols
+        new_model_sources: list[dict] = []
+        for i, spec in enumerate(self.text_models):
+            new_model_sources.append({
+                "type":        "text",
+                "local_index": i,
+                "spec":        spec,
+                "final_dir":   str((final_dir / f"text_{i}").resolve()),
+                "col_start":   col_offset + i * n_classes,
+                "n_cols":      n_classes,
+            })
+        for i, spec in enumerate(self.tabular_models):
+            new_model_sources.append({
+                "type":        "tabular",
+                "local_index": i,
+                "spec":        spec,
+                "final_dir":   str((final_dir / f"tabular_{i}").resolve()),
+                "col_start":   col_offset + (len(self.text_models) + i) * n_classes,
+                "n_cols":      n_classes,
+            })
+        all_model_sources = inherited_model_sources + new_model_sources
+
         # Save OOF metadata for cross-session handoff
-        oof_meta_names = _build_meta_feature_names(
-            self.text_models, self.tabular_models, sorted_ids
-        )
+        oof_meta_names = []
+        for src in all_model_sources:
+            mn = src["spec"]["model_name"].replace("/", "_").replace("-", "_")
+            prefix = f"text_{src['local_index']}_{mn}" if src["type"] == "text" \
+                     else f"tab_{src['local_index']}_{mn}"
+            for cid in sorted_ids:
+                oof_meta_names.append(f"{prefix}_prob_{cid}")
+
         oof_metadata = {
             "n_folds":          self.n_folds,
             "n_text_models":    len(self.text_models),
@@ -1114,9 +1301,11 @@ class StackingClassifier:
             "id2label":         {str(k): v for k, v in id2label.items()},
             "text_specs":       self.text_models,
             "tabular_specs":    self.tabular_models,
+            "model_sources":    all_model_sources,
             "meta_feature_names": oof_meta_names,
             "text_best_hp":     self.text_best_hp,
             "tabular_best_hp":  self.tabular_best_hp,
+            "inherited_from":   str(self.load_oof_from.resolve()) if self.load_oof_from else None,
         }
         with open(oof_dir / "oof_metadata.json", "w") as fh:
             json.dump(oof_metadata, fh, indent=2, default=str)
@@ -1163,7 +1352,7 @@ class StackingClassifier:
             if spec["model_name"] == _INSILICOVA:
                 _insilicova_save_config(
                     spec, self.tabular_best_hp[i], label2id, id2label,
-                    feature_cols, model_dir,
+                    feature_cols, model_dir, label_col=label_col,
                 )
             else:
                 tab_train(
@@ -1341,70 +1530,96 @@ class StackingClassifier:
         sorted_ids = sorted(self.id2label.keys())
         n_classes  = len(sorted_ids)
         n_test     = len(test_df)
-        n_total    = len(self.text_models) + len(self.tabular_models)
 
-        meta_X_test = np.zeros((n_test, n_total * n_classes), dtype=float)
+        # Load model_sources — flat ordered list of all base models
+        # (inherited + new) with absolute final_dir paths and column ranges.
+        # Falls back to constructing from self.text_models / self.tabular_models
+        # for runs created before model_sources was introduced.
+        _oof_meta_path = self.output_dir / "oof" / "oof_metadata.json"
+        model_sources: list[dict] | None = None
+        if _oof_meta_path.exists():
+            with open(_oof_meta_path) as _f:
+                _oof_meta = json.load(_f)
+            model_sources = _oof_meta.get("model_sources")
 
-        final_dir = self.output_dir / "final"
+        if not model_sources:
+            # Backward-compat fallback: only current-run models, no inheritance
+            final_dir_fb = self.output_dir / "final"
+            model_sources = []
+            for i, spec in enumerate(self.text_models):
+                model_sources.append({
+                    "type": "text", "local_index": i, "spec": spec,
+                    "final_dir": str((final_dir_fb / f"text_{i}").resolve()),
+                    "col_start": i * n_classes, "n_cols": n_classes,
+                })
+            for i, spec in enumerate(self.tabular_models):
+                model_sources.append({
+                    "type": "tabular", "local_index": i, "spec": spec,
+                    "final_dir": str((final_dir_fb / f"tabular_{i}").resolve()),
+                    "col_start": (len(self.text_models) + i) * n_classes,
+                    "n_cols": n_classes,
+                })
 
-        # --- Text final model predictions -----------------------------------
-        for i, spec in enumerate(self.text_models):
-            model_dir  = final_dir / f"text_{i}"
-            model_name = spec["model_name"]
-            max_length = spec.get("max_length", 512)
+        n_total_cols = sum(s["n_cols"] for s in model_sources)
+        meta_X_test  = np.zeros((n_test, n_total_cols), dtype=float)
 
-            logger.info("Predicting test — final text model %d (%s) ...", i, model_name)
-
-            # Retokenise test data with the correct model's tokeniser
-            _, test_text_ds, _, _ = text_prepare(
-                train_df, test_df,
-                text_col=self._text_col, label_col=self._label_col,
-                model_name=model_name, max_length=max_length,
-            )
-            result     = text_predict(model_dir, test_text_ds, batch_size=batch_size, top_k=1)
-            fold_probs = _extract_probs(result, sorted_ids)
-
-            col_s = i * n_classes
-            meta_X_test[:, col_s:col_s + n_classes] = fold_probs
-
-        # --- Tabular final model predictions --------------------------------
+        # Pre-load tabular test arrays once (shared by all sklearn tabular models).
+        # All tabular models in model_sources share the same feature space, so
+        # one preprocessed X_test works for all of them.
         X_test_npy = data_dir / "X_test.npy"
         y_test_npy = data_dir / "y_test.npy"
-
-        # Only load numpy arrays for sklearn-compatible (non-insilicova) models
-        has_sklearn_tabular = any(
-            s.get("model_name") != _INSILICOVA for s in self.tabular_models
+        _has_sklearn_tab = any(
+            s["type"] == "tabular" and s["spec"].get("model_name") != _INSILICOVA
+            for s in model_sources
         )
         X_test = y_test = None
-        if has_sklearn_tabular and X_test_npy.exists():
+        if _has_sklearn_tab and X_test_npy.exists():
             X_test = np.load(X_test_npy)
             y_test = np.load(y_test_npy)
-        elif has_sklearn_tabular:
-            # Reconstruct from test_df (preprocessor re-applied)
-            enc = (self._feature_cols and "ordinal") or "ordinal"
-            (_, X_test, _, y_test,
-             _, _, _, _) = tab_prepare(
+        elif _has_sklearn_tab:
+            (_, X_test, _, y_test, _, _, _, _) = tab_prepare(
                 train_df, test_df,
                 feature_cols=self._feature_cols,
                 label_col=self._label_col,
-                encode_categoricals=enc,
+                encode_categoricals="ordinal",
             )
 
-        for i, spec in enumerate(self.tabular_models):
-            model_dir  = final_dir / f"tabular_{i}"
+        # --- Iterate over all model sources (inherited + new) ---------------
+        for source in model_sources:
+            model_dir  = Path(source["final_dir"])
+            spec       = source["spec"]
+            col_s      = source["col_start"]
+            n_cols     = source["n_cols"]
             model_name = spec["model_name"]
 
-            logger.info("Predicting test — final tabular model %d (%s) ...", i, model_name)
-
-            if model_name == _INSILICOVA:
-                # InSilicoVA runs on the raw test DataFrame, not numpy arrays
-                fold_probs = _insilicova_predict_df(model_dir, test_df, sorted_ids)
-            else:
-                result     = tab_predict(model_dir, X_test, y_test, top_k=1)
+            if source["type"] == "text":
+                max_length = spec.get("max_length", 512)
+                logger.info(
+                    "Predicting test — text model %s (weights: %s) ...",
+                    model_name, model_dir,
+                )
+                _, test_text_ds, _, _ = text_prepare(
+                    train_df, test_df,
+                    text_col=self._text_col, label_col=self._label_col,
+                    model_name=model_name, max_length=max_length,
+                )
+                result     = text_predict(model_dir, test_text_ds, batch_size=batch_size, top_k=1)
                 fold_probs = _extract_probs(result, sorted_ids)
 
-            col_s = (len(self.text_models) + i) * n_classes
-            meta_X_test[:, col_s:col_s + n_classes] = fold_probs
+            else:  # tabular
+                logger.info(
+                    "Predicting test — tabular model %s (weights: %s) ...",
+                    model_name, model_dir,
+                )
+                if model_name == _INSILICOVA:
+                    fold_probs = _insilicova_predict_df(
+                        model_dir, test_df, sorted_ids, train_df=train_df,
+                    )
+                else:
+                    result     = tab_predict(model_dir, X_test, y_test, top_k=1)
+                    fold_probs = _extract_probs(result, sorted_ids)
+
+            meta_X_test[:, col_s:col_s + n_cols] = fold_probs
 
         # --- Meta-learner final prediction ----------------------------------
         meta_proba = self.meta_learner.predict_proba(meta_X_test)  # (n_test, n_classes)

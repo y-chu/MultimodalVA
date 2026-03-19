@@ -30,6 +30,14 @@ Public API
         Ranked hyperparameter importance from an Optuna study.
         Uses optuna.importance when available, otherwise Pearson correlation.
 
+    plot_param_importances(source, study_name, metric, kind, params, save_path, plot)
+        Interactive Plotly visualization via optuna.visualization.
+        Accepts a Study object, a path to an SQLite .db file, or a
+        {"study_name": ..., "storage": ...} dict.  Supports five plot kinds:
+        "importance" (default), "parallel_coordinate", "contour", "slice",
+        "optimization_history".  Saves to .html (interactive) or .png/.pdf
+        (requires kaleido).
+
     train_eval_gap(log_history, skip_steps, plot)
         Gap between training loss and evaluation loss at matched steps.
         Large positive gaps indicate overfitting.
@@ -157,10 +165,11 @@ def hpo_leaderboard(
     Args:
         source:    An ``optuna.Study`` or a ``pd.DataFrame`` from
                    ``study.trials_dataframe()``.
-        sort_by:   Column to sort by.  Defaults to the Optuna objective
-                   value (``"value"`` column).  Can be any metric stored as
-                   a user attribute (e.g. ``"accuracy"``, ``"f1_macro"``,
-                   ``"f1_weighted"``, ``"csmf_accuracy"``).
+        sort_by:   Column to sort by.  Defaults to ``"value"`` (Optuna
+                   objective column) when present; falls back to the first
+                   available metric column for Ray Tune DataFrames (which
+                   have no ``"value"`` column).  Can be set explicitly to any
+                   metric name (e.g. ``"f1_macro"``, ``"csmf_accuracy"``).
         top_n:     Return only the top N trials.  ``None`` = all trials.
         ascending: Sort direction.  Default ``False`` (highest score first).
         param_cols: Include hyperparameter columns (``params_*``) in the
@@ -227,9 +236,24 @@ def hpo_leaderboard(
 
     trials_df = trials_df[keep]
 
-    # Determine sort column
+    # Determine sort column.
+    # "value" is the Optuna objective column.  Ray Tune DataFrames omit it and
+    # expose metrics directly (e.g. "f1_macro").  Fall back to the first available
+    # metric column; skip sorting if none can be found.
     if sort_by is None:
-        sort_col = "value"
+        if "value" in trials_df.columns:
+            sort_col = "value"
+        elif metric_cols and metric_cols[0] in trials_df.columns:
+            sort_col = metric_cols[0]
+            logger.debug(
+                "No 'value' column found; sorting by first metric column %r.", sort_col
+            )
+        else:
+            sort_col = None
+            logger.warning(
+                "No sort column found (no 'value' and no user-attr metrics). "
+                "Returning trials in original order."
+            )
     elif sort_by in trials_df.columns:
         sort_col = sort_by
     else:
@@ -238,7 +262,10 @@ def hpo_leaderboard(
             f"Available columns: {list(trials_df.columns)}."
         )
 
-    trials_df = trials_df.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
+    if sort_col is not None:
+        trials_df = trials_df.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
+    else:
+        trials_df = trials_df.reset_index(drop=True)
 
     if top_n is not None:
         trials_df = trials_df.head(top_n)
@@ -716,6 +743,203 @@ def hyperparameter_importance(
         plt.show()
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# 6b. Optuna Plotly visualizations
+# ---------------------------------------------------------------------------
+
+_PLOT_KINDS = frozenset({
+    "importance",
+    "parallel_coordinate",
+    "contour",
+    "slice",
+    "optimization_history",
+})
+
+
+def plot_param_importances(
+    source,
+    *,
+    study_name: str = "text_hpo",
+    metric: str | None = None,
+    kind: str = "importance",
+    params: list[str] | None = None,
+    save_path=None,
+    plot: bool = True,
+):
+    """Interactive Plotly visualization of HPO results via optuna.visualization.
+
+    Produces a richer, interactive figure than the matplotlib-based
+    ``hyperparameter_importance()``.  The figure is returned as a Plotly
+    ``Figure`` object so it can be embedded in notebooks, saved as HTML, or
+    exported to a static image.
+
+    ``source`` can be any of:
+
+    * An ``optuna.Study`` object — used directly.
+    * A path to an SQLite ``.db`` file (``str`` or ``pathlib.Path``) —
+      loaded with ``optuna.load_study(study_name, storage=...)``.
+    * A ``dict`` with keys ``"study_name"`` and ``"storage"`` (SQLite URL or
+      RDB URL) — e.g. ``{"study_name": "text_hpo",
+      "storage": "sqlite:///runs/hpo.db"}``.
+
+    Args:
+        source:      See above.  Study object, ``.db`` path, or config dict.
+        study_name:  Study name used when loading from a ``.db`` file or when
+                     ``source`` is a dict without a ``"study_name"`` key.
+                     Default ``"text_hpo"`` (matches our HPO default).
+        metric:      User-attribute metric to use as the optimization target
+                     for the importance / contour / slice plots.  ``None``
+                     uses the Optuna objective value (default).  Pass a name
+                     such as ``"f1_macro"`` or ``"csmf_accuracy"`` to rank
+                     parameters by their effect on a secondary metric.
+        kind:        Which Optuna visualization to produce:
+
+                     * ``"importance"``            — bar chart of FAnova / MDI
+                       hyperparameter importances (default).
+                     * ``"parallel_coordinate"``   — parallel coordinates of
+                       all hyperparameters coloured by objective value.
+                     * ``"contour"``               — 2-D contour grid over
+                       pairs of hyperparameters.
+                     * ``"slice"``                 — 1-D slice plots for each
+                       hyperparameter vs objective.
+                     * ``"optimization_history"``  — trial-by-trial objective
+                       with running best value overlaid.
+
+        params:      Restrict the plot to this subset of hyperparameter names.
+                     ``None`` = all parameters.  Useful for ``"contour"`` and
+                     ``"slice"`` when the search space is large.
+        save_path:   File path to save the figure.  Supports two formats:
+
+                     * ``.html``         — interactive HTML (no extra deps).
+                     * ``.png`` / ``.pdf`` / ``.svg`` — static image via
+                       ``kaleido`` (``pip install kaleido``).
+
+                     ``None`` = do not save.  Default ``None``.
+        plot:        Call ``fig.show()`` to display the figure.  In Jupyter
+                     the figure renders inline; in a script it opens a browser
+                     tab.  Set ``False`` when saving headlessly.  Default True.
+
+    Returns:
+        ``plotly.graph_objects.Figure`` — the Plotly figure object.
+
+    Raises:
+        ImportError:  ``optuna`` is not installed, or ``kaleido`` is needed
+                      for a static image format but is not installed.
+        ValueError:   ``kind`` is not one of the supported values.
+        FileNotFoundError: ``.db`` file does not exist.
+
+    Example — load from SQLite and save interactive HTML::
+
+        from multimodalva.results import plot_param_importances
+
+        fig = plot_param_importances(
+            "runs/hpo/hpo_allenai_longformer-base-4096.db",
+            study_name="text_hpo",
+            metric="f1_macro",
+            kind="importance",
+            save_path="runs/hpo/param_importance.html",
+            plot=False,
+        )
+
+    Example — load study object directly::
+
+        import optuna
+        study = optuna.load_study(
+            study_name="text_hpo",
+            storage="sqlite:///runs/hpo/hpo_bert.db",
+        )
+        fig = plot_param_importances(study, kind="parallel_coordinate")
+    """
+    try:
+        import optuna
+        import optuna.visualization as ov
+    except ImportError as exc:
+        raise ImportError(
+            "optuna is required for plot_param_importances().  "
+            "Install with:  pip install 'optuna>=3.4'"
+        ) from exc
+
+    if kind not in _PLOT_KINDS:
+        raise ValueError(
+            f"kind={kind!r} is not supported.  "
+            f"Choose from: {sorted(_PLOT_KINDS)}."
+        )
+
+    # --- Resolve source to an optuna.Study -----------------------------------
+    if hasattr(source, "trials"):
+        # Already a Study object
+        study = source
+    elif isinstance(source, dict):
+        _sname   = source.get("study_name", study_name)
+        _storage = source["storage"]
+        logger.info("Loading Optuna study %r from %s", _sname, _storage)
+        study = optuna.load_study(study_name=_sname, storage=_storage)
+    else:
+        # Treat as a path to a .db file
+        from pathlib import Path as _Path
+        db_path = _Path(source)
+        if not db_path.exists():
+            raise FileNotFoundError(
+                f"SQLite database not found: {db_path}.  "
+                "Pass the correct path or a study object directly."
+            )
+        storage_url = f"sqlite:///{db_path.resolve()}"
+        logger.info("Loading Optuna study %r from %s", study_name, storage_url)
+        study = optuna.load_study(study_name=study_name, storage=storage_url)
+
+    # --- Build target callable when metric != objective ---------------------
+    target = None
+    target_name = metric
+    if metric is not None:
+        def target(trial: optuna.trial.FrozenTrial) -> float:  # noqa: E306
+            return trial.user_attrs.get(metric, float("nan"))
+
+    # --- Generate figure ----------------------------------------------------
+    _kw_target = {}
+    if target is not None:
+        _kw_target = {"target": target, "target_name": target_name}
+
+    _kw_params = {}
+    if params is not None:
+        _kw_params = {"params": params}
+
+    if kind == "importance":
+        fig = ov.plot_param_importances(study, **_kw_target)
+    elif kind == "parallel_coordinate":
+        fig = ov.plot_parallel_coordinate(study, **_kw_params, **_kw_target)
+    elif kind == "contour":
+        fig = ov.plot_contour(study, **_kw_params, **_kw_target)
+    elif kind == "slice":
+        fig = ov.plot_slice(study, **_kw_params, **_kw_target)
+    else:  # optimization_history
+        fig = ov.plot_optimization_history(study, **_kw_target)
+
+    # --- Save ---------------------------------------------------------------
+    if save_path is not None:
+        from pathlib import Path as _Path
+        save_path = _Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = save_path.suffix.lower()
+        if suffix == ".html":
+            fig.write_html(str(save_path))
+            logger.info("Saved interactive HPO plot to %s", save_path)
+        else:
+            try:
+                fig.write_image(str(save_path))
+                logger.info("Saved static HPO plot to %s", save_path)
+            except Exception as exc:
+                raise ImportError(
+                    f"Saving as {suffix!r} requires kaleido.  "
+                    "Install with:  pip install kaleido"
+                ) from exc
+
+    # --- Display ------------------------------------------------------------
+    if plot:
+        fig.show()
+
+    return fig
 
 
 # ---------------------------------------------------------------------------

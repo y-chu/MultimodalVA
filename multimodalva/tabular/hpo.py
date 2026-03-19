@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import optuna
+    import ray
 
 import numpy as np
 from sklearn.model_selection import StratifiedShuffleSplit
@@ -128,7 +129,7 @@ def optimize(
     id2label: dict,
     model_name: str,
     output_dir: str | Path,
-    n_trials: int = 20,
+    n_trials: int = 50,
     metric: str = "accuracy",
     search_space: dict | None = None,
     val_size: float = 0.2,
@@ -138,6 +139,7 @@ def optimize(
     load_if_exists: bool = True,
     enable_pruning: bool = False,
     save_trials_csv: bool = True,
+    cleanup_trials: bool = True,
     n_jobs: int = -1,
     use_gpu: bool | None = None,
 ) -> tuple[dict, optuna.Study]:
@@ -171,6 +173,10 @@ def optimize(
         enable_pruning: MedianPruner for early trial termination. Default False
                         (pruning is less useful for fast sklearn fits).
         save_trials_csv: Save all trial results to hpo_trials.csv. Default True.
+        cleanup_trials: Delete all per-trial directories (``trial_*/``) after HPO
+                        completes.  The best trial is preserved at ``best_trial/``
+                        before deletion.  The SQLite study DB, ``best_hyperparams.json``,
+                        ``best_trial/``, and the CSV are all kept.  Default True.
 
     Returns:
         best_hyperparams: Dict from the best trial — pass to train(hyperparams=...).
@@ -301,6 +307,23 @@ def optimize(
         study.trials_dataframe().to_csv(trials_csv_path, index=False)
         logger.info("Saved trial results to %s", trials_csv_path)
 
+    # --- Remove per-trial directories (optional) ---
+    # After HPO the best trial is in best_trial/ and hyperparams in best_hyperparams.json;
+    # individual trial_N/ directories serve no further purpose.
+    # The SQLite study DB is kept for resumability / further Optuna analysis.
+    if cleanup_trials:
+        removed = 0
+        for trial_dir in sorted(output_dir.iterdir()):
+            if (
+                trial_dir.is_dir()
+                and trial_dir.name.startswith("trial_")
+                and trial_dir.name.split("_")[-1].isdigit()
+            ):
+                shutil.rmtree(trial_dir)
+                removed += 1
+        if removed:
+            logger.info("Removed %d trial directories from %s.", removed, output_dir)
+
     return best_hyperparams, study
 
 
@@ -362,40 +385,28 @@ def _tabular_ray_trial_fn(
     random_state: int,
     n_jobs: int,
     use_gpu: bool | None,
-) -> None:
+) -> dict:
     """Single-trial trainable for Ray Tune (tabular pipeline).
 
-    Called once per trial by a Ray worker process.  Runs ``train()`` followed
-    by ``predict()`` and reports all six evaluation metrics to the Ray runtime
-    via ``ray.train.report()``.
+    Returns a metrics dict, which Ray Tune records as the trial's final result.
+    Returning a dict is the portable way to report metrics from a function
+    trainable — it works across all Ray 2.x versions without requiring a
+    Ray Train session (``ray.train.report()`` is the Train API and raises /
+    hangs when called outside a proper Train context such as TorchTrainer).
 
     Numpy arrays (``X_opt_train``, ``y_opt_train``, ``X_opt_val``,
     ``y_opt_val``) are passed via ``tune.with_parameters()`` — stored once in
     the Ray object store and referenced by all workers without re-serialisation.
 
-    Unlike the text trainable, no GPU memory clearing is needed here because
-    sklearn / tree-model fits do not allocate PyTorch tensors.  GPU-accelerated
-    variants (CatBoost, LightGBM, XGBoost) manage their own device memory and
-    release it when the model object goes out of scope.
-
-    Ray 2.x API used:
-      - ``ray.tune.get_context().get_trial_dir()``  — trial artifact directory
-        (``ray.train.get_context()`` is deprecated for function trainables per
-        https://github.com/ray-project/ray/issues/49454).
-      - ``ray.train.report(metrics_dict)``           — metric reporting.
-
     This function must be defined at module level (not nested) so that Ray can
     serialise it by reference when dispatching to remote workers.
     """
-    # ----- Ray 2.x API -----
-    # ray.tune.get_context() is correct for function trainables passed to tune.Tuner.
-    # ray.train.get_context() is deprecated in that context (Ray issue #49454).
+    import logging as _logging
     from ray import tune as _ray_tune
-    import ray.train as _ray_train
+
+    _trial_logger = _logging.getLogger(__name__)
 
     # ----- Ensure multimodalva is importable in the worker process -----
-    # Each Ray worker is a fresh Python subprocess; insert the project root into
-    # sys.path so absolute imports resolve even without a formal pip install.
     import sys as _sys
     _project_root = str(Path(__file__).resolve().parent.parent.parent)
     if _project_root not in _sys.path:
@@ -405,7 +416,7 @@ def _tabular_ray_trial_fn(
     from multimodalva.tabular.predict import predict as _predict
     from multimodalva.utils.metrics import score_predictions, log_loss_from_full
 
-    # ----- Trial artifact directory (Ray 2.x Tune API) -----
+    # ----- Trial artifact directory (Ray Tune API) -----
     ctx = _ray_tune.get_context()
     trial_dir = Path(ctx.get_trial_dir())
     trial_dir.mkdir(parents=True, exist_ok=True)
@@ -436,10 +447,16 @@ def _tabular_ray_trial_fn(
             for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
         }
         all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
-    finally:
-        # ray.train.report() must always be called so Ray records the outcome
-        # rather than leaving the trial in RUNNING state indefinitely.
-        _ray_train.report(all_scores)
+    except Exception:
+        _trial_logger.exception(
+            "Ray trial failed (config=%s); reporting zero/inf scores.", config
+        )
+
+    # Return the metrics dict — Ray Tune treats the return value of a function
+    # trainable as the trial's final reported result.  This avoids calling
+    # ray.train.report(), which is the Ray Train API and raises or hangs when
+    # invoked outside a Train session (e.g. TorchTrainer).
+    return all_scores
 
 
 def optimize_ray(
@@ -449,7 +466,7 @@ def optimize_ray(
     id2label: dict,
     model_name: str,
     output_dir: str | Path,
-    n_trials: int = 20,
+    n_trials: int = 50,
     metric: str = "accuracy",
     search_space: dict | None = None,
     val_size: float = 0.2,
@@ -461,8 +478,12 @@ def optimize_ray(
     num_gpus_per_trial: float = 0.0,
     num_cpus_per_trial: int = 4,
     max_concurrent_trials: int | None = None,
+    # ---- Resume ---------------------------------------------------------
+    resume: bool = True,
+    experiment_name: str | None = None,
     # ---- Output ---------------------------------------------------------
     save_trials_csv: bool = True,
+    cleanup_trials: bool = True,
 ) -> tuple[dict, "ray.tune.ResultGrid"]:
     """Run distributed HPO with Ray Tune across multiple CPUs/GPUs or cluster nodes.
 
@@ -583,7 +604,6 @@ def optimize_ray(
     try:
         import ray
         from ray import tune
-        from ray.train import RunConfig  # ray.air.RunConfig deprecated in Ray 2.7+
         from ray.tune.search.optuna import OptunaSearch
         from ray.tune.search import ConcurrencyLimiter
     except ImportError as exc:
@@ -599,6 +619,12 @@ def optimize_ray(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Experiment storage path (for resume) ---
+    safe_model_name = model_name.replace("/", "_")
+    exp_name    = experiment_name or f"ray_hpo_{safe_model_name}"
+    exp_storage = output_dir / "ray_experiment"
+    exp_path    = exp_storage / exp_name
 
     # --- Build effective search space ---
     active_space = dict(DEFAULT_SEARCH_SPACES.get(model_name, {}))
@@ -695,22 +721,64 @@ def optimize_ray(
         resources={"cpu": num_cpus_per_trial, "gpu": num_gpus_per_trial},
     )
 
-    # --- Tuner ---
-    tuner = tune.Tuner(
-        trainable,
-        param_space=ray_space,
-        tune_config=tune.TuneConfig(
-            metric=metric,
-            mode=_ray_mode,
-            num_samples=n_trials,
-            search_alg=search_alg,
-            max_concurrent_trials=max_concurrent_trials,
-        ),
-        run_config=RunConfig(
-            storage_path=str(output_dir),
-            name="tabular_hpo_ray",
-        ),
+    # --- RunConfig for experiment persistence (enables Tuner.restore()) ---
+    # Wrapped in try/except: some Ray versions raise checkpoint_at_end ValueError
+    # when RunConfig is used with function trainables.  If that happens we fall
+    # back to no run_config (losing resume capability for this run).
+    _run_config = None
+    try:
+        from ray.train import RunConfig
+        exp_storage.mkdir(parents=True, exist_ok=True)
+        _run_config = RunConfig(
+            storage_path=str(exp_storage.resolve()),
+            name=exp_name,
+        )
+    except Exception as _rc_err:
+        logger.warning(
+            "Could not create RunConfig — experiment state will not be persisted "
+            "(resume disabled for this run): %s", _rc_err,
+        )
+
+    _tune_config = tune.TuneConfig(
+        metric=metric,
+        mode=_ray_mode,
+        num_samples=n_trials,
+        search_alg=search_alg,
+        max_concurrent_trials=max_concurrent_trials,
     )
+
+    # --- Build or restore Tuner ---
+    def _fresh_tuner() -> "tune.Tuner":
+        kwargs: dict = dict(param_space=ray_space, tune_config=_tune_config)
+        if _run_config is not None:
+            kwargs["run_config"] = _run_config
+        return tune.Tuner(trainable, **kwargs)
+
+    if resume and exp_path.exists():
+        logger.info(
+            "resume=True and experiment found at %s — restoring "
+            "(errored trials will be restarted).", exp_path,
+        )
+        try:
+            tuner = tune.Tuner.restore(
+                str(exp_path),
+                trainable=trainable,
+                restart_errored=True,
+                resume_unfinished=True,
+            )
+            logger.info("Experiment restored successfully.")
+        except Exception as _restore_err:
+            logger.warning(
+                "Failed to restore experiment (%s); starting fresh.", _restore_err,
+            )
+            tuner = _fresh_tuner()
+    else:
+        if resume:
+            logger.info(
+                "resume=True but no experiment found at %s — starting fresh "
+                "(re-run with resume=True after an interruption to continue).", exp_path,
+            )
+        tuner = _fresh_tuner()
 
     logger.info(
         "optimize_ray: launching %d trials  model=%s  metric=%s  "
@@ -726,6 +794,21 @@ def optimize_ray(
     os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
     try:
         results = tuner.fit()
+    except ValueError as _ve:
+        if "checkpoint_at_end" in str(_ve):
+            # RunConfig caused the incompatibility — retry without it.
+            logger.warning(
+                "RunConfig triggered checkpoint_at_end error (%s). "
+                "Retrying without RunConfig — experiment will not be persisted "
+                "and resume will be unavailable for this run.", _ve,
+            )
+            os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
+            tuner_no_rc = tune.Tuner(
+                trainable, param_space=ray_space, tune_config=_tune_config,
+            )
+            results = tuner_no_rc.fit()
+        else:
+            raise
     finally:
         if _prev_ray_output is None:
             os.environ.pop("RAY_AIR_NEW_OUTPUT", None)
@@ -769,5 +852,12 @@ def optimize_ray(
         trials_csv_path = output_dir / "hpo_trials_ray.csv"
         results.get_dataframe().to_csv(trials_csv_path, index=False)
         logger.info("Saved Ray trial results to %s", trials_csv_path)
+
+    # --- Remove Ray experiment directory (optional) ---
+    # After a successful HPO run the best trial is in best_trial/ and all metrics
+    # are in hpo_trials_ray.csv; the ray_experiment/ tree is no longer needed.
+    if cleanup_trials and exp_storage.exists():
+        shutil.rmtree(exp_storage)
+        logger.info("Removed Ray experiment dir: %s", exp_storage)
 
     return best_hyperparams, results

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import optuna
+    import ray
 
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
@@ -66,6 +67,8 @@ from multimodalva.text.predict import predict
 logger = logging.getLogger(__name__)
 
 
+# Updated for ~20 classes and 3k-5k samples
+
 # Default search space: (type, *args)
 #   float_log  — log-uniform float:  (low, high)       best for scale-sensitive params like LR
 #   float      — uniform float:       (low, high)
@@ -75,22 +78,22 @@ DEFAULT_SEARCH_SPACE: dict = {
     # AdamW learning rate — most influential hyperparameter for BERT fine-tuning.
     # BERT paper recommends 2e-5 to 5e-5; log-uniform covers the relevant scale.
     # Wider range (1e-5, 1e-4) if the default range consistently hits a boundary.
-    "learning_rate": ("float_log", 1e-5, 4e-5),
+    "learning_rate": ("float_log", 8e-6, 4e-5),
 
     # Per-device training batch size.
     # 16 is the standard for 16 GB GPUs; use 8 if hitting OOM, or add 32 for larger GPUs.
     # Effective batch size = batch_size × gradient_accumulation_steps × n_GPUs.
-    "batch_size": ("categorical", [8, 16]),
+    "batch_size": ("categorical", [8, 16, 32]),
 
     # Number of full passes over the training data.
     # 3–5 epochs is typical for BERT fine-tuning; small datasets may benefit from more (5–10).
     # Always included so that optimize() returns an epoch count for the final train() call.
-    "epochs": ("categorical", [3, 5]),
+    "epochs": ("categorical", [3, 5, 7]),
 
     # L2 regularisation on non-bias / non-LayerNorm parameters (AdamW decoupled decay).
     # 0.01 is the HuggingFace default; 0.0–0.1 covers most reasonable settings.
     # Increase toward 0.1–0.3 if overfitting on small datasets.
-    "weight_decay": ("float", 0.0, 0.1),
+    "weight_decay": ("float", 0.0, 0.15),
 
     # Fraction of total training steps used for linear LR warmup.
     # BERT paper uses 0.1 (10%); 0.0–0.06 is common in practice.
@@ -112,7 +115,15 @@ DEFAULT_SEARCH_SPACE: dict = {
     # 6  — aggressive (half of BERT-base's 12 layers); use when heavily overfitting
     #       or as a final check that lower layers are not needed.
     # Note: values above 6 rarely help and reduce model capacity significantly.
-    "freeze_layers": ("categorical", [0, 2, 4, 6]),
+    "freeze_layers": ("categorical", [2, 4, 6]),
+
+    # Classifier dropout (high impact for small/imbalanced data) 
+    # strong regularizer for small datasets with 20-60 classes; 0.1–0.3 is a good range to explore. 0.0 (no dropout) can work well for larger datasets.
+    "classifier_dropout": ("float", 0.1, 0.4),
+
+    # Label smoothing (stabilizes multi-class training)
+    "label_smoothing": ("float", 0.0, 0.1),
+
 }
 
 # Focal loss search space (merged in when use_focal=True).
@@ -124,7 +135,7 @@ FOCAL_SEARCH_SPACE: dict = {
     # γ=0 reduces to standard CE.  γ=2 is the RetinaNet default and covers
     # most VA imbalance settings.  γ>3 is rarely beneficial and can cause
     # gradient instability on very small classes.
-    "focal_gamma": ("float", 0.5, 5.0),
+    "focal_gamma": ("float", 1.0, 4.0),
 
     # Per-class alpha weights (α) — rebalances the gradient contribution
     # across classes before the focal term is applied.
@@ -144,7 +155,7 @@ LORA_SEARCH_SPACE: dict = {
     # LoRA scaling factor applied to the adapter output (output *= lora_alpha / lora_r).
     # Common heuristic: set lora_alpha = 2 × lora_r (e.g. r=8 → alpha=16).
     # Larger alpha amplifies adapter contributions; too large can destabilise training.
-    "lora_alpha": ("categorical", [16, 32, 64]),
+    "lora_alpha": ("categorical", [8, 16, 32, 64]),
 
     # Dropout applied inside LoRA adapters for regularisation.
     # 0.05 is the LoRA paper default; 0.0 (no dropout) often works well for small adapters.
@@ -158,20 +169,21 @@ def optimize(
     id2label: dict,
     model_name: str,
     output_dir: str | Path,
-    n_trials: int = 20,
+    n_trials: int = 30,
     metric: str = "accuracy",
     search_space: dict | None = None,
     val_size: float = 0.2,
     random_state: int = 42,
     study_name: str = "text_hpo",
-    use_lora: bool = False,
+    use_lora: bool = True,
     use_focal: bool = False,
     gradient_checkpointing: bool = False,
-    early_stopping_patience: int | None = 3,
+    early_stopping_patience: int | None = 2,
     storage_path: str | None = None,
     load_if_exists: bool = True,
     enable_pruning: bool = True,
     save_trials_csv: bool = True,
+    cleanup_trials: bool = True,
 ) -> tuple[dict, optuna.Study]:
     """Run Optuna hyperparameter search using train() and predict().
 
@@ -220,12 +232,33 @@ def optimize(
                          optimization completes. Includes hyperparameters, objective
                          score, all user_attrs_* metrics, state, and duration.
                          Default True.
+        cleanup_trials: Delete all per-trial directories (``trial_*/``) after HPO
+                        completes.  The best trial is preserved at ``best_trial/``
+                        before deletion.  Each trial directory contains a full model
+                        checkpoint (≈400 MB for BERT-base); 20 trials can accumulate
+                        8+ GB.  The SQLite study DB, ``best_hyperparams.json``,
+                        ``best_trial/``, and the CSV are all kept.  Default True.
 
     Returns:
         best_hyperparams: Dict of hyperparameter values from the best trial.
                           Can be passed directly to train(hyperparams=best_hyperparams).
         study: The completed Optuna study object (for further analysis / visualisation).
     """
+    # Raise the open-file-descriptor limit before the HPO loop.
+    # On macOS the default soft limit is 256; Longformer HPO can exhaust this
+    # (model weights, tokenizer files, checkpoint dirs, Dropbox daemon) causing
+    # SQLite to fail with "unable to open database file" which in turn makes
+    # Optuna crash with AssertionError when it can't record a trial failure.
+    try:
+        import resource as _resource
+        _soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+        _target = min(max(_soft, 8192), _hard) if _hard > 0 else max(_soft, 8192)
+        if _soft < _target:
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (_target, _hard))
+            logger.info("Raised open-file-descriptor limit: %d → %d.", _soft, _target)
+    except Exception:
+        pass  # resource module not available on Windows; best-effort only
+
     try:
         import optuna
         from optuna.pruners import MedianPruner
@@ -254,10 +287,39 @@ def optimize(
     if search_space:
         active_space.update(search_space)
 
+    # Drop hyperparameters not supported by this model architecture.
+    # classifier_dropout: only BERT/RoBERTa/BigBird/ELECTRA configs accept it;
+    # Longformer does not — remove from search space to avoid wasted trials.
+    if "classifier_dropout" in active_space:
+        import inspect as _inspect
+        from transformers import AutoConfig as _AutoConfig
+        _cfg_cls = type(_AutoConfig.from_pretrained(model_name))
+        if "classifier_dropout" not in _inspect.signature(_cfg_cls.__init__).parameters:
+            active_space.pop("classifier_dropout")
+            logger.info(
+                "Removed 'classifier_dropout' from HPO search space: "
+                "%s (%s) does not support this parameter.",
+                model_name, _cfg_cls.__name__,
+            )
+
     if storage_path is None:
         safe_name = model_name.replace("/", "_")
         # Use resolved absolute path so the DB is always found regardless of CWD.
         storage_path = f"sqlite:///{output_dir.resolve()}/hpo_{safe_name}.db"
+        # Warn when the SQLite DB will live inside a cloud-sync folder.
+        # Dropbox / iCloud / OneDrive hold their own file locks on .db files while
+        # syncing, which can cause "unable to open database file" mid-trial.
+        # Pass an explicit storage_path pointing to a local dir (e.g. /tmp/) to avoid this.
+        _cloud_markers = ("Dropbox", "iCloudDrive", "OneDrive", "Google Drive", "Box")
+        _db_path_str = str(output_dir.resolve())
+        if any(m in _db_path_str for m in _cloud_markers):
+            logger.warning(
+                "Optuna SQLite DB is inside a cloud-sync folder (%s).  "
+                "Cloud sync daemons can hold file locks that prevent SQLite writes "
+                "mid-trial (→ 'unable to open database file').  "
+                "Pass storage_path='/tmp/hpo_%s.db' (or any local path) to avoid this.",
+                _db_path_str, safe_name,
+            )
 
     # --- Stratified internal split ---
     all_labels = _get_dataset_labels(train_dataset)
@@ -344,6 +406,17 @@ def optimize(
     else:
         logger.info("All %d trials already completed. Skipping optimization.", n_trials)
 
+    n_completed = sum(
+        1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
+    )
+    if n_completed == 0:
+        raise RuntimeError(
+            f"All {len(study.trials)} Optuna trials failed — no completed trial to "
+            "select best hyperparameters from.  Check the trial exception logs above "
+            "(typically GPU OOM, tokenizer errors, or NaN loss).  "
+            f"Trial artifacts are in: {output_dir}"
+        )
+
     best_hyperparams = study.best_params
 
     # --- Copy best trial artifacts ---
@@ -371,6 +444,24 @@ def optimize(
         trials_csv_path = output_dir / "hpo_trials.csv"
         study.trials_dataframe().to_csv(trials_csv_path, index=False)
         logger.info("Saved trial results to %s", trials_csv_path)
+
+    # --- Remove per-trial directories (optional) ---
+    # Each trial dir contains a full model copy (≈400 MB for BERT-base).
+    # After HPO the best trial is in best_trial/ and hyperparams in best_hyperparams.json;
+    # the individual trial_N/ directories serve no further purpose.
+    # The SQLite study DB is kept for resumability / further Optuna analysis.
+    if cleanup_trials:
+        removed = 0
+        for trial_dir in sorted(output_dir.iterdir()):
+            if (
+                trial_dir.is_dir()
+                and trial_dir.name.startswith("trial_")
+                and trial_dir.name.split("_")[-1].isdigit()
+            ):
+                shutil.rmtree(trial_dir)
+                removed += 1
+        if removed:
+            logger.info("Removed %d trial directories from %s.", removed, output_dir)
 
     return best_hyperparams, study
 
@@ -434,43 +525,36 @@ def _ray_trial_fn(
     use_focal: bool,
     gradient_checkpointing: bool,
     early_stopping_patience: int | None,
-) -> None:
+) -> dict:
     """Single trial for Ray Tune — fully compatible with Ray 2.x / Python 3.13.
 
-    Ray 2.x API used:
-      - ``ray.train.get_context().get_trial_dir()`` for the trial artifact directory
-        (replaces deprecated ``tune.get_trial_dir()`` / ``ctx.logdir``).
-      - ``ray.train.report(metrics_dict)`` for metric reporting
-        (replaces deprecated ``tune.report(**kwargs)``).
+    Returns a metrics dict, which Ray Tune records as the trial's final result.
+    Returning a dict is the portable way to report metrics from a function
+    trainable — it works across all Ray 2.x versions without requiring a
+    Ray Train session (``ray.train.report()`` is the Train API and raises /
+    hangs when called outside a proper Train context such as TorchTrainer).
 
-    Imports of ``multimodalva`` sub-modules are deferred to function body so that
-    Ray worker processes resolve them correctly regardless of how the package was
-    launched (installed wheel, editable install, or direct script execution).
+    Imports of ``multimodalva`` sub-modules are deferred to function body so
+    that Ray worker processes resolve them correctly regardless of how the
+    package was launched (installed wheel, editable install, or direct script).
     """
+    import logging as _logging
     import torch
-    # ray.tune.get_context() is the correct API for function trainables passed to
-    # Ray Tune (ray.train.get_context() is deprecated in that context per
-    # https://github.com/ray-project/ray/issues/49454).
-    # ray.train.report() remains the canonical reporting call for both Tune and Train.
     from ray import tune as _ray_tune
-    import ray.train as _ray_train
+
+    _trial_logger = _logging.getLogger(__name__)
 
     # --- Ensure multimodalva is importable in the worker process ---
-    # Each Ray worker is a fresh Python process; insert the project root into
-    # sys.path so absolute imports resolve even without a formal pip install.
     import sys as _sys
     _project_root = str(Path(__file__).resolve().parent.parent.parent)
     if _project_root not in _sys.path:
         _sys.path.insert(0, _project_root)
 
-    # Import inside the function body to avoid the name collision that occurs when
-    # ``from ray import train`` is used at the top of the file, which would shadow
-    # ``multimodalva.text.train.train``.
     from multimodalva.text.train import train as _train
     from multimodalva.text.predict import predict as _predict
     from multimodalva.utils.metrics import score_predictions, log_loss_from_full
 
-    # --- Trial artifact directory (Ray 2.x Tune API) ---
+    # --- Trial artifact directory (Ray Tune API) ---
     ctx = _ray_tune.get_context()
     trial_dir = Path(ctx.get_trial_dir())
     trial_dir.mkdir(parents=True, exist_ok=True)
@@ -513,14 +597,22 @@ def _ray_trial_fn(
         )
         all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
 
+    except Exception:
+        _trial_logger.exception(
+            "Ray trial failed (config=%s); reporting zero/inf scores.", config
+        )
+
     finally:
-        # --- Free GPU / MPS memory before the next trial ---
+        # Free GPU / MPS memory before the next trial.
         torch.cuda.empty_cache()
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
 
-        # Ray 2.x: report metrics as a plain dict — tune.report(**kwargs) is deprecated.
-        _ray_train.report(all_scores)
+    # Return the metrics dict — Ray Tune treats the return value of a function
+    # trainable as the trial's final reported result.  This avoids calling
+    # ray.train.report(), which is the Ray Train API and raises or hangs when
+    # invoked outside a Train session (e.g. TorchTrainer).
+    return all_scores
 
 
 # -----------------------
@@ -532,36 +624,86 @@ def optimize_ray(
     id2label: dict,
     model_name: str,
     output_dir: str | Path,
-    n_trials: int = 20,
+    n_trials: int | None = None,
     metric: str = "accuracy",
     search_space: dict | None = None,
     val_size: float = 0.2,
     random_state: int = 42,
-    use_lora: bool = False,
+    use_lora: bool = True,
     use_focal: bool = False,
     gradient_checkpointing: bool = False,
-    early_stopping_patience: int | None = 3,
+    early_stopping_patience: int | None = 2,
     ray_address: str | None = None,
-    num_gpus_per_trial: float = 1.0,
+    num_gpus_per_trial: float = 0.0,
     num_cpus_per_trial: int = 4,
     max_concurrent_trials: int | None = None,
+    resume: bool = True,
+    experiment_name: str | None = None,
     save_trials_csv: bool = True,
-) -> tuple[dict, "ray.tune.ResultGrid"]:
-    """Distributed HPO using Ray Tune."""
+    cleanup_trials: bool = True,
+    use_asha: bool = False,
+) -> tuple[dict, ray.tune.ResultGrid]:
+    """Distributed HPO using Ray Tune.
+
+    Extra args vs the original signature:
+
+    Args:
+        n_trials:        Total number of trials. Defaults to 60 when
+                         ``use_asha=True`` (ASHA prunes many trials early so
+                         more are needed to saturate the search), or 30 otherwise.
+                         Override by passing an explicit integer.
+        resume:          If ``True`` (default) and a previous experiment exists
+                         at ``output_dir/ray_experiment/<experiment_name>``,
+                         restore it and **restart** any errored trials from
+                         scratch with the same hyperparameter configs.
+                         Unfinished (interrupted) trials are also continued.
+                         Set to ``False`` to always start a fresh search.
+        experiment_name: Name used as the Ray experiment directory inside
+                         ``output_dir/ray_experiment/``.  Defaults to
+                         ``"ray_hpo_<model_name>"``.  Use a fixed name to
+                         reliably find the experiment on the next run.
+        use_asha:        Use the ASHA (Asynchronous Successive Halving) scheduler
+                         to terminate unpromising trials early based on epoch
+                         count.  Increases throughput when many trials are run.
+                         ``grace_period=2`` ensures every trial trains at least
+                         2 epochs before being eligible for pruning.
+                         Default False (OptunaSearch with no scheduler).
+                         Note: ASHA prunes trials based on reported intermediate
+                         results; since trials report only a final result (not
+                         per-epoch), ASHA acts as successive halving over
+                         completed trial scores rather than within-trial early
+                         stopping.
+    """
     _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
     if metric not in _VALID_METRICS:
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
         )
 
-    import ray
-    from ray import tune
-    from ray.train import RunConfig  # ray.air.RunConfig is deprecated in Ray 2.7+
-    from ray.tune.search.optuna import OptunaSearch
-    from ray.tune.search import ConcurrencyLimiter
+    try:
+        import ray
+        from ray import tune
+        from ray.tune.search.optuna import OptunaSearch
+        from ray.tune.search import ConcurrencyLimiter
+    except ImportError as exc:
+        raise ImportError(
+            "ray[tune] and optuna-integration are required for optimize_ray(). "
+            "Install with:  pip install 'ray[tune]>=2.9' 'optuna-integration>=3.4'\n"
+            "Or:            pip install multimodalva[ray]"
+        ) from exc
+
+    # --- Resolve n_trials default (depends on use_asha) ---
+    if n_trials is None:
+        n_trials = 60 if use_asha else 30
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Experiment storage path (for resume) ---
+    safe_name = model_name.replace("/", "_")
+    exp_name    = experiment_name or f"ray_hpo_{safe_name}"
+    exp_storage = output_dir / "ray_experiment"
+    exp_path    = exp_storage / exp_name
 
     # --- Build effective search space ---
     active_space = dict(DEFAULT_SEARCH_SPACE)
@@ -571,6 +713,20 @@ def optimize_ray(
         active_space.update(FOCAL_SEARCH_SPACE)
     if search_space:
         active_space.update(search_space)
+
+    # Drop classifier_dropout for architectures that don't support it (e.g. Longformer).
+    if "classifier_dropout" in active_space:
+        import inspect as _inspect
+        from transformers import AutoConfig as _AutoConfig
+        _cfg_cls = type(_AutoConfig.from_pretrained(model_name))
+        if "classifier_dropout" not in _inspect.signature(_cfg_cls.__init__).parameters:
+            active_space.pop("classifier_dropout")
+            logger.info(
+                "Removed 'classifier_dropout' from Ray HPO search space: "
+                "%s (%s) does not support this parameter.",
+                model_name, _cfg_cls.__name__,
+            )
+
     ray_space = _to_ray_space(active_space)
 
     # --- Stratified split ---
@@ -602,6 +758,26 @@ def optimize_ray(
     if max_concurrent_trials is not None:
         search_alg = ConcurrencyLimiter(search_alg, max_concurrent=max_concurrent_trials)
 
+    # --- ASHA scheduler (optional) ---
+    # ASHAScheduler terminates unpromising trials based on successive halving.
+    # max_t is set to the maximum epochs value in the active search space so
+    # ASHA's budget matches the longest possible trial.
+    # Note: since trials report only a final score (not per-epoch intermediate
+    # results), ASHA acts as successive halving over completed trial scores
+    # rather than within-trial early stopping.
+    _scheduler = None
+    if use_asha:
+        from ray.tune.schedulers import ASHAScheduler
+        _epochs_spec = active_space.get("epochs", ("categorical", [3, 5, 8]))
+        _max_t = max(_epochs_spec[1])  # e.g. max([3, 5, 8]) = 8
+        _scheduler = ASHAScheduler(
+            max_t=_max_t,
+            grace_period=2,       # every trial trains at least 2 epochs before pruning
+            reduction_factor=2,   # keep top 50% at each halving bracket
+            brackets=1,
+        )
+        logger.info("ASHA scheduler enabled (max_t=%d epochs, grace_period=2).", _max_t)
+
     # --- Trainable ---
     trainable = tune.with_parameters(
         _ray_trial_fn,
@@ -614,26 +790,70 @@ def optimize_ray(
         use_focal=use_focal,
         gradient_checkpointing=gradient_checkpointing,
         early_stopping_patience=early_stopping_patience,
-        # output_dir is NOT passed here — _ray_trial_fn derives the trial directory
-        # from ray.train.get_context().get_trial_dir() (Ray 2.x API).
     )
     trainable = tune.with_resources(
         trainable, resources={"cpu": num_cpus_per_trial, "gpu": num_gpus_per_trial}
     )
 
-    # --- Tuner ---
-    tuner = tune.Tuner(
-        trainable,
-        param_space=ray_space,
-        tune_config=tune.TuneConfig(
-            metric=metric,
-            mode=_ray_mode,
-            num_samples=n_trials,
-            search_alg=search_alg,
-            max_concurrent_trials=max_concurrent_trials,
-        ),
-        run_config=RunConfig(storage_path=str(output_dir), name="text_hpo_ray"),
+    # --- RunConfig for experiment persistence (enables Tuner.restore()) ---
+    # Wrapped in try/except: some Ray versions raise checkpoint_at_end ValueError
+    # when RunConfig is used with function trainables.  If that happens, we fall
+    # back to no run_config (losing resume capability for this run).
+    _run_config = None
+    try:
+        from ray.train import RunConfig
+        exp_storage.mkdir(parents=True, exist_ok=True)
+        _run_config = RunConfig(
+            storage_path=str(exp_storage.resolve()),
+            name=exp_name,
+        )
+    except Exception as _rc_err:
+        logger.warning(
+            "Could not create RunConfig — experiment state will not be persisted "
+            "(resume disabled for this run): %s", _rc_err,
+        )
+
+    _tune_config = tune.TuneConfig(
+        metric=metric,
+        mode=_ray_mode,
+        num_samples=n_trials,
+        search_alg=search_alg,
+        max_concurrent_trials=max_concurrent_trials,
+        scheduler=_scheduler,
     )
+
+    # --- Build or restore Tuner ---
+    def _fresh_tuner() -> "tune.Tuner":
+        kwargs: dict = dict(param_space=ray_space, tune_config=_tune_config)
+        if _run_config is not None:
+            kwargs["run_config"] = _run_config
+        return tune.Tuner(trainable, **kwargs)
+
+    if resume and exp_path.exists():
+        logger.info(
+            "resume=True and experiment found at %s — restoring "
+            "(errored trials will be restarted).", exp_path,
+        )
+        try:
+            tuner = tune.Tuner.restore(
+                str(exp_path),
+                trainable=trainable,
+                restart_errored=True,
+                resume_unfinished=True,
+            )
+            logger.info("Experiment restored successfully.")
+        except Exception as _restore_err:
+            logger.warning(
+                "Failed to restore experiment (%s); starting fresh.", _restore_err,
+            )
+            tuner = _fresh_tuner()
+    else:
+        if resume:
+            logger.info(
+                "resume=True but no experiment found at %s — starting fresh "
+                "(re-run with resume=True after an interruption to continue).", exp_path,
+            )
+        tuner = _fresh_tuner()
 
     logger.info("Launching %d trials, metric=%s, gpus/trial=%.1f, cpus/trial=%d",
                 n_trials, metric, num_gpus_per_trial, num_cpus_per_trial)
@@ -647,6 +867,21 @@ def optimize_ray(
     os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
     try:
         results = tuner.fit()
+    except ValueError as _ve:
+        if "checkpoint_at_end" in str(_ve):
+            # RunConfig caused the incompatibility — retry without it.
+            logger.warning(
+                "RunConfig triggered checkpoint_at_end error (%s). "
+                "Retrying without RunConfig — experiment will not be persisted "
+                "and resume will be unavailable for this run.", _ve,
+            )
+            os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
+            tuner_no_rc = tune.Tuner(
+                trainable, param_space=ray_space, tune_config=_tune_config,
+            )
+            results = tuner_no_rc.fit()
+        else:
+            raise
     finally:
         if _prev_ray_output is None:
             os.environ.pop("RAY_AIR_NEW_OUTPUT", None)
@@ -675,5 +910,14 @@ def optimize_ray(
     # --- Save trial CSV ---
     if save_trials_csv:
         results.get_dataframe().to_csv(output_dir / "hpo_trials_ray.csv", index=False)
+
+    # --- Remove Ray experiment directory (optional) ---
+    # The ray_experiment/ tree holds Ray's per-trial artifacts (model weights,
+    # optimizer state, Ray metadata).  After a successful HPO run the best trial
+    # is already in best_trial/ and all metrics are in hpo_trials_ray.csv, so
+    # the experiment tree is no longer needed and can be several GB for text models.
+    if cleanup_trials and exp_storage.exists():
+        shutil.rmtree(exp_storage)
+        logger.info("Removed Ray experiment dir: %s", exp_storage)
 
     return best_hyperparams, results

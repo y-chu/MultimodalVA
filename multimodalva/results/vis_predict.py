@@ -20,6 +20,13 @@ Public API
     topk_accuracy(topk_df, max_k)
         Accuracy at k=1..K: true label is among the top-k predicted causes.
 
+    plot_topk_accuracy(data, max_k, kind, ncols, ...)
+        Bar chart of top-k accuracy.  Single-model (one bar per k) or
+        multi-model in ``"grouped"`` (bundles by k) or ``"facet"``
+        (one subplot per model, 2-column grid by default) layout.
+        Input: ``result.topk`` or ``dict[model_name, topk_df]``.
+        Returns ``(fig, ax)`` for single/grouped, ``(fig, axes)`` for facet.
+
     cause_accuracy_heatmap(df, true_col, model_cols, top_k, topk_dfs, ...)
         Cause-specific accuracy heatmap across selected models.
         Rows = causes, columns = models, cells = % correct.
@@ -471,6 +478,259 @@ def topk_accuracy(
         })
 
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# 6. Top-K accuracy bar chart
+# ---------------------------------------------------------------------------
+
+_TOPK_BAR_COLORS = [
+    "steelblue", "darkorange", "seagreen", "firebrick", "mediumpurple",
+    "saddlebrown", "deeppink", "darkcyan", "goldenrod", "slategray",
+]
+
+
+def plot_topk_accuracy(
+    data: "pd.DataFrame | dict[str, pd.DataFrame]",
+    max_k: int | None = None,
+    kind: str = "grouped",
+    ncols: int = 2,
+    colors: list[str] | None = None,
+    title: str | None = None,
+    model_label: str | None = None,
+    figsize: tuple[float, float] | None = None,
+    ylim: tuple[float, float] = (0, 105),
+    label_fontsize: int = 9,
+    save_path: "str | None" = None,
+    dpi: int = 150,
+) -> tuple:
+    """Plot top-k accuracy as a bar chart for one or multiple models.
+
+    Accepts either a single topk DataFrame (single-model bar chart) or a
+    dict of topk DataFrames keyed by model name (multi-model grouped or facet).
+
+    Args:
+        data:           Single ``topk_df`` (from ``result.topk`` or
+                        ``topk_from_full()``) **or** a
+                        ``dict[model_name, topk_df]`` for multi-model.
+                        ``topk_accuracy()`` is called internally — do **not**
+                        pre-compute the accuracy table.
+        max_k:          Evaluate up to this k.  ``None`` = all available k.
+        kind:           Multi-model layout:
+
+                        - ``"grouped"`` — side-by-side bars within each k
+                          bundle; one colour per model.
+                        - ``"facet"``   — one subplot per model arranged in a
+                          grid; one colour per k level (consistent across
+                          subplots); shared y-axis range.
+
+                        Ignored for single-model input.
+        ncols:          Number of columns in the facet grid.  Default 2.
+                        Ignored for ``kind="grouped"`` and single-model.
+        colors:         Bar colours.
+
+                        - Single model or facet: list length ≥ max_k —
+                          one colour per k level.
+                        - Grouped: list length ≥ number of models — one colour
+                          per model.
+
+                        Default: built-in palette
+                        (steelblue / darkorange / seagreen / …).
+        title:          Single-model: axes title (overridden by
+                        ``model_label`` when both are set).
+                        Multi-model: ``fig.suptitle``.
+        model_label:    Single-model only — axes title string.  Takes
+                        precedence over ``title`` for the axes title.
+        figsize:        Figure size ``(width, height)`` in inches.
+                        Auto-sized when ``None``.
+        ylim:           Y-axis limits ``(ymin, ymax)``.  Default ``(0, 105)``.
+        label_fontsize: Font size for the percentage labels above each bar.
+                        Default 9.
+        save_path:      File path to save the figure.  Skipped when ``None``.
+        dpi:            Resolution for saved figure.  Default 150.
+
+    Returns:
+        ``(fig, ax)``    — single-model **or** ``kind="grouped"`` multi-model.
+        ``(fig, axes)``  — ``kind="facet"`` multi-model; ``axes`` is a 2-D
+                           NumPy array shaped ``(nrows, ncols)``.
+
+    Raises:
+        ValueError: If ``data`` is not a DataFrame or non-empty dict, if
+                    ``kind`` is unrecognised, or if models have no common
+                    k values.
+
+    Examples::
+
+        from multimodalva.results import plot_topk_accuracy
+
+        # --- Single model ---
+        fig, ax = plot_topk_accuracy(
+            result.topk, max_k=3, model_label="BioBERT (adults)",
+        )
+
+        # --- Multi-model grouped ---
+        fig, ax = plot_topk_accuracy(
+            {"BioBERT": result_text.topk, "LightGBM": result_tab.topk},
+            max_k=3, kind="grouped", title="Top-k Accuracy Comparison",
+        )
+
+        # --- Multi-model facet (2 × 2 grid) ---
+        fig, axes = plot_topk_accuracy(
+            {
+                "BioBERT":   result_text.topk,
+                "LightGBM":  result_tab.topk,
+                "Data Fusion": result_df.topk,
+                "Stacking":  result_stk.topk,
+            },
+            max_k=3, kind="facet", ncols=2,
+            title="Top-k Accuracy by Model",
+        )
+        plt.show()
+    """
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    palette = colors or _TOPK_BAR_COLORS
+
+    # ------------------------------------------------------------------ #
+    # Single-model path
+    # ------------------------------------------------------------------ #
+    if isinstance(data, pd.DataFrame):
+        acc    = topk_accuracy(data, max_k=max_k)
+        ks     = acc["k"].astype(str).tolist()
+        pcts   = acc["accuracy_pct"].tolist()
+        bcolors = [palette[i % len(palette)] for i in range(len(ks))]
+
+        _figsize = figsize or (max(4.0, len(ks) * 1.4), 3.5)
+        fig, ax = plt.subplots(figsize=_figsize)
+        ax.bar(ks, pcts, color=bcolors)
+        for k_str, pct in zip(ks, pcts):
+            ax.text(k_str, pct + 0.5, f"{pct:.1f}%",
+                    ha="center", va="bottom", fontsize=label_fontsize)
+        ax.set_xlabel("k")
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_ylim(ylim)
+        _ax_title = model_label or title
+        if _ax_title:
+            ax.set_title(_ax_title)
+        plt.tight_layout()
+        if save_path is not None:
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        return fig, ax
+
+    # ------------------------------------------------------------------ #
+    # Multi-model path — validate input
+    # ------------------------------------------------------------------ #
+    if not isinstance(data, dict) or len(data) == 0:
+        raise ValueError(
+            "data must be a topk DataFrame (single model) or a non-empty "
+            "dict[model_name, topk_df] (multi-model)."
+        )
+
+    model_names = list(data.keys())
+    acc_tables  = {name: topk_accuracy(df, max_k=max_k) for name, df in data.items()}
+
+    all_ks = sorted(
+        set.intersection(*[set(t["k"].tolist()) for t in acc_tables.values()])
+    )
+    if not all_ks:
+        raise ValueError("No common k values across models.")
+
+    # ------------------------------------------------------------------ #
+    # Grouped bar chart — one bundle per k, models side by side
+    # ------------------------------------------------------------------ #
+    if kind == "grouped":
+        n_models    = len(model_names)
+        n_k         = len(all_ks)
+        bar_width   = min(0.7 / n_models, 0.25)
+        x_centers   = np.arange(n_k)
+        model_colors = [palette[i % len(palette)] for i in range(n_models)]
+
+        _figsize = figsize or (max(5.0, n_k * (n_models * bar_width + 0.8)), 4.0)
+        fig, ax = plt.subplots(figsize=_figsize)
+
+        for m_idx, (name, color) in enumerate(zip(model_names, model_colors)):
+            acc  = acc_tables[name]
+            pcts = [
+                float(acc.loc[acc["k"] == k, "accuracy_pct"].values[0])
+                for k in all_ks
+            ]
+            offsets = x_centers + (m_idx - n_models / 2 + 0.5) * bar_width
+            bars = ax.bar(offsets, pcts, width=bar_width, color=color, label=name)
+            for bar, pct in zip(bars, pcts):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.5,
+                    f"{pct:.1f}%",
+                    ha="center", va="bottom", fontsize=label_fontsize,
+                )
+
+        ax.set_xticks(x_centers)
+        ax.set_xticklabels([f"Top-{k}" for k in all_ks])
+        ax.set_xlabel("k")
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_ylim(ylim)
+        ax.legend(loc="lower right", framealpha=0.8)
+        if title:
+            ax.set_title(title)
+        plt.tight_layout()
+        if save_path is not None:
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        return fig, ax
+
+    # ------------------------------------------------------------------ #
+    # Facet bar chart — one subplot per model, shared y-axis
+    # ------------------------------------------------------------------ #
+    if kind == "facet":
+        n_models = len(model_names)
+        nrows    = (n_models + ncols - 1) // ncols
+        n_k      = len(all_ks)
+        k_colors = [palette[i % len(palette)] for i in range(n_k)]
+        k_strs   = [str(k) for k in all_ks]
+
+        _figsize = figsize or (ncols * 4.5, nrows * 3.5)
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=_figsize,
+            sharey=True,
+            squeeze=False,
+        )
+
+        for m_idx, name in enumerate(model_names):
+            row, col = divmod(m_idx, ncols)
+            ax   = axes[row][col]
+            acc  = acc_tables[name]
+            pcts = [
+                float(acc.loc[acc["k"] == k, "accuracy_pct"].values[0])
+                for k in all_ks
+            ]
+            bars = ax.bar(k_strs, pcts, color=k_colors)
+            for bar, pct in zip(bars, pcts):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.5,
+                    f"{pct:.1f}%",
+                    ha="center", va="bottom", fontsize=label_fontsize,
+                )
+            ax.set_title(name, fontsize=10, fontweight="bold")
+            ax.set_ylim(ylim)
+
+        # Hide unused axes when n_models doesn't fill the grid
+        for empty_idx in range(n_models, nrows * ncols):
+            row, col = divmod(empty_idx, ncols)
+            axes[row][col].set_visible(False)
+
+        # Shared axis labels
+        fig.supxlabel("k", fontsize=10)
+        fig.supylabel("Accuracy (%)", fontsize=10)
+        if title:
+            fig.suptitle(title, fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        if save_path is not None:
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        return fig, axes
+
+    raise ValueError(f"kind must be 'grouped' or 'facet', got {kind!r}.")
 
 
 # ---------------------------------------------------------------------------

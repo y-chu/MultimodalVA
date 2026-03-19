@@ -156,13 +156,16 @@ class DataFusionClassifier:
         max_length: int = 1024,
         # --- training ---
         use_optimize: bool = False,
-        n_trials: int = 20,
+        n_trials: int = 30,
         optimize_metric: str = "csmf_accuracy",
         search_space: dict | None = None,
         hyperparams: dict | None = None,
-        use_lora: bool = False,
+        use_lora: bool = True,
+        use_focal: bool = False,
         gradient_checkpointing: bool = True,
-        early_stopping_patience: int | None = 3,
+        early_stopping_patience: int | None = 2,
+        resume_hpo: bool = True,
+        resume_training: bool = True,
         # --- inference ---
         batch_size: int = 16,
         top_k: int = 3,
@@ -202,15 +205,24 @@ class DataFusionClassifier:
             max_length:    Tokeniser max length. Default 1 024 (Longformer/BigBird).
                            Use 4 096 for very long documents.
             use_optimize:  Run Optuna HPO before final training. Default False.
-            n_trials:      Optuna trial count (use_optimize=True only). Default 20.
+            n_trials:      Optuna trial count (use_optimize=True only). Default 30.
             optimize_metric: Metric to maximise during HPO. Default "csmf_accuracy".
             search_space:  Custom Optuna search space dict.
                            None → DEFAULT_SEARCH_SPACE (long-context calibrated defaults).
             hyperparams:   Fixed hyperparameter dict. Used when use_optimize=False.
-            use_lora:      Apply LoRA adapters. Default False.
+            use_lora:      Apply LoRA adapters. Default True.
+            use_focal:     Use focal loss during HPO trials (use_optimize=True only).
+                           Merges FOCAL_SEARCH_SPACE (focal_gamma, class_weights) and
+                           injects loss_type="focal" into every trial. Default False.
+                           For non-HPO focal loss, pass hyperparams={"loss_type": "focal",
+                           "focal_gamma": 2.0, "class_weights": "effective_n"}.
             gradient_checkpointing: Enable gradient checkpointing. Default True
                            (strongly recommended for long-context models).
-            early_stopping_patience: Early stopping patience. Default 3.
+            early_stopping_patience: Early stopping patience. Default 2.
+            resume_hpo:    Resume an existing Optuna study if present (load_if_exists).
+                           Default True.
+            resume_training: Resume final training from the latest checkpoint in
+                           output_dir/final/ if one exists. Default True.
             batch_size:    Inference batch size. Default 16.
             top_k:         Number of top classes in topk output. Default 3.
 
@@ -305,8 +317,10 @@ class DataFusionClassifier:
                 search_space=effective_search_space,
                 random_state=random_state,
                 use_lora=use_lora,
+                use_focal=use_focal,
                 gradient_checkpointing=gradient_checkpointing,
                 early_stopping_patience=early_stopping_patience,
+                load_if_exists=resume_hpo,
             )
             self.best_hyperparams = best_hyperparams
             self.study = study
@@ -333,6 +347,7 @@ class DataFusionClassifier:
             use_lora=use_lora,
             gradient_checkpointing=gradient_checkpointing,
             early_stopping_patience=early_stopping_patience,
+            resume=resume_training,
         )
 
         # ------------------------------------------------------------------
