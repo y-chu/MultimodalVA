@@ -159,7 +159,7 @@ def optimize(
         id2label:       Integer-to-label mapping from prepare_dataset().
         model_name:     Model alias — one of SUPPORTED_MODELS keys.
         output_dir:     Root directory for trial outputs and study database.
-        n_trials:       Total Optuna trials. Default 20.
+        n_trials:       Total Optuna trials. Default 50.
         metric:         Metric to maximise — "accuracy", "balanced_accuracy",
                         "f1_macro", "f1_weighted", "csmf_accuracy". Default "accuracy".
                         Use "balanced_accuracy", "csmf_accuracy", or "f1_macro" for imbalanced VA data.
@@ -277,6 +277,34 @@ def optimize(
         study.optimize(objective, n_trials=remaining, catch=(Exception,))
     else:
         logger.info("All %d trials already completed. Skipping optimization.", n_trials)
+
+    # --- HPO Health Check ---
+    _all_states = [t.state for t in study.trials]
+    _n_total    = len(_all_states)
+    _n_complete = sum(1 for s in _all_states if s == optuna.trial.TrialState.COMPLETE)
+    _n_pruned   = sum(1 for s in _all_states if s == optuna.trial.TrialState.PRUNED)
+    _n_failed   = sum(1 for s in _all_states if s == optuna.trial.TrialState.FAIL)
+    _success_rt = (_n_complete / _n_total * 100) if _n_total > 0 else 0.0
+    _best_val   = study.best_value if _n_complete > 0 else float("nan")
+    logger.info(
+        "\n%s\n  HPO HEALTH SUMMARY (Optuna)\n%s\n"
+        "  Total trials launched : %d\n"
+        "  Completed             : %d\n"
+        "  Pruned                : %d\n"
+        "  Failed / errored      : %d\n"
+        "  Success rate          : %.1f%%\n"
+        "  Best %-20s: %.4f\n%s",
+        "=" * 42, "=" * 42,
+        _n_total, _n_complete, _n_pruned, _n_failed, _success_rt,
+        metric, _best_val, "=" * 42,
+    )
+    if _success_rt < 80.0 and _n_total > 0:
+        logger.warning(
+            "High HPO failure rate (%.1f%% success, %d/%d trials).  "
+            "Likely causes: model fit errors, invalid hyperparameter combinations, "
+            "or OOM.  Check trial logs above for details.",
+            _success_rt, _n_complete, _n_total,
+        )
 
     best_hyperparams = study.best_params
 
@@ -551,7 +579,7 @@ def optimize_ray(
         model_name:     Model alias — one of SUPPORTED_MODELS keys.
         output_dir:     Root directory for all Ray Tune artifacts.  Use a
                         shared filesystem path for multi-node clusters.
-        n_trials:       Total number of trials. Default 20.
+        n_trials:       Total number of trials. Default 50.
         metric:         Metric to maximise — ``"accuracy"``, ``"balanced_accuracy"``,
                         ``"f1_macro"``, ``"f1_weighted"``, ``"csmf_accuracy"``. Default ``"accuracy"``.
         search_space:   Custom search space dict (same format as
@@ -814,6 +842,29 @@ def optimize_ray(
             os.environ.pop("RAY_AIR_NEW_OUTPUT", None)
         else:
             os.environ["RAY_AIR_NEW_OUTPUT"] = _prev_ray_output
+
+    # --- HPO Health Check (Ray) ---
+    _ray_df     = results.get_dataframe()
+    _n_total_r  = len(_ray_df)
+    _n_errors_r = int(_ray_df["error"].notnull().sum()) if "error" in _ray_df.columns else 0
+    _n_ok_r     = _n_total_r - _n_errors_r
+    _succ_rt_r  = (_n_ok_r / _n_total_r * 100) if _n_total_r > 0 else 0.0
+    logger.info(
+        "\n%s\n  HPO HEALTH SUMMARY (Ray Tune)\n%s\n"
+        "  Total trials launched : %d\n"
+        "  Successful / pruned   : %d\n"
+        "  System errors         : %d\n"
+        "  Success rate          : %.1f%%\n%s",
+        "=" * 42, "=" * 42,
+        _n_total_r, _n_ok_r, _n_errors_r, _succ_rt_r, "=" * 42,
+    )
+    if _succ_rt_r < 80.0 and _n_total_r > 0:
+        logger.warning(
+            "High HPO failure rate (%.1f%% success, %d/%d trials).  "
+            "Likely causes: model fit errors, invalid hyperparameter combinations, "
+            "or Ray worker errors.  Check logs above for details.",
+            _succ_rt_r, _n_ok_r, _n_total_r,
+        )
 
     # --- Extract best result ---
     best_result = results.get_best_result(metric=metric, mode=_ray_mode)

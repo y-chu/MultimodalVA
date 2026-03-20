@@ -18,7 +18,7 @@ i022l,Was she a woman aged 12-19 years at death?,f 12-19,demographics,a woman ag
 i022m,Was she a woman aged 20-34 years at death?,f 20-34,demographics,a woman aged 20 to 34 years at death
 i022n,Was she a woman aged 35 to 49 years at death?,f 30-49,demographics,a woman aged 35 to 49 years at death
 i059o,Was she married at the time of death?,married,demographics,married at the time of death
-i077o,Did (s)he suffer from any injury or accident that led to her/his death?,injury,injury,injury that led to the death
+i077o,Did (s)he suffer from any injury or accident that led to her/his death?,injury,injury,suffering from injury that led to the death
 i079o,Was (s)he injured in a road traffic accident?,inj rta,injury,injured in a road traffic accident
 i082o,Was (s)he injured in a non-road transport accident?,inj nrta,injury,injured in a non-road transport accident
 i083o,Was (s)he injured in a fall?,inj fall,injury,injured in a fall

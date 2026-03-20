@@ -146,8 +146,9 @@ class DataFusionClassifier:
         prefix_cols: dict[str, str] | None = None,
         yes_no_map: dict[str, str] | None = None,
         separator: str = DEFAULT_SEPARATOR,
-        group_symptoms: bool = True,
+        group_symptoms: bool = False,
         fused_col: str = "fused_text",
+        save_fused_csv: bool = True,
         # --- split ---
         test_size: float = 0.2,
         random_state: int = 42,
@@ -169,6 +170,7 @@ class DataFusionClassifier:
         # --- inference ---
         batch_size: int = 16,
         top_k: int = 3,
+        use_fast: bool = False,
     ) -> dict:
         """Run the full data-level fusion pipeline.
 
@@ -236,29 +238,38 @@ class DataFusionClassifier:
                 "output_dir":       Path to the root output directory
         """
         # ------------------------------------------------------------------
-        # Step 1 — Build fused text
+        # Step 1 — Build fused text (skipped if df already contains fused_col)
         # ------------------------------------------------------------------
-        logger.info(
-            "DataFusionClassifier: fusing %d tabular columns into narrative text.",
-            len(feature_cols),
-        )
-        fused_series = build_fused_text(
-            df,
-            text_col=text_col,
-            feature_cols=feature_cols,
-            qdesc=qdesc,
-            templates=templates,
-            binary_map=binary_map,
-            with_neg=with_neg,
-            prefix_cols=prefix_cols,
-            yes_no_map=yes_no_map,
-            separator=separator,
-            group_symptoms=group_symptoms,
-        )
-
-        # Build a minimal DataFrame: fused text + label only.
-        fused_df = df[[label_col]].copy()
-        fused_df[fused_col] = fused_series.values
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if fused_col in df.columns:
+            logger.info(
+                "DataFusionClassifier: column '%s' already present in df — "
+                "skipping build_fused_text().",
+                fused_col,
+            )
+            fused_df = df[[label_col, fused_col]].copy()
+        else:
+            logger.info(
+                "DataFusionClassifier: fusing %d tabular columns into narrative text.",
+                len(feature_cols),
+            )
+            fused_series = build_fused_text(
+                df,
+                text_col=text_col,
+                feature_cols=feature_cols,
+                qdesc=qdesc,
+                templates=templates,
+                binary_map=binary_map,
+                with_neg=with_neg,
+                prefix_cols=prefix_cols,
+                yes_no_map=yes_no_map,
+                separator=separator,
+                group_symptoms=group_symptoms,
+                save_csv=self.output_dir / "fused_text.csv" if save_fused_csv else None,
+            )
+            # Build a minimal DataFrame: fused text + label only.
+            fused_df = df[[label_col]].copy()
+            fused_df[fused_col] = fused_series.values
 
         # ------------------------------------------------------------------
         # Step 2 — Split
@@ -289,90 +300,64 @@ class DataFusionClassifier:
             label_col=label_col,
             model_name=self.model_name,
             max_length=max_length,
+            use_fast=use_fast,
         )
         self.label2id = label2id
         self.id2label = id2label
 
         # ------------------------------------------------------------------
-        # Step 4 — HPO (optional)
+        # Steps 4–6 — HPO / Train / Predict via TextClassifier
+        #
+        # DataFusionClassifier delegates the HPO → train → predict sequence
+        # to TextClassifier so that both pipelines share exactly one
+        # implementation.  Any future changes to TextClassifier (new HPO
+        # params, train flags, predict options) are automatically inherited.
         # ------------------------------------------------------------------
-        if use_optimize:
-            from ..text.hpo import optimize
+        from ..text.text_classifier import TextClassifier
 
-            # Use long-context defaults when no custom space is provided.
-            effective_search_space = search_space if search_space is not None else DEFAULT_SEARCH_SPACE
+        # Use long-context calibrated defaults when no custom space is given.
+        effective_search_space = search_space if search_space is not None else DEFAULT_SEARCH_SPACE
 
-            logger.info(
-                "DataFusionClassifier: running Optuna HPO — %d trials, metric=%s.",
-                n_trials, optimize_metric,
-            )
-            best_hyperparams, study = optimize(
-                train_ds,
-                label2id=label2id,
-                id2label=id2label,
-                model_name=self.model_name,
-                output_dir=self.output_dir / "hpo",
-                n_trials=n_trials,
-                metric=optimize_metric,
-                search_space=effective_search_space,
-                random_state=random_state,
-                use_lora=use_lora,
-                use_focal=use_focal,
-                gradient_checkpointing=gradient_checkpointing,
-                early_stopping_patience=early_stopping_patience,
-                load_if_exists=resume_hpo,
-            )
-            self.best_hyperparams = best_hyperparams
-            self.study = study
-            val_size = None   # epochs already determined by HPO; train on all data
-        else:
-            best_hyperparams = hyperparams or {}
-            self.best_hyperparams = best_hyperparams
-            val_size = 0.1    # carve internal val split for early stopping / eval
-
-        # ------------------------------------------------------------------
-        # Step 5 — Train
-        # ------------------------------------------------------------------
-        from ..text.train import train
-
-        logger.info("DataFusionClassifier: training final model.")
-        trainer, tokenizer, metadata = train(
-            train_ds,
-            label2id=label2id,
-            id2label=id2label,
+        text_clf = TextClassifier(
             model_name=self.model_name,
-            output_dir=self.output_dir / "final",
-            hyperparams=best_hyperparams,
-            val_size=val_size,
-            use_lora=use_lora,
-            gradient_checkpointing=gradient_checkpointing,
-            early_stopping_patience=early_stopping_patience,
-            resume=resume_training,
+            output_dir=self.output_dir,
         )
+        # Pass the already-tokenised datasets directly so TextClassifier skips
+        # its own split + prepare_dataset steps and goes straight to HPO/train.
+        text_clf.train_dataset = train_ds
+        text_clf.test_dataset  = test_ds
+        text_clf.label2id      = label2id
+        text_clf.id2label      = id2label
+        text_clf.train_df      = train_df
+        text_clf.test_df       = test_df
 
-        # ------------------------------------------------------------------
-        # Step 6 — Predict
-        # ------------------------------------------------------------------
-        from ..text.predict import predict
-
-        logger.info("DataFusionClassifier: generating predictions on test set.")
-        result = predict(
-            output_dir=None,      # in-memory mode — no disk reload needed
-            test_dataset=test_ds,
+        logger.info(
+            "DataFusionClassifier: delegating HPO/train/predict to TextClassifier "
+            "(use_optimize=%s, n_trials=%d, metric=%s).",
+            use_optimize, n_trials, optimize_metric,
+        )
+        results = text_clf._run_from_datasets(
+            label_col=label_col,
+            hyperparams=hyperparams,
+            use_optimize=use_optimize,
+            n_trials=n_trials,
+            optimize_metric=optimize_metric,
+            search_space=effective_search_space,
             batch_size=batch_size,
             top_k=top_k,
-            save_dir=self.output_dir / "predictions",
-            model=trainer.model,
-            tokenizer=tokenizer,
-            id2label=id2label,
+            use_lora=use_lora,
+            use_focal=use_focal,
+            gradient_checkpointing=gradient_checkpointing,
+            early_stopping_patience=early_stopping_patience,
+            resume_hpo=resume_hpo,
+            resume_training=resume_training,
+            random_state=random_state,
+            use_fast=use_fast,
         )
-        self.predictions = result
 
-        return {
-            "predictions":      result,
-            "train_metadata":   metadata,
-            "best_hyperparams": best_hyperparams,
-            "label2id":         label2id,
-            "id2label":         id2label,
-            "output_dir":       self.output_dir,
-        }
+        # Mirror TextClassifier state onto self for API consistency.
+        self.best_hyperparams = text_clf.best_hyperparams
+        self.study             = text_clf.study
+        self.predictions       = text_clf.predictions
+
+        return results

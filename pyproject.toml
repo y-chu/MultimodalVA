@@ -9,17 +9,20 @@ name = "multimodalva"
 version = "0.1.0"
 description = "Cause of death classification using text and tabular data from verbal autopsies"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 license = {text = "MIT"}
 authors = [
     {name = "Yue Chu", email = "ychu612@gmail.com"},
 ]
 dependencies = [
-    # Python 3.12+ minimum versions — see notes below.
+    # Python 3.12 required (tested on 3.12.2; 3.13+ not supported).
     # torch 2.1: first release with Python 3.12 wheels (Oct 2023).
     "torch>=2.1",
-    # transformers 4.35: pure Python, compatible with 3.12.
-    "transformers>=4.35",
+    # transformers 4.38–4.x: required for Python 3.12.2 compatibility;
+    # 5.x not yet tested/supported.
+    "transformers>=4.38,<5",
+    # tokenizers 0.15: required for Python 3.12 wheels and BlueBERT slow tokenizer.
+    "tokenizers>=0.15",
     # accelerate is required by transformers Trainer (since ~4.31).
     # Without it, `from transformers import Trainer` raises ModuleNotFoundError.
     # accelerate 0.26: first release with Python 3.12 wheels (Nov 2023).
@@ -48,6 +51,10 @@ dependencies = [
     # seaborn 0.13: first release to support Python 3.12 (Sep 2023).
     # 0.12 depended on deprecated matplotlib APIs that 3.8 removed.
     "seaborn>=0.13",
+    # sentencepiece: required by models with SentencePiece tokenizers
+    # (e.g. BlueBERT, T5, XLNet, DeBERTa-v2). transformers will raise
+    # ImportError at tokenizer load time if this is missing.
+    "sentencepiece>=0.1.99",
 ]
 
 [project.optional-dependencies]
@@ -76,15 +83,16 @@ feature_fusion = ["autogluon.multimodal>=1.1"]
 # Enables model_name="insilicova" in StackingClassifier tabular_models specs.
 insilicova = ["pyinsilicova>=1.0"]
 
-# --- Install everything (recommended for research / full functionality) ---
+# --- Install everything compatible with Python 3.12 ---
 # pip install multimodalva[all]
+# Note: pyinsilicova is excluded — it requires Python <3.10 and must be
+# installed separately in a Python 3.7–3.9 environment.
 all = [
     "lightgbm>=4.1",
     "xgboost>=2.0",
     "catboost>=1.2.2",
     "peft>=0.6",
     "autogluon.multimodal>=1.1",
-    "pyinsilicova>=1.0",
 ]
 
 dev = ["pytest", "pytest-cov"]

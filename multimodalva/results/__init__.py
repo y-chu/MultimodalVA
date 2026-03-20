@@ -2,6 +2,8 @@
 Results subpackage: training diagnostics and prediction visualization.
 
 Sub-modules:
+    - palettes:    Color constants (TOPK_BAR_COLORS, HEATMAP_SEQ,
+                    HEATMAP_DIV, HEATMAP_CLINICAL)
     - vis_train:   Training/HPO diagnostics
                    (plot_loss_curves, hpo_leaderboard,
                     oov_rate, hpo_loss_trend, hpo_convergence_plot,
@@ -15,6 +17,12 @@ Sub-modules:
                     cause_accuracy_diff_heatmap, confusion_heatmap)
 """
 
+from .palettes import (
+    TOPK_BAR_COLORS,
+    HEATMAP_SEQ,
+    HEATMAP_DIV,
+    HEATMAP_CLINICAL,
+)
 from .vis_train import (
     plot_loss_curves,
     hpo_leaderboard,
@@ -38,6 +46,11 @@ from .vis_predict import (
 )
 
 __all__ = [
+    # palettes
+    "TOPK_BAR_COLORS",
+    "HEATMAP_SEQ",
+    "HEATMAP_DIV",
+    "HEATMAP_CLINICAL",
     # vis_train
     "plot_loss_curves",
     "hpo_leaderboard",

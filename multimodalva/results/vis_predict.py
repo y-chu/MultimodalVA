@@ -50,6 +50,7 @@ import numpy as np
 import pandas as pd
 
 from ..utils.metrics import log_loss_from_full
+from .palettes import _TOPK_BAR_COLORS, HEATMAP_SEQ, HEATMAP_DIV, HEATMAP_CLINICAL
 
 logger = logging.getLogger(__name__)
 
@@ -484,10 +485,8 @@ def topk_accuracy(
 # 6. Top-K accuracy bar chart
 # ---------------------------------------------------------------------------
 
-_TOPK_BAR_COLORS = [
-    "steelblue", "darkorange", "seagreen", "firebrick", "mediumpurple",
-    "saddlebrown", "deeppink", "darkcyan", "goldenrod", "slategray",
-]
+# Palettes imported from palettes.py — edit that file to adjust colours.
+# _TOPK_BAR_COLORS is used as the default categorical palette here.
 
 
 def plot_topk_accuracy(
@@ -902,6 +901,7 @@ def cause_accuracy_heatmap(
     cbar_label: str | None = None,
     x_rotation: int = 45,
     y_rotation: int = 0,
+    show_n: bool = False,
     save_path: str | None = None,
     dpi: int = 150,
 ) -> tuple:
@@ -968,6 +968,11 @@ def cause_accuracy_heatmap(
                         ``"Accuracy"`` depending on ``percentage``.
         x_rotation:     X-axis tick rotation.  Default 45.
         y_rotation:     Y-axis tick rotation.  Default 0.
+        show_n:         Append true-label sample size to each y-axis tick,
+                        e.g. ``"Malaria (n=42)"``.  Counts are taken from
+                        ``df[true_col]`` when ``df`` is provided, otherwise
+                        from the ``"true_label"`` column of the first entry
+                        in ``topk_dfs``.  Default False.
         save_path:      Save figure to this path before returning.  Supports
                         any matplotlib extension (.png, .pdf, .svg).
         dpi:            Resolution when saving.  Default 150.
@@ -1047,6 +1052,18 @@ def cause_accuracy_heatmap(
     accuracy_df = accuracy_df.dropna(how="all")
 
     # ------------------------------------------------------------------
+    # Step 4b: compute per-cause sample counts (used when show_n=True)
+    # ------------------------------------------------------------------
+    if show_n:
+        if df is not None:
+            label_counts = df[true_col].value_counts()
+        else:
+            _first_topk = next(iter(topk_dfs.values()))
+            label_counts = _first_topk["true_label"].value_counts()
+    else:
+        label_counts = None
+
+    # ------------------------------------------------------------------
     # Step 5: rename for display (work on a copy to keep accuracy_df clean)
     # ------------------------------------------------------------------
     display_df = accuracy_df.copy()
@@ -1062,7 +1079,7 @@ def cause_accuracy_heatmap(
         from matplotlib.colors import LinearSegmentedColormap
         cmap = LinearSegmentedColormap.from_list(
             "va_cause_accuracy",
-            [(255 / 255, 245 / 255, 242 / 255), "#D8453B"],
+            HEATMAP_CLINICAL,
         )
 
     if cbar_label is None:
@@ -1091,6 +1108,13 @@ def cause_accuracy_heatmap(
     ax.set_ylabel("")
     ax.tick_params(axis="x", rotation=x_rotation)
     ax.tick_params(axis="y", rotation=y_rotation)
+
+    if show_n:
+        ytick_labels = [
+            f"{display_cause} (n={label_counts.get(orig_cause, 0)})"
+            for orig_cause, display_cause in zip(accuracy_df.index, display_df.index)
+        ]
+        ax.set_yticklabels(ytick_labels, rotation=y_rotation)
 
     # ------------------------------------------------------------------
     # Step 8: column grouping annotations below x-axis
@@ -1128,7 +1152,7 @@ def cause_accuracy_diff_heatmap(
     group_boundaries: list[tuple[float, float]] | None = None,
     group_labels: list[str] | None = None,
     # --- aesthetics ---
-    cmap: str = "RdBu_r",
+    cmap=None,
     vmin: float | None = None,
     vmax: float | None = None,
     percentage: bool = True,
@@ -1316,6 +1340,10 @@ def cause_accuracy_diff_heatmap(
     # ------------------------------------------------------------------
     # Step 5: symmetric colormap bounds centred at 0
     # ------------------------------------------------------------------
+    if cmap is None:
+        from matplotlib.colors import LinearSegmentedColormap
+        cmap = LinearSegmentedColormap.from_list("va_diff", HEATMAP_DIV)
+
     if vmin is None and vmax is None:
         max_abs = float(np.nanmax(np.abs(display_df.values)))
         vmin = -max_abs
@@ -1375,7 +1403,7 @@ def confusion_heatmap(
     label_abbr: bool = False,
     annot: bool = True,
     figsize: tuple = (10, 8),
-    cmap: str = "Blues",
+    cmap=None,
     x_rotation: int = 90,
     y_rotation: int = 0,
     normalize: bool = False,
@@ -1475,6 +1503,10 @@ def confusion_heatmap(
     accuracy = accuracy_score(y_true.astype(str), y_pred.astype(str))
 
     # --- plot ---------------------------------------------------------------
+    if cmap is None:
+        from matplotlib.colors import LinearSegmentedColormap
+        cmap = LinearSegmentedColormap.from_list("va_confusion", HEATMAP_SEQ)
+
     fig, ax = plt.subplots(figsize=figsize)
     sns.heatmap(
         data_fig,

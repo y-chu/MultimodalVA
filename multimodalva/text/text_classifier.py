@@ -82,7 +82,14 @@ class TextClassifier:
         optimize_metric: str = "accuracy",
         search_space: dict | None = None,
         batch_size: int = 32,
+        top_k: int = 3,
         use_lora: bool = True,
+        use_focal: bool = False,
+        gradient_checkpointing: bool = False,
+        early_stopping_patience: int | None = 2,
+        resume_hpo: bool = True,
+        resume_training: bool = True,
+        use_fast: bool = False,
     ) -> dict:
         """Run the full text classification pipeline.
 
@@ -123,10 +130,25 @@ class TextClassifier:
             search_space: Custom Optuna search space dict (only used when
                           use_optimize=True). Merged over DEFAULT_SEARCH_SPACE.
             batch_size: Inference batch size for predict(). Default 32.
+            top_k: Number of top classes in topk output. Default 3.
             use_lora: Apply LoRA adapters for parameter-efficient fine-tuning.
                       Reduces GPU memory and improves generalisation on small datasets.
                       When True, LoRA hyperparameters (lora_r, lora_alpha, lora_dropout)
                       are also searched during HPO. Default True.
+            use_focal: Use focal loss during HPO trials (use_optimize=True only).
+                       Merges FOCAL_SEARCH_SPACE and injects loss_type="focal" into every
+                       trial. For non-HPO focal loss, pass hyperparams={"loss_type":
+                       "focal", "focal_gamma": 2.0}. Default False.
+            gradient_checkpointing: Enable gradient checkpointing to reduce GPU memory
+                                    at the cost of slightly slower training. Default False.
+            early_stopping_patience: Stop training early if eval loss does not improve
+                                     for this many evaluations. None = disabled. Default 2.
+            resume_hpo: Resume an existing Optuna study if one exists at
+                        output_dir/hpo/ (load_if_exists). Default True.
+            resume_training: Resume final training from the latest checkpoint in
+                             output_dir/final/ if one exists. Default True.
+            use_fast: Use the HuggingFace fast (Rust) tokenizer. Default False.
+                      Set False for models that lack a fast tokenizer (e.g. BlueBERT).
 
         Returns:
             results: Dict with keys:
@@ -161,6 +183,7 @@ class TextClassifier:
                 label_col=label_col,
                 model_name=self.model_name,
                 max_length=max_length,
+                use_fast=use_fast,
             )
         )
         logger.info("Prepared datasets: %d classes.", len(self.label2id))
@@ -179,6 +202,11 @@ class TextClassifier:
                 search_space=search_space,
                 random_state=random_state,
                 use_lora=use_lora,
+                use_focal=use_focal,
+                gradient_checkpointing=gradient_checkpointing,
+                early_stopping_patience=early_stopping_patience,
+                load_if_exists=resume_hpo,
+                use_fast=use_fast,
             )
             final_hyperparams = self.best_hyperparams
             # HPO already determined epochs; train on full training data.
@@ -199,6 +227,10 @@ class TextClassifier:
             hyperparams=final_hyperparams,
             val_size=final_val_size,
             use_lora=use_lora,
+            gradient_checkpointing=gradient_checkpointing,
+            early_stopping_patience=early_stopping_patience,
+            resume=resume_training,
+            use_fast=use_fast,
         )
 
         # --- Step 5: predict on test set ---
@@ -206,7 +238,105 @@ class TextClassifier:
             output_dir=self.output_dir / "final",
             test_dataset=self.test_dataset,
             batch_size=batch_size,
+            top_k=top_k,
             save_dir=self.output_dir / "predictions",
+            use_fast=use_fast,
+        )
+
+        return {
+            "predictions": self.predictions,
+            "train_metadata": self.train_metadata,
+            "best_hyperparams": final_hyperparams,
+            "label2id": self.label2id,
+            "id2label": self.id2label,
+            "output_dir": self.output_dir,
+        }
+
+    def _run_from_datasets(
+        self,
+        label_col: str,
+        hyperparams: dict | None = None,
+        use_optimize: bool = False,
+        n_trials: int = 30,
+        optimize_metric: str = "accuracy",
+        search_space: dict | None = None,
+        batch_size: int = 32,
+        top_k: int = 3,
+        use_lora: bool = True,
+        use_focal: bool = False,
+        gradient_checkpointing: bool = False,
+        early_stopping_patience: int | None = 2,
+        resume_hpo: bool = True,
+        resume_training: bool = True,
+        random_state: int = 42,
+        use_fast: bool = False,
+    ) -> dict:
+        """Run Steps 3–5 (HPO → train → predict) on pre-loaded datasets.
+
+        Intended for callers (e.g. DataFusionClassifier) that have already
+        populated ``self.train_dataset``, ``self.test_dataset``,
+        ``self.label2id``, and ``self.id2label`` before calling this method.
+        Skips the split and prepare_dataset steps.
+
+        All parameters mirror ``run()``.
+        """
+        if self.train_dataset is None or self.label2id is None:
+            raise RuntimeError(
+                "_run_from_datasets() requires train_dataset, test_dataset, "
+                "label2id, and id2label to be set on self before calling."
+            )
+
+        # --- Step 3: optional HPO ---
+        if use_optimize:
+            from multimodalva.text.hpo import optimize  # noqa: PLC0415
+            self.best_hyperparams, self.study = optimize(
+                train_dataset=self.train_dataset,
+                label2id=self.label2id,
+                id2label=self.id2label,
+                model_name=self.model_name,
+                output_dir=self.output_dir / "hpo",
+                n_trials=n_trials,
+                metric=optimize_metric,
+                search_space=search_space,
+                random_state=random_state,
+                use_lora=use_lora,
+                use_focal=use_focal,
+                gradient_checkpointing=gradient_checkpointing,
+                early_stopping_patience=early_stopping_patience,
+                load_if_exists=resume_hpo,
+                use_fast=use_fast,
+            )
+            final_hyperparams = self.best_hyperparams
+            final_val_size = None
+        else:
+            self.best_hyperparams = hyperparams
+            final_hyperparams = hyperparams
+            final_val_size = 0.1
+
+        # --- Step 4: final training ---
+        _, _, self.train_metadata = train(
+            train_dataset=self.train_dataset,
+            label2id=self.label2id,
+            id2label=self.id2label,
+            model_name=self.model_name,
+            output_dir=self.output_dir / "final",
+            hyperparams=final_hyperparams,
+            val_size=final_val_size,
+            use_lora=use_lora,
+            gradient_checkpointing=gradient_checkpointing,
+            early_stopping_patience=early_stopping_patience,
+            resume=resume_training,
+            use_fast=use_fast,
+        )
+
+        # --- Step 5: predict on test set ---
+        self.predictions = predict(
+            output_dir=self.output_dir / "final",
+            test_dataset=self.test_dataset,
+            batch_size=batch_size,
+            top_k=top_k,
+            save_dir=self.output_dir / "predictions",
+            use_fast=use_fast,
         )
 
         return {

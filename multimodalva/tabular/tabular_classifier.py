@@ -37,7 +37,7 @@ class TabularClassifier:
         clf = TabularClassifier(model_name="lightgbm", output_dir="runs/tabular")
         results = clf.run(
             df, feature_cols=[...], label_col="cause",
-            use_optimize=True, n_trials=30, optimize_metric="csmf_accuracy",
+            use_optimize=True, n_trials=50, optimize_metric="csmf_accuracy",
         )
     """
 

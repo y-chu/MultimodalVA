@@ -184,6 +184,7 @@ def optimize(
     enable_pruning: bool = True,
     save_trials_csv: bool = True,
     cleanup_trials: bool = True,
+    use_fast: bool = False,
 ) -> tuple[dict, optuna.Study]:
     """Run Optuna hyperparameter search using train() and predict().
 
@@ -359,8 +360,9 @@ def optimize(
                 early_stopping_patience=early_stopping_patience,
                 # Each trial gets a fresh directory — never resume from a previous trial.
                 resume=False,
+                use_fast=use_fast,
             )
-            result = predict(trial_dir, opt_val)
+            result = predict(trial_dir, opt_val, use_fast=use_fast)
             # Compute all metrics and store as user attributes for traceability.
             # Only `metric` drives Optuna's optimization; the rest are available
             # in study.trials_dataframe() as user_attrs_* columns.
@@ -405,6 +407,35 @@ def optimize(
         study.optimize(objective, n_trials=remaining, catch=(Exception,))
     else:
         logger.info("All %d trials already completed. Skipping optimization.", n_trials)
+
+    # --- HPO Health Check ---
+    _all_states = [t.state for t in study.trials]
+    _n_total    = len(_all_states)
+    _n_complete = sum(1 for s in _all_states if s == optuna.trial.TrialState.COMPLETE)
+    _n_pruned   = sum(1 for s in _all_states if s == optuna.trial.TrialState.PRUNED)
+    _n_failed   = sum(1 for s in _all_states if s == optuna.trial.TrialState.FAIL)
+    _success_rt = (_n_complete / _n_total * 100) if _n_total > 0 else 0.0
+    _best_val   = study.best_value if _n_complete > 0 else float("nan")
+    logger.info(
+        "\n%s\n  HPO HEALTH SUMMARY (Optuna)\n%s\n"
+        "  Total trials launched : %d\n"
+        "  Completed             : %d\n"
+        "  Pruned                : %d\n"
+        "  Failed / errored      : %d\n"
+        "  Success rate          : %.1f%%\n"
+        "  Best %-20s: %.4f\n%s",
+        "=" * 42, "=" * 42,
+        _n_total, _n_complete, _n_pruned, _n_failed, _success_rt,
+        metric, _best_val, "=" * 42,
+    )
+    if _success_rt < 80.0 and _n_total > 0:
+        logger.warning(
+            "High HPO failure rate (%.1f%% success, %d/%d trials).  "
+            "Likely causes: GPU OOM, file descriptor exhaustion, NaN loss, or "
+            "checkpoint errors.  Check trial logs above for details.  "
+            "Tip: pass storage_path='/tmp/hpo_<name>.db' if output_dir is on Dropbox/cloud.",
+            _success_rt, _n_complete, _n_total,
+        )
 
     n_completed = sum(
         1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
@@ -525,6 +556,7 @@ def _ray_trial_fn(
     use_focal: bool,
     gradient_checkpointing: bool,
     early_stopping_patience: int | None,
+    use_fast: bool = False,
 ) -> dict:
     """Single trial for Ray Tune — fully compatible with Ray 2.x / Python 3.13.
 
@@ -585,10 +617,11 @@ def _ray_trial_fn(
             gradient_checkpointing=gradient_checkpointing,
             early_stopping_patience=early_stopping_patience,
             resume=False,
+            use_fast=use_fast,
         )
 
         # --- Evaluate ---
-        result = _predict(trial_dir, opt_val)
+        result = _predict(trial_dir, opt_val, use_fast=use_fast)
         all_scores.update(
             {
                 m: score_predictions(result.top1, m)
@@ -642,6 +675,7 @@ def optimize_ray(
     save_trials_csv: bool = True,
     cleanup_trials: bool = True,
     use_asha: bool = False,
+    use_fast: bool = False,
 ) -> tuple[dict, ray.tune.ResultGrid]:
     """Distributed HPO using Ray Tune.
 
@@ -790,6 +824,7 @@ def optimize_ray(
         use_focal=use_focal,
         gradient_checkpointing=gradient_checkpointing,
         early_stopping_patience=early_stopping_patience,
+        use_fast=use_fast,
     )
     trainable = tune.with_resources(
         trainable, resources={"cpu": num_cpus_per_trial, "gpu": num_gpus_per_trial}
@@ -887,6 +922,30 @@ def optimize_ray(
             os.environ.pop("RAY_AIR_NEW_OUTPUT", None)
         else:
             os.environ["RAY_AIR_NEW_OUTPUT"] = _prev_ray_output
+
+    # --- HPO Health Check (Ray) ---
+    _ray_df     = results.get_dataframe()
+    _n_total_r  = len(_ray_df)
+    _n_errors_r = int(_ray_df["error"].notnull().sum()) if "error" in _ray_df.columns else 0
+    _n_ok_r     = _n_total_r - _n_errors_r
+    _succ_rt_r  = (_n_ok_r / _n_total_r * 100) if _n_total_r > 0 else 0.0
+    logger.info(
+        "\n%s\n  HPO HEALTH SUMMARY (Ray Tune)\n%s\n"
+        "  Total trials launched : %d\n"
+        "  Successful / pruned   : %d\n"
+        "  System errors         : %d\n"
+        "  Success rate          : %.1f%%\n%s",
+        "=" * 42, "=" * 42,
+        _n_total_r, _n_ok_r, _n_errors_r, _succ_rt_r, "=" * 42,
+    )
+    if _succ_rt_r < 80.0 and _n_total_r > 0:
+        logger.warning(
+            "High HPO failure rate (%.1f%% success, %d/%d trials).  "
+            "Likely causes: GPU OOM, file descriptor limit, or Ray worker errors.  "
+            "Consider: reduce batch_size, set num_gpus_per_trial=0 for CPU-only, "
+            "or pass storage_path='/tmp/...' to move the SQLite DB off cloud storage.",
+            _succ_rt_r, _n_ok_r, _n_total_r,
+        )
 
     best_result = results.get_best_result(metric=metric, mode=_ray_mode)
     best_hyperparams = best_result.config

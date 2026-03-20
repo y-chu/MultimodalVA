@@ -118,6 +118,7 @@ def prepare_dataset(
     label_col: str,
     model_name: str,
     max_length: int | None = 512,
+    use_fast: bool = False,
 ) -> tuple[ClassificationDataset, ClassificationDataset, dict, dict]:
     """Tokenize text and encode labels, returning ClassificationDataset objects.
 
@@ -137,6 +138,9 @@ def prepare_dataset(
             - 512 (default) → truncate to 512 tokens (BERT's maximum).
             - None → use the model's built-in maximum (e.g. 4096 for Longformer).
             - int → truncate to exactly that many tokens.
+        use_fast: Use the HuggingFace fast (Rust) tokenizer. Default False.
+                  Set False for models that lack a fast tokenizer
+                  (e.g. BlueBERT, BioELECTRA) to avoid a falling-back warning.
 
     Returns:
         train_dataset: Tokenized ClassificationDataset for training.
@@ -148,7 +152,7 @@ def prepare_dataset(
     train_df = _drop_invalid_rows(train_df, text_col, label_col, split="train")
     test_df = _drop_invalid_rows(test_df, text_col, label_col, split="test")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=use_fast)
 
     # Build label maps from the union of both splits to avoid missing keys
     label_list = sorted(set(train_df[label_col]).union(test_df[label_col]))

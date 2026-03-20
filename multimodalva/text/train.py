@@ -80,7 +80,7 @@ LORA_DEFAULTS: dict = {
 #   BERT-family : bert, biobert, bioclinicalbert, bluebert, biomedbert, clinicalbert
 #   RoBERTa     : biomedroberta
 #   ELECTRA     : bioelectra
-#   Long-range  : longformer, bigbird
+#   Long-range  : longformer, clinicallongformer, bigbird, clinicalbigbird
 SUPPORTED_MODELS: dict[str, str] = {
     "bert":            "bert-base-uncased",
     "biobert":         "dmis-lab/biobert-base-cased-v1.2", #dmis-lab/biobert-v1.1
@@ -91,7 +91,9 @@ SUPPORTED_MODELS: dict[str, str] = {
     "biomedroberta":   "allenai/biomed_roberta_base",
     "bioelectra":      "kamalkraj/bioelectra-base-discriminator-pubmed",
     "longformer":      "allenai/longformer-base-4096",
+    "clinicallongformer":      "yikuan8/Clinical-Longformer",
     "bigbird":         "google/bigbird-roberta-base",
+    "clinicalbigbird":         "yikuan8/Clinical-BigBird",
 }
 
 # Models not on the HuggingFace Hub — must be fetched via download_model(key).
@@ -419,6 +421,7 @@ def train(
     early_stopping_patience: int | None = None,
     resume: bool = True,
     cleanup_checkpoints: bool = False,
+    use_fast: bool = False,
 ) -> tuple[Trainer, AutoTokenizer, dict]:
     """Fine-tune a BERT-family model for multiclass classification.
 
@@ -467,6 +470,9 @@ def train(
                              space (equal to the full model size per checkpoint, up to
                              ``save_total_limit=2``).  The final model weights saved
                              directly in output_dir are unaffected.  Default False.
+        use_fast: Use the HuggingFace fast (Rust) tokenizer. Default False.
+                  Set False for models that lack a fast tokenizer
+                  (e.g. BlueBERT) to avoid a falling-back warning.
 
     Returns:
         trainer:   HuggingFace Trainer with the fine-tuned model at trainer.model.
@@ -562,7 +568,13 @@ def train(
 
     # --- Apply LoRA ---
     if use_lora:
-        from peft import LoraConfig, TaskType, get_peft_model
+        try:
+            from peft import LoraConfig, TaskType, get_peft_model
+        except ImportError:
+            raise ImportError(
+                "peft is required for LoRA fine-tuning. "
+                "Install it with: pip install 'multimodalva[lora]' or pip install peft>=0.6"
+            ) from None
 
         peft_config = LoraConfig(
             r=hp["lora_r"],
@@ -611,7 +623,7 @@ def train(
     )
 
     # --- Load tokenizer for DataCollator (needed before Trainer is created) ---
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=use_fast)
 
     callbacks = []
     if has_eval and early_stopping_patience is not None:

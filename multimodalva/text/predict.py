@@ -42,6 +42,7 @@ def predict(
     top_k: int = 3,
     save_dir: str | Path | None = None,
     save_prefix: str = "predictions",
+    use_fast: bool = False,
     *, # everything after here is keyword-only, e.g. MUST be passed as model=...
     model: AutoModelForSequenceClassification | None = None,
     tokenizer: AutoTokenizer | None = None,
@@ -70,6 +71,8 @@ def predict(
                          <save_dir>/<save_prefix>_top1.csv
                          <save_dir>/<save_prefix>_full.csv
                          <save_dir>/<save_prefix>_topk.csv
+        use_fast: Use the HuggingFace fast (Rust) tokenizer. Default False.
+                  Must match the value used in prepare_dataset() / train().
         model: (keyword-only) Fine-tuned model in memory. When all three of model,
                tokenizer, and id2label are provided, disk loading is skipped entirely.
         tokenizer: (keyword-only) Tokenizer in memory.
@@ -99,7 +102,7 @@ def predict(
         with open(output_dir / "id2label.json") as f:
             id2label = {int(k): v for k, v in json.load(f).items()}
 
-        tokenizer = AutoTokenizer.from_pretrained(str(output_dir))
+        tokenizer = AutoTokenizer.from_pretrained(str(output_dir), use_fast=use_fast)
         model = AutoModelForSequenceClassification.from_pretrained(str(output_dir))
 
     # Normalise id2label keys to int in both paths

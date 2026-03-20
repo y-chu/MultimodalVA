@@ -94,6 +94,18 @@ DEFAULT_YES_NO_MAP: dict[str, str] = {
 DEFAULT_YES_VERB = "had"
 DEFAULT_NO_VERB  = "had no"
 
+# Per-type default verb pairs used when qdesc has no yes/no columns.
+# Value is (positive_verb, negative_verb_or_None).
+# None for the negative means: skip negative phrases entirely for that type.
+TYPE_VERB_MAP: dict[str, tuple[str, str | None]] = {
+    "symptom":     ("had",         "had no"),
+    "diagnosis":   ("had",         "had no"),
+    "behavior":    ("had",         "had no"),
+    "service":     ("had",         "had no"),
+    "injury":      ("was",         "was not"),
+    "environment": ("died during", None),   # negatives not informative — skip
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -293,7 +305,11 @@ def qdesc_feature_overlap(
 
 
 def _is_positive(val) -> bool:
-    """Return True if *val* represents a positive / 'yes' answer."""
+    """Return True if *val* represents a positive / 'yes' answer.
+
+    Handles both integer 1 and float 1.0 (common when pandas reads binary
+    columns with NaNs, storing them as float64).
+    """
     if val is None:
         return False
     try:
@@ -301,11 +317,18 @@ def _is_positive(val) -> bool:
             return False
     except (TypeError, ValueError):
         pass
-    return str(val).strip().lower() in ("y", "yes", "1", "true")
+    try:
+        return float(val) == 1.0
+    except (ValueError, TypeError):
+        return str(val).strip().lower() in ("y", "yes", "true")
 
 
 def _is_negative(val) -> bool:
-    """Return True if *val* represents a negative / 'no' answer."""
+    """Return True if *val* represents a negative / 'no' answer.
+
+    Handles both integer 0 and float 0.0 (mirrors the float-safe logic in
+    _is_positive).
+    """
     if val is None:
         return False
     try:
@@ -313,7 +336,10 @@ def _is_negative(val) -> bool:
             return False
     except (TypeError, ValueError):
         pass
-    return str(val).strip().lower() in ("n", "no", "0", "false")
+    try:
+        return float(val) == 0.0
+    except (ValueError, TypeError):
+        return str(val).strip().lower() in ("n", "no", "false")
 
 
 def _get_prefix(
@@ -373,6 +399,50 @@ def _join_symptom_list(
     return f"{prefix} {verb} {', '.join(descs[:-1])}, {conjunction} {descs[-1]}."
 
 
+def _get_type(entry: pd.Series) -> str:
+    """Return the qdesc type string for an entry, or '' if missing/NaN."""
+    return (
+        str(entry["type"])
+        if "type" in entry.index and pd.notna(entry["type"])
+        else ""
+    )
+
+
+def _resolve_yes_verb(entry: pd.Series, type_: str) -> str:
+    """Return the positive verb for a qdesc entry.
+
+    Priority:
+        1. qdesc ``yes`` column (per-indicator override).
+        2. TYPE_VERB_MAP[type_] positive verb.
+        3. DEFAULT_YES_VERB ("had").
+    """
+    if "yes" in entry.index and pd.notna(entry["yes"]):
+        return str(entry["yes"])
+    yes_verb, _ = TYPE_VERB_MAP.get(type_, (DEFAULT_YES_VERB, DEFAULT_NO_VERB))
+    return yes_verb
+
+
+def _resolve_no_verb(
+    entry: pd.Series,
+    type_: str,
+    yes_no_map: dict,
+    yes_verb: str,
+) -> str | None:
+    """Return the negative verb for a qdesc entry, or None to skip the phrase.
+
+    Priority:
+        1. qdesc ``no`` column (per-indicator override).
+        2. TYPE_VERB_MAP[type_] negative verb (may be None → skip).
+        3. yes_no_map lookup on yes_verb, then DEFAULT_NO_VERB.
+    """
+    if "no" in entry.index and pd.notna(entry["no"]):
+        return str(entry["no"])
+    if type_ in TYPE_VERB_MAP:
+        _, no_verb = TYPE_VERB_MAP[type_]
+        return no_verb  # may be None
+    return yes_no_map.get(yes_verb, DEFAULT_NO_VERB)
+
+
 # ---------------------------------------------------------------------------
 # Core conversion functions
 # ---------------------------------------------------------------------------
@@ -386,7 +456,7 @@ def tabular_to_text(
     with_neg: bool = True,
     prefix_cols: dict[str, str] | None = None,
     yes_no_map: dict[str, str] | None = None,
-    group_symptoms: bool = True,
+    group_symptoms: bool = False,
 ) -> str:
     """Convert one DataFrame row's tabular features to a natural-language sentence.
 
@@ -482,49 +552,45 @@ def tabular_to_text(
         ]
         if demo_positive:
             descs = [str(qdesc_idx.loc[c, "desc"]) for c in demo_positive]
-            parts.append(f"{prefix} was {', '.join(descs)}.")
+            # Always use the fallback subject ("The deceased") for the
+            # demographics sentence — sex/age are the information being
+            # described, so the sex-derived pronoun isn't available yet.
+            # The pronoun (He/She) is used for symptom sentences below.
+            parts.append(f"{DEFAULT_PREFIX_FALLBACK} was {', '.join(descs)}.")
 
         # ---- Symptom / environment / diagnosis / … variables -----------
         non_demo_indics = set(qdesc_idx[~demo_mask].index)
         symp_cols = [c for c in qdesc_cols if c in non_demo_indics]
 
         if group_symptoms:
-            # Grouped mode: collect descs by verb phrase, emit one sentence per
-            # unique verb.  Positives joined with "and"; negatives with "or".
-            pos_by_verb: dict[str, list[str]] = {}
-            neg_by_verb: dict[str, list[str]] = {}
+            # Grouped mode: collect descs by (type, verb) so each variable
+            # type (symptom, diagnosis, environment, …) produces its own
+            # sentence(s).  Positives joined with "and"; negatives with "or".
+            pos_by_type_verb: dict[tuple[str, str], list[str]] = {}
+            neg_by_type_verb: dict[tuple[str, str], list[str]] = {}
 
             for col in symp_cols:
                 entry = qdesc_idx.loc[col]
                 desc  = str(entry["desc"])
                 val   = row[col]
+                type_ = _get_type(entry)
 
                 if _is_positive(val):
-                    yes_word = (
-                        str(entry["yes"])
-                        if "yes" in entry.index and pd.notna(entry["yes"])
-                        else DEFAULT_YES_VERB
-                    )
-                    pos_by_verb.setdefault(yes_word, []).append(desc)
+                    yes_word = _resolve_yes_verb(entry, type_)
+                    pos_by_type_verb.setdefault((type_, yes_word), []).append(desc)
                 elif _is_negative(val) and with_neg:
-                    if "no" in entry.index and pd.notna(entry["no"]):
-                        no_word = str(entry["no"])
-                    else:
-                        yes_word = (
-                            str(entry["yes"])
-                            if "yes" in entry.index and pd.notna(entry["yes"])
-                            else DEFAULT_YES_VERB
-                        )
-                        no_word = yes_no_map.get(yes_word, DEFAULT_NO_VERB)
-                    neg_by_verb.setdefault(no_word, []).append(desc)
+                    yes_word = _resolve_yes_verb(entry, type_)
+                    no_word  = _resolve_no_verb(entry, type_, yes_no_map, yes_word)
+                    if no_word is not None:
+                        neg_by_type_verb.setdefault((type_, no_word), []).append(desc)
 
-            for verb, descs in pos_by_verb.items():
+            for (_, verb), descs in pos_by_type_verb.items():
                 parts.append(_join_symptom_list(prefix, verb, descs, "and"))
-            for verb, descs in neg_by_verb.items():
+            for (_, verb), descs in neg_by_type_verb.items():
                 parts.append(_join_symptom_list(prefix, verb, descs, "or"))
 
         else:
-            # Per-symptom mode: one sentence per indicator (original behaviour).
+            # Per-symptom mode: one sentence per indicator.
             pos_phrases: list[str] = []
             neg_phrases: list[str] = []
 
@@ -532,25 +598,16 @@ def tabular_to_text(
                 entry = qdesc_idx.loc[col]
                 desc  = str(entry["desc"])
                 val   = row[col]
+                type_ = _get_type(entry)
 
                 if _is_positive(val):
-                    yes_word = (
-                        str(entry["yes"])
-                        if "yes" in entry.index and pd.notna(entry["yes"])
-                        else DEFAULT_YES_VERB
-                    )
+                    yes_word = _resolve_yes_verb(entry, type_)
                     pos_phrases.append(f"{prefix} {yes_word} {desc}.")
                 elif _is_negative(val) and with_neg:
-                    if "no" in entry.index and pd.notna(entry["no"]):
-                        no_word = str(entry["no"])
-                    else:
-                        yes_word = (
-                            str(entry["yes"])
-                            if "yes" in entry.index and pd.notna(entry["yes"])
-                            else DEFAULT_YES_VERB
-                        )
-                        no_word = yes_no_map.get(yes_word, DEFAULT_NO_VERB)
-                    neg_phrases.append(f"{prefix} {no_word} {desc}.")
+                    yes_word = _resolve_yes_verb(entry, type_)
+                    no_word  = _resolve_no_verb(entry, type_, yes_no_map, yes_word)
+                    if no_word is not None:
+                        neg_phrases.append(f"{prefix} {no_word} {desc}.")
 
             parts.extend(pos_phrases)
             parts.extend(neg_phrases)
@@ -596,7 +653,8 @@ def build_fused_text(
     prefix_cols: dict[str, str] | None = None,
     yes_no_map: dict[str, str] | None = None,
     separator: str = DEFAULT_SEPARATOR,
-    group_symptoms: bool = True,
+    group_symptoms: bool = False,
+    save_csv: str | None = None,
 ) -> pd.Series:
     """Apply tabular_to_text() to every row and concatenate with the narrative.
 
@@ -626,6 +684,10 @@ def build_fused_text(
         group_symptoms: Group symptoms sharing the same verb into one sentence.
                         Default True (recommended — ~40–50% fewer tokens).
                         See tabular_to_text() for details.
+        save_csv:       File path to save the fused text as a CSV for review.
+                        The CSV contains all original DataFrame columns plus a
+                        ``"fused_text"`` column.  Set to None to skip saving.
+                        Default ``"fused_text.csv"`` (saved in the current directory).
 
     Returns:
         pd.Series of fused text strings, one per row, same index as df.
@@ -666,4 +728,15 @@ def build_fused_text(
             return f"{tab_text}{separator}{narrative}"
         return tab_text or narrative
 
-    return df.apply(_fuse_row, axis=1)
+    fused = df.apply(_fuse_row, axis=1)
+
+    if save_csv is not None:
+        import logging as _logging
+        from pathlib import Path as _Path
+        _log = _logging.getLogger(__name__)
+        out = _Path(save_csv)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.assign(fused_text=fused).to_csv(out, index=False)
+        _log.info("Fused text saved to %s", out)
+
+    return fused

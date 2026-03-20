@@ -344,7 +344,7 @@ def oov_rate(
         from transformers import AutoTokenizer
         from multimodalva.results import oov_rate
 
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=False)
         stats = oov_rate(train_df["narrative"].dropna().tolist(), tokenizer)
         print(f"OOV rate: {stats['unk_rate']:.2%}")
     """
@@ -452,9 +452,25 @@ def hpo_loss_trend(
 
     col = metric or "value"
     if col not in trials_df.columns:
-        raise ValueError(
-            f"metric={col!r} not found.  "
-            f"Available columns: {list(trials_df.columns)}."
+        if metric is not None:
+            raise ValueError(
+                f"metric={col!r} not found.  "
+                f"Available columns: {list(trials_df.columns)}."
+            )
+        # Auto-fallback for Ray Tune DataFrames, which expose metric columns
+        # directly and have no "value" (Optuna objective) column.
+        _candidates = ["accuracy", "f1_macro", "f1_weighted", "csmf_accuracy",
+                       "balanced_accuracy", "log_loss"]
+        col = next((m for m in _candidates if m in trials_df.columns), None)
+        if col is None:
+            logger.warning(
+                "No 'value' column and no standard metric columns found.  "
+                "Available columns: %s", list(trials_df.columns),
+            )
+            return pd.DataFrame()
+        logger.info(
+            "No 'value' column found (Ray Tune DataFrame?); "
+            "using %r as the trend metric.", col,
         )
 
     out = trials_df[["trial", col]].dropna(subset=[col]).sort_values("trial").copy()
@@ -531,9 +547,25 @@ def hpo_convergence_plot(
 
     col = metric or "value"
     if col not in trials_df.columns:
-        raise ValueError(
-            f"metric={col!r} not found.  "
-            f"Available columns: {list(trials_df.columns)}."
+        if metric is not None:
+            raise ValueError(
+                f"metric={col!r} not found.  "
+                f"Available columns: {list(trials_df.columns)}."
+            )
+        # Auto-fallback for Ray Tune DataFrames, which expose metric columns
+        # directly and have no "value" (Optuna objective) column.
+        _candidates = ["accuracy", "f1_macro", "f1_weighted", "csmf_accuracy",
+                       "balanced_accuracy", "log_loss"]
+        col = next((m for m in _candidates if m in trials_df.columns), None)
+        if col is None:
+            logger.warning(
+                "No 'value' column and no standard metric columns found.  "
+                "Available columns: %s", list(trials_df.columns),
+            )
+            return plt.figure()
+        logger.info(
+            "No 'value' column found (Ray Tune DataFrame?); "
+            "using %r as the convergence metric.", col,
         )
 
     vals = trials_df.sort_values("trial")[col].dropna().values
