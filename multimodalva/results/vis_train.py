@@ -215,9 +215,12 @@ def hpo_leaderboard(
     }
     trials_df = trials_df.rename(columns=user_attr_rename)
 
-    # Rename "number" → "trial"
+    # Rename "number" → "trial"; for Ray Tune CSVs (no "number") create sequential index
     if "number" in trials_df.columns:
         trials_df = trials_df.rename(columns={"number": "trial"})
+    elif "trial" not in trials_df.columns:
+        trials_df = trials_df.reset_index(drop=True)
+        trials_df.insert(0, "trial", trials_df.index)
 
     # Select columns: trial, value, duration, metrics, [params_*]
     priority_cols = ["trial", "value", "duration"]
@@ -298,6 +301,11 @@ def _load_trials(source) -> pd.DataFrame:
     })
     if "number" in df.columns:
         df = df.rename(columns={"number": "trial"})
+    elif "trial" not in df.columns:
+        # Ray Tune CSVs have no "number" column; use a sequential index so
+        # callers that sort/select on "trial" always find the column.
+        df = df.reset_index(drop=True)
+        df.insert(0, "trial", df.index)
     return df
 
 

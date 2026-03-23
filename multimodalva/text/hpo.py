@@ -321,6 +321,11 @@ def optimize(
                 "Pass storage_path='/tmp/hpo_%s.db' (or any local path) to avoid this.",
                 _db_path_str, safe_name,
             )
+    elif "://" not in storage_path:
+        # User passed a plain file path (e.g. "/tmp/hpo.db") without the SQLite URL
+        # scheme.  Convert it so SQLAlchemy can parse it.
+        storage_path = f"sqlite:///{Path(storage_path).resolve()}"
+        logger.info("storage_path converted to SQLite URL: %s", storage_path)
 
     # --- Stratified internal split ---
     all_labels = _get_dataset_labels(train_dataset)
@@ -788,7 +793,11 @@ def optimize_ray(
 
     _ray_mode = "min" if METRIC_DIRECTION.get(metric, "maximize") == "minimize" else "max"
 
-    search_alg = OptunaSearch(metric=metric, mode=_ray_mode, seed=random_state)
+    search_alg = OptunaSearch(
+        metric=metric,
+        mode=_ray_mode,
+        seed=random_state,
+    )
     if max_concurrent_trials is not None:
         search_alg = ConcurrencyLimiter(search_alg, max_concurrent=max_concurrent_trials)
 
@@ -875,6 +884,7 @@ def optimize_ray(
                 trainable=trainable,
                 restart_errored=True,
                 resume_unfinished=True,
+                param_space=ray_space,
             )
             logger.info("Experiment restored successfully.")
         except Exception as _restore_err:

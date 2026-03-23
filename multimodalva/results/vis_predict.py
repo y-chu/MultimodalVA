@@ -821,21 +821,27 @@ def _draw_group_annotations(
     fig,
     group_boundaries: list[tuple[float, float]],
     group_labels: list[str],
-    fontsize: int = 10,
+    fontsize: int = 12,
 ) -> None:
-    """Draw bracket lines and labels below the x-axis to annotate column groups.
+    """Draw bracket lines and labels above the heatmap to annotate column groups.
 
-    Uses ``ax.get_xaxis_transform()`` so x-coordinates are in heatmap column-index
-    space (e.g. 0.5 → between column 0 and 1) and y-coordinates are in axes
-    fraction (0 = bottom of axes box, negative = below it).  ``clip_on=False``
-    lets the annotations extend outside the axes boundaries.
+    Uses pure data coordinates — ``ax.hlines()`` for the bracket lines and
+    ``ax.text()`` for labels — so x positions align exactly with seaborn heatmap
+    column indices (e.g. 0.5 = centre of column 0, 2.5 = centre of column 2).
+
+    Seaborn heatmap inverts the y-axis (``ylim = (n_rows, 0)``).  Annotations
+    are placed at negative y values, which sit above the first data row in this
+    inverted space.  ``ax.set_ylim`` is extended so they are visible without
+    relying on ``clip_on=False`` overlays.
 
     Args:
-        ax:               Matplotlib Axes.
-        fig:              Matplotlib Figure (used to adjust bottom margin).
-        group_boundaries: List of ``(start, end)`` column-index pairs.
+        ax:               Matplotlib Axes (must already contain a seaborn heatmap).
+        fig:              Matplotlib Figure (unused; kept for API compatibility).
+        group_boundaries: List of ``(xmin, xmax)`` column-index pairs using the
+                          same data coordinates as ``ax.hlines()``
+                          (e.g. ``(0.5, 4.5)`` spans column-centre 0 to 4).
         group_labels:     One label per group; must match len(group_boundaries).
-        fontsize:         Label font size.  Default 10.
+        fontsize:         Label font size.  Default 12.
     """
     if len(group_boundaries) != len(group_labels):
         raise ValueError(
@@ -847,29 +853,29 @@ def _draw_group_annotations(
             raise ValueError(
                 f"group_boundaries[{i}] must be a 2-element (start, end) tuple, "
                 f"got {boundary!r} with {len(boundary) if hasattr(boundary, '__len__') else 'unknown'} elements. "
-                "Example: group_boundaries=[(0.5, 1.5), (2.5, 3.5)]"
+                "Example: group_boundaries=[(0.5, 2.5), (3.5, 5.5)]"
             )
 
-    transform = ax.get_xaxis_transform()  # x=data coords, y=axes fraction
-    y_line = -0.05   # just below the axes bottom edge (axes fraction)
-    y_text = -0.14   # text sits further below the line
+    # Annotation geometry in data (y) coordinates.
+    # Seaborn heatmap y-axis is inverted: ylim = (n_rows, 0).
+    # Negative y → above the first data row (top of the heatmap).
+    y_bar  = -0.35   # horizontal bracket line
+    y_text = -0.65   # label just above the line
+    y_top  = -1.4    # new ylim top — enough room for line + label
 
+    y_bottom, _ = ax.get_ylim()   # n_rows (bottom of inverted axis)
+
+    gap = 0.15  # inset right end so adjacent lines don't touch; left starts at exact column boundary
     for (start, end), label in zip(group_boundaries, group_labels):
-        ax.plot(
-            [start, end], [y_line, y_line],
-            color="black", linewidth=2,
-            transform=transform, clip_on=False,
-            solid_capstyle="butt",
-        )
+        ax.hlines(y=y_bar, xmin=start, xmax=end - gap, color="black", linewidth=2)
         ax.text(
-            (start + end) / 2, y_text, label,
-            transform=transform,
-            ha="center", va="top",
-            fontsize=fontsize, clip_on=False,
+            (start + end) / 2 + 0.25, y_text, label,
+            ha="center", va="bottom",
+            fontsize=fontsize, fontweight="bold",
         )
 
-    # Reserve bottom margin so annotations are not cropped on save
-    fig.subplots_adjust(bottom=0.22)
+    # Extend the y-axis upward (negative in inverted space) to reveal the annotations.
+    ax.set_ylim(y_bottom, y_top)
 
 
 # ---------------------------------------------------------------------------
@@ -949,9 +955,9 @@ def cause_accuracy_heatmap(
 
         group_boundaries: List of ``(start, end)`` pairs in heatmap column-index
                           coordinates marking model groups.  For example,
-                          ``[(0.5, 3.5), (4.5, 6.5)]`` draws a bracket under
+                          ``[(0.5, 3.5), (4.5, 6.5)]`` draws a bracket above
                           columns 1–3 and 5–6 (0-based, 0.5-offset for centering).
-                          Drawn as horizontal lines just below the x-axis ticks.
+                          Drawn as horizontal lines just above the heatmap (top).
         group_labels:   One label string per entry in ``group_boundaries``.
 
         cmap:           Colormap.  Default: custom light-cream → dark-red
@@ -1117,12 +1123,14 @@ def cause_accuracy_heatmap(
         ax.set_yticklabels(ytick_labels, rotation=y_rotation)
 
     # ------------------------------------------------------------------
-    # Step 8: column grouping annotations below x-axis
+    # Step 8: column grouping annotations above heatmap
     # ------------------------------------------------------------------
     if group_boundaries and group_labels:
         _draw_group_annotations(ax, fig, group_boundaries, group_labels)
 
-    plt.tight_layout(rect=[0, 0.05 if group_boundaries else 0, 1, 1])
+    # Group annotations live inside the axes (via ax.set_ylim extension), so
+    # tight_layout needs no rect constraint — it lays out the full figure normally.
+    plt.tight_layout()
 
     if save_path is not None:
         fig.savefig(save_path, dpi=dpi, bbox_inches="tight")

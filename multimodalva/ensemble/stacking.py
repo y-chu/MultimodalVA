@@ -153,6 +153,16 @@ class _SubsetDataset:
         self._full    = full_ds
         self._indices = np.asarray(indices, dtype=int)
 
+    @property
+    def labels(self):
+        """Integer labels for the subset, in subset order.
+
+        Delegates to the underlying dataset's .labels list so that
+        text.train._get_dataset_labels() can handle _SubsetDataset the same
+        way it handles ClassificationDataset and torch.utils.data.Subset.
+        """
+        return [self._full.labels[int(i)] for i in self._indices]
+
     def __len__(self):
         return len(self._indices)
 

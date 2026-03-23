@@ -71,7 +71,7 @@ tabular = [
 
 # --- LoRA fine-tuning (parameter-efficient text training) ---
 # Install with: pip install multimodalva[lora]
-lora = ["peft>=0.6"]
+lora = ["peft>=0.7"]
 
 # --- Ensemble strategy 2: AutoGluon AutoMM feature fusion ---
 # Install with: pip install multimodalva[feature_fusion]
@@ -91,7 +91,7 @@ all = [
     "lightgbm>=4.1",
     "xgboost>=2.0",
     "catboost>=1.2.2",
-    "peft>=0.6",
+    "peft>=0.7",
     "autogluon.multimodal>=1.1",
 ]
 

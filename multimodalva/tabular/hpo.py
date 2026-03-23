@@ -217,6 +217,10 @@ def optimize(
     if storage_path is None:
         # Use resolved absolute path so the DB is always found regardless of CWD.
         storage_path = f"sqlite:///{output_dir.resolve()}/hpo_{model_name}.db"
+    elif "://" not in storage_path:
+        # User passed a plain file path without the SQLite URL scheme; convert it.
+        storage_path = f"sqlite:///{Path(storage_path).resolve()}"
+        logger.info("storage_path converted to SQLite URL: %s", storage_path)
 
     # Stratified internal split — never uses the held-out test set
     sss = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)

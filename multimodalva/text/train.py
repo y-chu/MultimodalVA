@@ -566,31 +566,61 @@ def train(
         **_extra_model_kwargs,
     )
 
+    # --- Freeze layers (must happen before LoRA when use_lora=True) ---
+    # freeze_model_layers() sets requires_grad=False on all parameters in the frozen
+    # layers.  If called AFTER get_peft_model(), it silently freezes the LoRA adapters
+    # (lora_A / lora_B) in those layers, defeating the purpose of LoRA.
+    # Applying freeze to the base_model first ensures LoRA adapters remain trainable
+    # on every layer while the base-model weights in bottom layers stay frozen.
+    # When use_lora=False, freeze is applied to the model after assignment below.
+    if hp.get("freeze_layers") and use_lora:
+        try:
+            base_model = freeze_model_layers(base_model, hp["freeze_layers"])
+        except ValueError as e:
+            logger.warning("Layer freezing skipped (unsupported architecture): %s", e)
+
     # --- Apply LoRA ---
     if use_lora:
         try:
-            from peft import LoraConfig, TaskType, get_peft_model
+            from peft import LoraConfig, get_peft_model
         except ImportError:
             raise ImportError(
                 "peft is required for LoRA fine-tuning. "
-                "Install it with: pip install 'multimodalva[lora]' or pip install peft>=0.6"
+                "Install it with: pip install 'multimodalva[lora]' or pip install peft>=0.7"
             ) from None
 
+        # Required when gradient_checkpointing=True: ensures input embeddings retain
+        # a grad_fn so gradients can flow through checkpointed activations.
+        # Harmless when gradient_checkpointing=False.
+        if gradient_checkpointing:
+            base_model.enable_input_require_grads()
+
+        # task_type is intentionally omitted.
+        # TaskType.SEQ_CLS auto-populates modules_to_save=["classifier"] inside PEFT's
+        # __post_init__ / inject_adapter.  With target_modules="all-linear", the classifier
+        # head is already wrapped as a LoraLinear; PEFT >= 0.10 then raises
+        #   TypeError: modules_to_save cannot be applied to modules of type LoraLinear
+        # because it tries to double-wrap it.  Passing modules_to_save=[] does not reliably
+        # prevent this — some PEFT versions override it when the list is falsy.
+        # Omitting task_type entirely leaves modules_to_save=None (no auto-population)
+        # and does not affect training: AutoModelForSequenceClassification already owns the
+        # classification head; PEFT's task_type is only a hint for its module-wrapping logic.
         peft_config = LoraConfig(
             r=hp["lora_r"],
             lora_alpha=hp["lora_alpha"],
             lora_dropout=hp["lora_dropout"],
-            target_modules=["query", "value"],
+            target_modules="all-linear",  # works across all architectures + PEFT versions
             bias="none",
-            task_type=TaskType.SEQ_CLS,
         )
         model = get_peft_model(base_model, peft_config)
         model.print_trainable_parameters()
     else:
         model = base_model
 
-    # --- Freeze layers ---
-    if hp.get("freeze_layers"):
+    # --- Freeze layers (non-LoRA path) ---
+    # When use_lora=False, freeze is applied here to the full model.
+    # When use_lora=True, freeze was already applied to base_model above.
+    if hp.get("freeze_layers") and not use_lora:
         try:
             model = freeze_model_layers(model, hp["freeze_layers"])
         except ValueError as e:
@@ -598,7 +628,21 @@ def train(
 
     model.to(get_device())
 
+    # --- Device capability flags ---
+    _is_cuda = torch.cuda.is_available()
+    _is_mps  = torch.backends.mps.is_available() and not _is_cuda
+
     # --- Training arguments ---
+    # dataloader_pin_memory: True speeds up CUDA transfers but is unsupported on MPS.
+    #   HuggingFace TrainingArguments defaults to True, which triggers a UserWarning on
+    #   Apple Silicon. Explicitly set to False on MPS (and CPU) to suppress it.
+    # fp16: only safe on CUDA; MPS uses bfloat16 natively so fp16=False is correct.
+    # gradient_checkpointing_kwargs use_reentrant=False: the reentrant implementation
+    #   requires at least one input tensor to have requires_grad=True.  When layers are
+    #   frozen (freeze_layers > 0) the early checkpointed segments receive all-frozen
+    #   inputs, causing "None of the inputs have requires_grad=True. Gradients will be
+    #   None."  use_reentrant=False (non-reentrant autograd checkpointing, PyTorch >= 2.1)
+    #   removes this requirement and is the recommended modern default.
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         learning_rate=hp["learning_rate"],
@@ -616,9 +660,11 @@ def train(
         load_best_model_at_end=has_eval,
         logging_steps=50,
         report_to="none",
-        fp16=torch.cuda.is_available(),
+        fp16=_is_cuda,
         dataloader_num_workers=hp["dataloader_num_workers"],
+        dataloader_pin_memory=_is_cuda,
         gradient_checkpointing=gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
         disable_tqdm=False,
     )
 
@@ -659,6 +705,20 @@ def train(
         trainer = WeightedTrainer(**_trainer_kwargs, class_weights=class_weights)
     else:
         trainer = Trainer(**_trainer_kwargs)
+
+    # --- Strip HuggingFace's auto-injected Ray Tune callback ---
+    # When a Ray Tune trial is active, transformers.Trainer.__init__ automatically
+    # adds RayTuneCallback, which calls ray.tune.report() after every eval epoch.
+    # Those intermediate reports trigger OptunaSearch.on_trial_result(), which
+    # raises KeyError because the trial ID isn't registered for intermediate results.
+    # Our _ray_trial_fn returns a final metrics dict directly — no intermediate
+    # reporting needed — so removing this callback is safe in all contexts.
+    try:
+        from transformers.integrations import RayTuneCallback  # noqa: PLC0415
+        trainer.remove_callback(RayTuneCallback)
+    except (ImportError, Exception):
+        pass
+
     # --- Resolve resume checkpoint ---
     resume_checkpoint = None
     if resume:
