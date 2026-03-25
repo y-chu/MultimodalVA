@@ -222,6 +222,13 @@ Full API reference: [`docs/index.html`](docs/index.html)
 
 ---
 
+## Upcoming
+
+- Add support for [InSilicoVA](https://github.com/verbal-autopsy-software/pyinsilicova) in ensemble pipelines. 
+
+
+---
+
 ## License
 
 MIT

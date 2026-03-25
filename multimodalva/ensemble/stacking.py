@@ -133,6 +133,52 @@ DEFAULT_META_LEARNER: dict = {
     "hyperparams": {"max_iter": 1000, "C": 1.0},
 }
 
+# Default Optuna search spaces for meta-learner HPO (use_optimize=True).
+# Keys are model aliases; values are dicts of param → tuple spec or fixed value.
+# Tuple format: ("float", lo, hi), ("log_float", lo, hi), ("int", lo, hi),
+#               ("categorical", [v1, v2, ...])
+# Fixed values (non-tuple) are passed through unchanged — use to pin params
+# that should not be searched (e.g. {"max_iter": 2000} alongside searched "C").
+DEFAULT_META_SEARCH_SPACES: dict[str, dict] = {
+    "logistic_regression": {
+        "C": ("log_float", 1e-3, 1e2),
+    },
+    "lightgbm": {
+        "n_estimators":      ("int",       50,  500),
+        "learning_rate":     ("log_float", 0.01, 0.3),
+        "max_depth":         ("int",        3,   10),
+        "num_leaves":        ("int",       15,   63),
+        "min_child_samples": ("int",        5,   50),
+    },
+    "random_forest": {
+        "n_estimators":      ("int",  50, 400),
+        "max_depth":         ("int",   3,  20),
+        "min_samples_split": ("int",   2,  20),
+    },
+    "xgboost": {
+        "n_estimators":      ("int",       50,  500),
+        "learning_rate":     ("log_float", 0.01, 0.3),
+        "max_depth":         ("int",        3,   10),
+        "subsample":         ("float",      0.5,  1.0),
+        "colsample_bytree":  ("float",      0.5,  1.0),
+    },
+    "catboost": {
+        "iterations":        ("int",        50,  400),
+        "learning_rate":     ("log_float", 0.01, 0.3),
+        "depth":             ("int",         3,    8),
+    },
+    "gbdt": {
+        "n_estimators":      ("int",        50,  400),
+        "learning_rate":     ("log_float", 0.01, 0.3),
+        "max_depth":         ("int",         3,   10),
+    },
+    "mlp": {
+        "hidden_layer_sizes": ("categorical", [(64,), (128,), (256,), (128, 64), (256, 128)]),
+        "learning_rate_init": ("log_float",   1e-4, 1e-2),
+        "alpha":              ("log_float",   1e-5, 1e-2),
+    },
+}
+
 # Alias used to identify InSilicoVA specs throughout this module
 _INSILICOVA = "insilicova"
 
@@ -264,6 +310,7 @@ def _resolve_meta_learner(
         from sklearn.linear_model import LogisticRegression
         hp.setdefault("max_iter",      1000)
         hp.setdefault("C",             1.0)
+        hp.setdefault("solver",        "lbfgs")   # lbfgs supports multinomial multiclass natively
         hp.setdefault("n_jobs",        n_jobs)
         hp.setdefault("random_state",  random_state)
         return LogisticRegression(**hp)
@@ -341,6 +388,69 @@ def _score_meta_candidate(
 
     top1_df = pd.DataFrame({"true_label": true_str, "predicted_label": pred_str})
     return score_predictions(top1_df, metric=metric)
+
+
+def _meta_optuna_objective(
+    trial,
+    model_name: str,
+    base_hp: dict,
+    search_space: dict,
+    oof_meta_X: np.ndarray,
+    oof_y: np.ndarray,
+    id2label: dict,
+    metric: str,
+    cv_folds: int,
+    n_jobs: int,
+    random_state: int,
+) -> float:
+    """Optuna trial objective for meta-learner HPO.
+
+    Samples hyperparameters from ``search_space``, scores the resulting model
+    via stratified k-fold CV on ``oof_meta_X`` / ``oof_y``.
+    Test data is **never accessed** — the OOF matrix is the only data used here.
+
+    Args:
+        trial:        Optuna Trial object.
+        model_name:   Meta-learner model alias (e.g. ``"logistic_regression"``).
+        base_hp:      Fixed HPs from the spec (e.g. ``{"max_iter": 1000}``).
+                      Searched keys override these.
+        search_space: Dict of param → tuple spec or fixed value.
+        oof_meta_X:   OOF meta-feature matrix (n_train × n_base_outputs).
+        oof_y:        Integer label array (n_train,).
+        id2label:     Integer → label string mapping.
+        metric:       Scoring metric (``accuracy``, ``f1_macro``, …).
+        cv_folds:     Stratified CV folds for scoring.
+        n_jobs:       CPU parallelism.
+        random_state: Seed.
+
+    Returns:
+        CV score (float, higher is better for all supported metrics).
+    """
+    hp = dict(base_hp)
+    for key, spec in search_space.items():
+        if isinstance(spec, tuple):
+            kind = spec[0]
+            if kind == "float":
+                hp[key] = trial.suggest_float(key, spec[1], spec[2])
+            elif kind == "log_float":
+                hp[key] = trial.suggest_float(key, spec[1], spec[2], log=True)
+            elif kind == "int":
+                hp[key] = trial.suggest_int(key, spec[1], spec[2])
+            elif kind == "categorical":
+                hp[key] = trial.suggest_categorical(key, list(spec[1]))
+            else:
+                raise ValueError(
+                    f"Unknown search space kind '{kind}' for param '{key}'. "
+                    "Use 'float', 'log_float', 'int', or 'categorical'."
+                )
+        else:
+            hp[key] = spec  # fixed value — no search
+
+    candidate_spec = {"model_name": model_name, "hyperparams": hp}
+    model = _resolve_meta_learner(candidate_spec, n_jobs=n_jobs, random_state=random_state)
+    return _score_meta_candidate(
+        model, oof_meta_X, oof_y, id2label, metric, cv_folds, random_state,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1396,25 +1506,52 @@ class StackingClassifier:
         meta_cv_folds: int = 3,
         random_state: int = 42,
         n_jobs: int = -1,
+        use_optimize: bool = False,
+        n_trials: int = 30,
+        search_space: dict | None = None,
     ) -> dict:
         """Stage 2: train meta-learner candidates and select the best.
 
         Can be called after ``train_base_models()`` in the same session, or in
         a fresh session (OOF data loaded automatically from disk).
 
+        **No data leakage guarantee:** this stage uses only the OOF meta-feature
+        matrix (``oof_meta_X``) and OOF labels (``oof_y``).  Test data is never
+        accessed here, whether Optuna search is enabled or not.
+
+        **Fixed-spec selection (default, ``use_optimize=False``):**
         When multiple meta-learner specs are provided, each is scored via
         stratified ``meta_cv_folds``-fold CV on the OOF meta-features.  The
         highest-scoring model is fitted on all OOF data and saved.
 
+        **Optuna HP search (``use_optimize=True``):**
+        Exactly one meta-learner spec must be provided (the model type to
+        search).  Optuna runs ``n_trials`` trials, each scored via stratified
+        ``meta_cv_folds``-fold CV on the OOF meta-features.  The best
+        hyperparameters are used to fit the final meta-learner on all OOF data.
+        This is a single round of selection — no two-stage leakage risk.
+
         Args:
-            meta_learners:  Override ``self.meta_learner_specs``.  One dict or
-                            a list of dicts.  ``None`` uses the specs from
-                            ``__init__``.
-            metric:         Selection metric.  Default: ``self.meta_select_metric``
-                            (``f1_macro`` unless overridden at init).
-            meta_cv_folds:  CV folds for meta-learner selection. Default 3.
-            random_state:   Seed. Default 42.
-            n_jobs:         CPU parallelism for meta-learner instantiation.
+            meta_learners:   Override ``self.meta_learner_specs``.  One dict or
+                             a list of dicts.  ``None`` uses the specs from
+                             ``__init__``.
+            metric:          Selection metric.  Default: ``self.meta_select_metric``
+                             (``f1_macro`` unless overridden at init).
+            meta_cv_folds:   CV folds for meta-learner scoring. Default 3.
+            random_state:    Seed. Default 42.
+            n_jobs:          CPU parallelism for meta-learner instantiation.
+            use_optimize:    Run Optuna HP search instead of fixed-spec
+                             selection.  Requires exactly one spec.  Default
+                             ``False``.
+            n_trials:        Number of Optuna trials when ``use_optimize=True``.
+                             Default 30.
+            search_space:    HP search space dict for Optuna.  Keys are param
+                             names; values are tuple specs
+                             ``("log_float", lo, hi)``, ``("float", lo, hi)``,
+                             ``("int", lo, hi)``, ``("categorical", [...])``,
+                             or a fixed scalar.  ``None`` uses
+                             ``DEFAULT_META_SEARCH_SPACES[model_name]``.
+                             Only used when ``use_optimize=True``.
 
         Returns:
             dict with ``meta_learner``, ``meta_scores``, ``best_meta_name``,
@@ -1429,52 +1566,151 @@ class StackingClassifier:
 
         metric = metric or self.meta_select_metric
 
-        logger.info("Stage 2: training %d meta-learner candidate(s) ...", len(specs))
-
         meta_dir = self.output_dir / "meta_learner"
         meta_dir.mkdir(parents=True, exist_ok=True)
 
-        scores = {}
-        for spec in specs:
-            name  = spec["model_name"]
-            model = _resolve_meta_learner(spec, n_jobs=n_jobs, random_state=random_state)
+        # ------------------------------------------------------------------
+        # Branch A: Optuna HP search (use_optimize=True)
+        # ------------------------------------------------------------------
+        if use_optimize:
+            if len(specs) != 1:
+                raise ValueError(
+                    "use_optimize=True requires exactly one meta-learner spec "
+                    "(the model type whose hyperparameters will be searched). "
+                    f"Got {len(specs)} specs.  Pass a single dict or remove "
+                    "extra entries from meta_learners."
+                )
+            spec       = specs[0]
+            model_name = spec["model_name"]
+            base_hp    = dict(spec.get("hyperparams") or {})
+
+            # Resolve search space: user override > DEFAULT_META_SEARCH_SPACES > {}
+            if search_space is not None:
+                active_space = search_space
+            elif model_name in DEFAULT_META_SEARCH_SPACES:
+                active_space = DEFAULT_META_SEARCH_SPACES[model_name]
+            else:
+                logger.warning(
+                    "No default search space for meta-learner '%s'. "
+                    "Pass search_space= explicitly or choose a supported model.",
+                    model_name,
+                )
+                active_space = {}
+
+            logger.info(
+                "Stage 2: Optuna HP search for meta-learner '%s' "
+                "(%d trials, metric=%s) ...",
+                model_name, n_trials, metric,
+            )
+
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=random_state),
+            )
+            study.optimize(
+                lambda trial: _meta_optuna_objective(
+                    trial,
+                    model_name=model_name,
+                    base_hp=base_hp,
+                    search_space=active_space,
+                    oof_meta_X=self.oof_meta_X,
+                    oof_y=self.oof_y,
+                    id2label=self.id2label,
+                    metric=metric,
+                    cv_folds=meta_cv_folds,
+                    n_jobs=n_jobs,
+                    random_state=random_state,
+                ),
+                n_trials=n_trials,
+                catch=(Exception,),
+            )
+
+            n_completed = len([t for t in study.trials
+                               if t.state == optuna.trial.TrialState.COMPLETE])
+            if n_completed == 0:
+                raise RuntimeError(
+                    "All Optuna meta-learner trials failed. "
+                    "Check that the model dependencies are installed and the "
+                    "search space bounds are valid."
+                )
+
+            best_hp    = {**base_hp, **study.best_trial.params}
+            best_name  = model_name
+            best_score = study.best_value
+            scores     = {model_name: round(best_score, 6)}
+
+            logger.info(
+                "Meta-learner Optuna complete: best %s = %.4f, params = %s",
+                metric, best_score, best_hp,
+            )
+
+            # Save trial CSV
+            try:
+                import pandas as _pd
+                trials_df = study.trials_dataframe()
+                trials_df.to_csv(meta_dir / f"hpo_meta_{model_name}.csv", index=False)
+            except Exception:
+                pass
+
+            # Build best spec with found HPs for final fit
+            best_spec = {"model_name": model_name, "hyperparams": best_hp}
+
+        # ------------------------------------------------------------------
+        # Branch B: fixed-spec candidate selection (default)
+        # ------------------------------------------------------------------
+        else:
+            logger.info("Stage 2: training %d meta-learner candidate(s) ...", len(specs))
+
+            scores = {}
+            for spec in specs:
+                name  = spec["model_name"]
+                model = _resolve_meta_learner(spec, n_jobs=n_jobs, random_state=random_state)
+
+                if len(specs) > 1:
+                    score = _score_meta_candidate(
+                        model, self.oof_meta_X, self.oof_y,
+                        self.id2label, metric, meta_cv_folds, random_state,
+                    )
+                    scores[name] = round(score, 6)
+                    logger.info("  %s  %s = %.4f", name, metric, score)
+                else:
+                    scores[name] = None
 
             if len(specs) > 1:
-                score = _score_meta_candidate(
-                    model, self.oof_meta_X, self.oof_y,
-                    self.id2label, metric, meta_cv_folds, random_state,
+                best_name = max(scores, key=lambda k: scores[k])
+                logger.info(
+                    "Best meta-learner: %s (%.4f)", best_name, scores[best_name],
                 )
-                scores[name] = round(score, 6)
-                logger.info("  %s  %s = %.4f", name, metric, score)
             else:
-                scores[name] = None
+                best_name = specs[0]["model_name"]
 
-        # Select best
-        if len(specs) > 1:
-            best_name = max(scores, key=lambda k: scores[k])
-            logger.info("Best meta-learner: %s (%.4f)", best_name, scores[best_name])
-        else:
-            best_name = specs[0]["model_name"]
+            best_spec = next(s for s in specs if s["model_name"] == best_name)
 
-        best_spec  = next(s for s in specs if s["model_name"] == best_name)
+        # ------------------------------------------------------------------
+        # Fit winner on all OOF data and save
+        # ------------------------------------------------------------------
         best_model = _resolve_meta_learner(best_spec, n_jobs=n_jobs, random_state=random_state)
         best_model.fit(self.oof_meta_X, self.oof_y)
 
         self.meta_learner = best_model
         self.meta_scores  = scores
 
-        # Save
         joblib.dump(best_model, meta_dir / "meta_learner.joblib")
         with open(meta_dir / "meta_scores.json", "w") as fh:
             json.dump(scores, fh, indent=2)
 
         meta_metadata = {
-            "best_meta_name":    best_name,
+            "best_meta_name":     best_name,
             "meta_select_metric": metric,
-            "meta_cv_folds":     meta_cv_folds,
-            "meta_scores":       scores,
-            "meta_specs":        specs,
-            "oof_meta_X_shape":  list(self.oof_meta_X.shape),
+            "meta_cv_folds":      meta_cv_folds,
+            "use_optimize":       use_optimize,
+            "n_trials":           n_trials if use_optimize else None,
+            "meta_scores":        scores,
+            "best_spec":          best_spec,
+            "oof_meta_X_shape":   list(self.oof_meta_X.shape),
         }
         with open(meta_dir / "meta_learner_metadata.json", "w") as fh:
             json.dump(meta_metadata, fh, indent=2, default=str)
@@ -1689,6 +1925,9 @@ class StackingClassifier:
         meta_learners: list[dict] | dict | None = None,
         meta_select_metric: str | None = None,
         meta_cv_folds: int = 3,
+        meta_use_optimize: bool = False,
+        meta_n_trials: int = 30,
+        meta_search_space: dict | None = None,
         # --- inference ---
         top_k: int = 3,
     ) -> dict:
@@ -1724,6 +1963,9 @@ class StackingClassifier:
             meta_cv_folds=meta_cv_folds,
             random_state=random_state,
             n_jobs=n_jobs,
+            use_optimize=meta_use_optimize,
+            n_trials=meta_n_trials,
+            search_space=meta_search_space,
         )
         predictions = self.predict_test(top_k=top_k, batch_size=batch_size)
 

@@ -757,14 +757,36 @@ def optimize_ray(
     # Wrapped in try/except: some Ray versions raise checkpoint_at_end ValueError
     # when RunConfig is used with function trainables.  If that happens we fall
     # back to no run_config (losing resume capability for this run).
+    # We try two variants:
+    #   1. RunConfig + CheckpointConfig(checkpoint_at_end=False) — prevents the
+    #      auto-injection of checkpoint_at_end=True in Ray Train v2 which would
+    #      raise ValueError("checkpoint_at_end=True is not supported for function
+    #      trainables").  This is the preferred path.
+    #   2. Plain RunConfig — fallback for older Ray versions that don't have
+    #      CheckpointConfig or don't inject checkpoint_at_end.
     _run_config = None
     try:
-        from ray.train import RunConfig
+        from ray.train import RunConfig, CheckpointConfig
         exp_storage.mkdir(parents=True, exist_ok=True)
         _run_config = RunConfig(
             storage_path=str(exp_storage.resolve()),
             name=exp_name,
+            checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
         )
+    except ImportError:
+        # CheckpointConfig not available — try plain RunConfig
+        try:
+            from ray.train import RunConfig  # noqa: F811
+            exp_storage.mkdir(parents=True, exist_ok=True)
+            _run_config = RunConfig(
+                storage_path=str(exp_storage.resolve()),
+                name=exp_name,
+            )
+        except Exception as _rc_err2:
+            logger.warning(
+                "Could not create RunConfig — experiment state will not be persisted "
+                "(resume disabled for this run): %s", _rc_err2,
+            )
     except Exception as _rc_err:
         logger.warning(
             "Could not create RunConfig — experiment state will not be persisted "
@@ -834,6 +856,22 @@ def optimize_ray(
                 "Retrying without RunConfig — experiment will not be persisted "
                 "and resume will be unavailable for this run.", _ve,
             )
+            # Clean up the stale exp_path: tune.Tuner() writes tuner.pkl and
+            # .validate_storage_marker to exp_path in its constructor (before
+            # fit() is called), so exp_path now exists but contains no trial
+            # subdirectories.  If left in place, a subsequent run with
+            # resume=True will find exp_path, call Tuner.restore(), and
+            # "restore" an empty experiment — treating all n_trials as
+            # unfinished and starting them all from scratch (silent re-run
+            # instead of a genuine fresh start).  Removing exp_path prevents
+            # this: the next run sees no experiment to restore and starts clean.
+            if exp_path.exists():
+                shutil.rmtree(exp_path, ignore_errors=True)
+                logger.warning(
+                    "Removed stale exp_path %s (contained tuner.pkl but no "
+                    "trial state — checkpoint_at_end fallback was triggered).",
+                    exp_path,
+                )
             os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
             tuner_no_rc = tune.Tuner(
                 trainable, param_space=ray_space, tune_config=_tune_config,
