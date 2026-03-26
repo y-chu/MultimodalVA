@@ -23,7 +23,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import optuna
@@ -681,7 +681,7 @@ def optimize_ray(
     cleanup_trials: bool = True,
     use_asha: bool = False,
     use_fast: bool = False,
-) -> tuple[dict, ray.tune.ResultGrid]:
+) -> tuple[dict, Any]:
     """Distributed HPO using Ray Tune.
 
     Extra args vs the original signature:
@@ -738,6 +738,48 @@ def optimize_ray(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Auto-redirect to optimize() on MPS/CPU-only ---
+    # Ray Train v2 is incompatible with function trainables on non-CUDA devices:
+    # RunConfig auto-injects checkpoint_at_end=True which raises ValueError,
+    # forcing a no-RunConfig fallback where trial state goes to ~/ray_results
+    # and cannot be restored → resume always restarts from trial 1.
+    # On MPS/CPU, optimize() (Optuna + SQLite) is the correct backend.
+    try:
+        import torch as _torch
+        _cuda_available = _torch.cuda.device_count() > 0
+    except ImportError:
+        _cuda_available = False
+    if not _cuda_available:
+        _safe = model_name.replace("/", "_")
+        logger.info(
+            "optimize_ray(): no CUDA GPUs detected — redirecting to optimize() "
+            "(Optuna sequential, SQLite-backed). Ray Tune requires CUDA for "
+            "reliable experiment persistence and resume. "
+            "SQLite DB: %s/hpo_%s.db",
+            output_dir, _safe,
+        )
+        return optimize(
+            train_dataset=train_dataset,
+            label2id=label2id,
+            id2label=id2label,
+            model_name=model_name,
+            output_dir=output_dir,
+            n_trials=n_trials,
+            metric=metric,
+            search_space=search_space,
+            val_size=val_size,
+            random_state=random_state,
+            use_lora=use_lora,
+            use_focal=use_focal,
+            gradient_checkpointing=gradient_checkpointing,
+            early_stopping_patience=early_stopping_patience,
+            storage_path=str(output_dir / f"hpo_{_safe}.db"),
+            load_if_exists=resume,
+            save_trials_csv=save_trials_csv,
+            cleanup_trials=cleanup_trials,
+            use_fast=use_fast,
+        )
+
     # --- Experiment storage path (for resume) ---
     safe_name = model_name.replace("/", "_")
     exp_name    = experiment_name or f"ray_hpo_{safe_name}"
@@ -789,6 +831,21 @@ def optimize_ray(
         logger.warning(
             "num_gpus_per_trial=%.1f but no GPUs detected; trials will queue indefinitely.",
             num_gpus_per_trial,
+        )
+
+    # Warn early on MPS/CPU-only: Ray Train v2 is incompatible with function
+    # trainables when RunConfig is used, causing checkpoint_at_end ValueError.
+    # This means experiment state cannot be persisted → resume is impossible.
+    # The fallback (tuner_no_rc) saves to ~/ray_results which we cannot restore.
+    # Users on Apple Silicon or CPU-only machines should use optimize() instead.
+    if available_gpus == 0:
+        logger.warning(
+            "optimize_ray(): no CUDA GPUs available (MPS/CPU-only environment). "
+            "Ray Train v2 is incompatible with function trainables on non-CUDA "
+            "devices — experiment state cannot be persisted and resume will not "
+            "work across restarts. "
+            "RECOMMENDATION: use optimize() (Optuna backend) instead — it uses "
+            "SQLite for reliable crash recovery and resume on MPS/CPU machines.",
         )
 
     _ray_mode = "min" if METRIC_DIRECTION.get(metric, "maximize") == "minimize" else "max"
@@ -937,26 +994,38 @@ def optimize_ray(
         results = tuner.fit()
     except ValueError as _ve:
         if "checkpoint_at_end" in str(_ve):
-            # RunConfig caused the incompatibility — retry without it.
+            # Ray Train v2 incompatibility: RunConfig auto-injects
+            # checkpoint_at_end=True for function trainables, which is
+            # unsupported and raises ValueError.  This typically occurs on
+            # MPS/CPU-only machines where CheckpointConfig(checkpoint_at_end=
+            # False) is not respected by the installed Ray version.
+            # In this fallback mode, trials run via tuner_no_rc and their
+            # state is saved to ~/ray_results — NOT to our exp_path — so
+            # resume via Tuner.restore() is impossible across restarts.
+            # On MPS/Apple Silicon: switch to optimize() (Optuna) for
+            # reliable resume.  optimize() uses SQLite and resumes correctly
+            # after crashes or SLURM preemptions.
             logger.warning(
-                "RunConfig triggered checkpoint_at_end error (%s). "
-                "Retrying without RunConfig — experiment will not be persisted "
-                "and resume will be unavailable for this run.", _ve,
+                "checkpoint_at_end error from Ray Train v2 (%s). "
+                "Retrying without RunConfig — this run's trial state will be "
+                "saved to ~/ray_results (not %s) and CANNOT be resumed. "
+                "If you need resume support, use optimize() (Optuna backend) "
+                "which persists state in SQLite and resumes correctly on "
+                "MPS/CPU-only machines.", _ve, exp_path,
             )
-            # Clean up the stale exp_path: tune.Tuner() writes tuner.pkl and
-            # .validate_storage_marker to exp_path in its constructor (before
-            # fit() is called), so exp_path now exists but contains no trial
-            # subdirectories.  If left in place, a subsequent run with
-            # resume=True will find exp_path, call Tuner.restore(), and
-            # "restore" an empty experiment — treating all n_trials as
-            # unfinished and starting them all from scratch (silent re-run
-            # instead of a genuine fresh start).  Removing exp_path prevents
-            # this: the next run sees no experiment to restore and starts clean.
+            # Clean up the stale exp_path: tune.Tuner() constructor wrote
+            # tuner.pkl and .validate_storage_marker to exp_path before
+            # fit() raised.  If left in place, a subsequent resume=True run
+            # finds exp_path, calls Tuner.restore(), sees 0 completed trials
+            # (they ran via tuner_no_rc to ~/ray_results), and silently
+            # re-runs all N trials from scratch — identical to "starts from
+            # trial 1".  Deleting exp_path makes the next run start honestly
+            # fresh rather than triggering this misleading restore loop.
             if exp_path.exists():
                 shutil.rmtree(exp_path, ignore_errors=True)
                 logger.warning(
-                    "Removed stale exp_path %s (contained tuner.pkl but no "
-                    "trial state — checkpoint_at_end fallback was triggered).",
+                    "Removed stale exp_path %s (tuner.pkl written before "
+                    "fit() raised — no trial state was persisted there).",
                     exp_path,
                 )
             os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
@@ -994,6 +1063,15 @@ def optimize_ray(
             "Consider: reduce batch_size, set num_gpus_per_trial=0 for CPU-only, "
             "or pass storage_path='/tmp/...' to move the SQLite DB off cloud storage.",
             _succ_rt_r, _n_ok_r, _n_total_r,
+        )
+
+    _n_ok_ray = sum(1 for r in results if not r.error)
+    if _n_ok_ray == 0:
+        raise RuntimeError(
+            f"All {len(results)} Ray Tune trials errored — no completed trial to "
+            "select best hyperparameters from.  Check the trial logs above "
+            "(typically GPU OOM, tokenizer errors, or NaN loss).  "
+            f"Trial artifacts are in: {exp_storage}"
         )
 
     best_result = results.get_best_result(metric=metric, mode=_ray_mode)
