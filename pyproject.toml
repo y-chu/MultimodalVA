@@ -30,17 +30,43 @@ dependencies = [
     # datasets 2.14: pure Python, compatible with 3.12.
     "datasets>=2.14",
     # scikit-learn 1.3.2: first release with official 3.12 classifiers (Nov 2023).
+    # scikit-learn 1.3.x requires numpy<2.0 (satisfied by the numpy cap below).
     "scikit-learn>=1.3.2",
     # pandas 2.1: first release with official 3.12 classifiers (Aug 2023).
     # pandas 1.x never supported 3.12.
     "pandas>=2.1",
     # numpy 1.26: first release with Python 3.12 wheels (Sep 2023).
-    "numpy>=1.26",
+    # <2 cap: compiled C extensions (catboost, scipy, pyinsilicova, and others
+    # built against NumPy 1.x ABI) raise ImportError at runtime with NumPy 2.x
+    # ("A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x").
+    # NumPy 2.0 introduced a binary-incompatible ABI; modules must be recompiled
+    # against NumPy 2.0 to run with it. Pinning <2 is the safest cross-package fix.
+    "numpy>=1.26,<2",
+    # scipy: transitive dep of scikit-learn and lightgbm; listed explicitly so
+    # pip resolves a version compatible with numpy<2 (scipy<1.14 was compiled
+    # against NumPy 1.x; listing it here ensures the cap applies transitively).
+    "scipy>=1.11",
     # optuna 3.4: first release with Python 3.12 classifiers (Nov 2023).
     "optuna>=3.4",
     # ray 2.9: first release with official Python 3.12 support.
     # ray[tune] is required for optimize_ray() in text/hpo.py and tabular/hpo.py.
     "ray[tune]>=2.9",
+    # opentelemetry packages: transitive deps of ray[tune]. On some HPC clusters
+    # ray is pre-installed without its [tune] extras, leaving these missing and
+    # causing ImportError at tune startup. Listed explicitly to guarantee install.
+    # >=1.1.0: minimum version known to be compatible with ray[tune]>=2.9.
+    "opentelemetry-api>=1.1.0",
+    "opentelemetry-sdk>=1.1.0",
+    "opentelemetry-exporter-otlp>=1.1.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.1.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.1.0",
+    "opentelemetry-instrumentation>=0.22b0",
+    # grpcio: required by opentelemetry-exporter-otlp-proto-grpc and ray.
+    # >=1.42.0: minimum for Python 3.10+ (covers 3.12).
+    "grpcio>=1.42.0",
+    # protobuf: required by grpcio and ray serialisation.
+    # >=3.20.3: minimum declared by ray 2.9+; <5 avoids untested major bump.
+    "protobuf>=3.20.3,<5",
     # optuna-integration 3.4: required by Ray Tune's OptunaSearch backend.
     "optuna-integration>=3.4",
     # joblib 1.3: pure Python, compatible with 3.12.
@@ -64,8 +90,10 @@ tabular = [
     # lightgbm 4.1: first release with Python 3.12 wheels (Oct 2023).
     "lightgbm>=4.1",
     # xgboost 2.0: released Oct 2023 alongside Python 3.12, includes 3.12 wheels.
+    # xgboost 2.1+ added NumPy 2.x support but is backward-compatible with numpy<2.
     "xgboost>=2.0",
     # catboost 1.2.2: first release with Python 3.12 wheels (Dec 2023).
+    # compiled against NumPy 1.x; compatible with numpy<2 cap in core deps.
     "catboost>=1.2.2",
 ]
 
@@ -76,11 +104,13 @@ lora = ["peft>=0.7"]
 # --- Ensemble strategy 2: AutoGluon AutoMM feature fusion ---
 # Install with: pip install multimodalva[feature_fusion]
 # autogluon 1.1: first release to officially support Python 3.12.
+# autogluon 1.1–1.x supports numpy>=1.25; compatible with numpy<2 cap.
 feature_fusion = ["autogluon.multimodal>=1.1"]
 
 # --- Ensemble strategy 4: InSilicoVA base model in stacking ---
 # Install with: pip install multimodalva[insilicova]
 # Enables model_name="insilicova" in StackingClassifier tabular_models specs.
+# pyinsilicova requires Python <3.10 — must be installed in a separate env.
 insilicova = ["pyinsilicova>=1.0"]
 
 # --- Install everything compatible with Python 3.12 ---

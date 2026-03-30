@@ -909,7 +909,11 @@ def optimize_ray(
     # in get_air_verbosity() expects int or AirVerbosity enum → AttributeError.
     # Force RAY_AIR_NEW_OUTPUT=0 for our HPO run to use the stable output path,
     # then restore the caller's value so AutoGluon's own runs are unaffected.
-    _prev_ray_output = os.environ.get("RAY_AIR_NEW_OUTPUT")
+    # RAY_AIR_LOCAL_CACHE_DIR is deprecated in newer Ray versions; if it is set
+    # in the HPC environment, Ray raises a DeprecationWarning *as an exception*
+    # inside tune.run(), aborting the run.  Unset it for our call and restore.
+    _prev_ray_output   = os.environ.get("RAY_AIR_NEW_OUTPUT")
+    _prev_ray_cache    = os.environ.pop("RAY_AIR_LOCAL_CACHE_DIR", None)
     os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
     try:
         results = tuner.fit()
@@ -961,6 +965,8 @@ def optimize_ray(
             os.environ.pop("RAY_AIR_NEW_OUTPUT", None)
         else:
             os.environ["RAY_AIR_NEW_OUTPUT"] = _prev_ray_output
+        if _prev_ray_cache is not None:
+            os.environ["RAY_AIR_LOCAL_CACHE_DIR"] = _prev_ray_cache
 
     # --- HPO Health Check (Ray) ---
     _ray_df     = results.get_dataframe()
