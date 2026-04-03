@@ -20,6 +20,8 @@ import joblib
 import numpy as np
 from sklearn.compose import ColumnTransformer
 
+from ..utils.numpy_compat import null_rng_pickler, prepare_estimator_for_joblib
+
 logger = logging.getLogger(__name__)
 
 # Supported model aliases: (module path, class name)
@@ -204,11 +206,22 @@ def train(
     )
     model.fit(X_train, y_train)
 
-    # Bundle model + preprocessor so predict() can reload both from one file.
-    # The preprocessor is not used by predict() when X_test is already preprocessed,
-    # but it is available for users who want to score raw new samples later.
+    # Sanitize and strip all RNG objects before pickling to prevent
+    # cross-NumPy-version joblib failures (MT19937 BitGenerator path changed
+    # between NumPy 1.x and 2.x).  RNG state is never used during predict().
+    #
+    # Three-layer defence:
+    #   1. _sanitize_random_state: reset random_state* attrs to int 42.
+    #   2. _strip_fit_rng: null out RNG objects reachable via Python __dict__.
+    #   3. _null_rng_pickler: patch copyreg.dispatch_table so every RNG object
+    #      that pickle encounters — including those in C-extension slots or
+    #      attributes where setattr is blocked — is serialised as None.
+    prepare_estimator_for_joblib(model, random_state=random_state)
+    if preprocessor is not None:
+        prepare_estimator_for_joblib(preprocessor, random_state=random_state)
     bundle = {"model": model, "preprocessor": preprocessor}
-    joblib.dump(bundle, output_dir / "model.joblib")
+    with null_rng_pickler():
+        joblib.dump(bundle, output_dir / "model.joblib")
 
     # Persist feature names (for SHAP and visualization)
     with open(output_dir / "feature_names.json", "w") as f:

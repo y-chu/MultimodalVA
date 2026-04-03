@@ -27,7 +27,6 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
-    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
 )
@@ -173,6 +172,33 @@ def _get_dataset_labels(dataset) -> list[int]:
         f"Cannot extract labels from dataset of type {type(dataset).__name__}. "
         "Expected ClassificationDataset or torch.utils.data.Subset."
     )
+
+
+def _compute_eval_metrics(eval_pred) -> dict:
+    """Compute accuracy and macro F1 from Trainer EvalPrediction.
+
+    Passed as compute_metrics to the Trainer when has_eval=True.
+    Both metrics are always present when logits are collected.
+    EarlyStoppingCallback and load_best_model_at_end watch eval_macro_f1
+    (more robust than eval_loss for imbalanced multiclass VA data).
+    """
+    from sklearn.metrics import f1_score  # noqa: PLC0415
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)
+    accuracy = float((predictions == labels).mean())
+    macro_f1 = float(f1_score(labels, predictions, average="macro", zero_division=0))
+    return {"accuracy": accuracy, "macro_f1": macro_f1}
+
+
+def _best_model_metric_name(has_eval: bool) -> str | None:
+    """Return the best-model metric name in the format Trainer expects."""
+    if not has_eval:
+        return None
+    # Use the explicit evaluation metric key for compatibility across Trainer
+    # versions. Some versions accept an unprefixed name, but others look up the
+    # exact key in the evaluation metrics dict and will fail the trial if only
+    # ``macro_f1`` is provided here.
+    return "eval_macro_f1"
 
 
 def _val_split(dataset, val_size: float, random_state: int = 42) -> tuple[Subset, Subset]:
@@ -422,6 +448,7 @@ def train(
     resume: bool = True,
     cleanup_checkpoints: bool = False,
     use_fast: bool = False,
+    eval_batch_size: int = 4,
 ) -> tuple[Trainer, AutoTokenizer, dict]:
     """Fine-tune a BERT-family model for multiclass classification.
 
@@ -458,9 +485,9 @@ def train(
         use_lora: Apply LoRA adapters during training. Default False.
         gradient_checkpointing: Enable gradient checkpointing to reduce GPU memory.
                                 Default False.
-        early_stopping_patience: Stop training if eval metric does not improve for
-                                  this many epochs. Only active when eval_dataset
-                                  is provided. Default None (disabled).
+        early_stopping_patience: Stop training if eval_macro_f1 does not improve
+                                  for this many epochs. Active whenever val_size > 0.
+                                  Default None (disabled).
         resume: Resume training from the latest checkpoint in output_dir.
                 Default True.
         cleanup_checkpoints: Delete intermediate ``checkpoint-*/`` subdirectories
@@ -473,11 +500,15 @@ def train(
         use_fast: Use the HuggingFace fast (Rust) tokenizer. Default False.
                   Set False for models that lack a fast tokenizer
                   (e.g. BlueBERT) to avoid a falling-back warning.
+        eval_batch_size: Per-device batch size used exclusively for eval forward
+                         passes. Decoupled from training batch_size to prevent
+                         eval OOM when training uses large batches. Default 4.
+                         Only relevant when val_size > 0.
 
     Returns:
         trainer:   HuggingFace Trainer with the fine-tuned model at trainer.model.
-                   When load_best_model_at_end=True (i.e. val_size is set), trainer.model
-                   holds the best checkpoint rather than the final epoch's weights.
+                   When val_size > 0, trainer.model holds the best checkpoint
+                   (by eval_macro_f1) rather than the final epoch's weights.
         tokenizer: Tokenizer matching the model, ready for DataCollatorWithPadding.
         metadata:  Dict with keys output_dir, model_name, hyperparams, label2id,
                    id2label, log_history. Contains everything needed for in-memory
@@ -637,17 +668,29 @@ def train(
     #   HuggingFace TrainingArguments defaults to True, which triggers a UserWarning on
     #   Apple Silicon. Explicitly set to False on MPS (and CPU) to suppress it.
     # fp16: only safe on CUDA; MPS uses bfloat16 natively so fp16=False is correct.
+    # label_names: force Trainer to treat "labels" as supervised targets even when
+    #   the model is wrapped by PEFT/LoRA. Some transformers versions cannot infer
+    #   label fields from wrapped forward signatures during evaluation, which causes
+    #   eval to emit only timing metrics and breaks metric_for_best_model.
     # gradient_checkpointing_kwargs use_reentrant=False: the reentrant implementation
     #   requires at least one input tensor to have requires_grad=True.  When layers are
     #   frozen (freeze_layers > 0) the early checkpointed segments receive all-frozen
     #   inputs, causing "None of the inputs have requires_grad=True. Gradients will be
     #   None."  use_reentrant=False (non-reentrant autograd checkpointing, PyTorch >= 2.1)
     #   removes this requirement and is the recommended modern default.
+    metric_for_best_model = _best_model_metric_name(has_eval)
+    num_workers = int(hp["dataloader_num_workers"])
+
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         learning_rate=hp["learning_rate"],
         per_device_train_batch_size=hp["batch_size"],
-        per_device_eval_batch_size=32,
+        # eval_batch_size is intentionally decoupled from training batch_size.
+        # Using training batch_size for eval can OOM (especially with LoRA +
+        # gradient_accumulation where effective batch is already large), leaving
+        # eval_loss absent and causing KeyError in _determine_best_metric.
+        # A small fixed value (default 4) guarantees eval never OOMs.
+        per_device_eval_batch_size=eval_batch_size,
         num_train_epochs=hp["epochs"],
         warmup_ratio=hp["warmup_ratio"],
         weight_decay=hp["weight_decay"],
@@ -658,11 +701,17 @@ def train(
         save_strategy="epoch",
         save_total_limit=2,
         load_best_model_at_end=has_eval,
+        # Use the explicit evaluation metric key to match the metrics dict that
+        # Trainer produces at eval time across transformers versions.
+        metric_for_best_model=metric_for_best_model,
+        greater_is_better=True if has_eval else None,
         logging_steps=50,
         report_to="none",
         fp16=_is_cuda,
-        dataloader_num_workers=hp["dataloader_num_workers"],
+        label_names=["labels"],
+        dataloader_num_workers=num_workers,
         dataloader_pin_memory=_is_cuda,
+        dataloader_persistent_workers=bool(num_workers > 0),
         gradient_checkpointing=gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
         disable_tqdm=False,
@@ -671,8 +720,13 @@ def train(
     # --- Load tokenizer for DataCollator (needed before Trainer is created) ---
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=use_fast)
 
+    # EarlyStoppingCallback watches eval_macro_f1 (via metric_for_best_model).
+    # load_best_model_at_end=has_eval is always True when eval is available —
+    # EarlyStoppingCallback requires load_best_model_at_end=True.
+    # Active whenever val_size > 0 and early_stopping_patience is set.
     callbacks = []
     if has_eval and early_stopping_patience is not None:
+        from transformers import EarlyStoppingCallback  # noqa: PLC0415
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=early_stopping_patience))
 
     # --- Create trainer ---
@@ -689,6 +743,7 @@ def train(
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=DataCollatorWithPadding(tokenizer),
+        compute_metrics=_compute_eval_metrics if has_eval else None,
         callbacks=callbacks or None,
     )
     if loss_type == "focal":

@@ -378,7 +378,6 @@ class SoftVotingClassifier:
             raise ValueError(
                 f"weights has {len(weights)} entries but there are {n_models} base models."
             )
-
         self.text_models    = text_models
         self.tabular_models = tabular_models
         self.output_dir     = Path(output_dir)
@@ -640,7 +639,8 @@ class SoftVotingClassifier:
         # --- Step 4: soft vote ----------------------------------------------
         logger.info(
             "Soft voting over %d base models (weights=%s)",
-            len(self.base_predictions), self.weights,
+            len(self.base_predictions),
+            self.weights,
         )
         self.predictions = vote_from_results(
             self.base_predictions,

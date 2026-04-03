@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from ..utils.types import PredictionResult
+from ..utils.numpy_compat import load_joblib_compat
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ def predict(
                 "Either output_dir or both (model, id2label) must be provided."
             )
         output_dir = Path(output_dir)
-        bundle = joblib.load(output_dir / "model.joblib")
+        bundle = load_joblib_compat(output_dir / "model.joblib")
         model = bundle["model"]
         with open(output_dir / "id2label.json") as f:
             id2label = {int(k): v for k, v in json.load(f).items()}

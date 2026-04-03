@@ -9,7 +9,7 @@ for fine-tuning.
 Pipeline (this module):
     DataFrame
       → tabular_to_text()  — structured features → natural-language description
-      → build_fused_text() — concatenate tabular description + narrative
+      → build_fused_text() — concatenate narrative + tabular description
 
 Question descriptions (qdesc):
     When a ``qdesc`` DataFrame is supplied, each variable's natural-language rendering
@@ -659,10 +659,11 @@ def build_fused_text(
     """Apply tabular_to_text() to every row and concatenate with the narrative.
 
     Each fused text is:
-        <tabular description> <separator> <narrative>
+        <narrative> <separator> <tabular description>
 
-    Placing the structured description before the narrative ensures the LM sees
-    it early (before any truncation) and can attend to it during narrative encoding.
+    The original narrative always comes first so it is never truncated by the
+    tokenizer's max_length limit; the structured tabular description is appended
+    at the end.
 
     Args:
         df:             Input DataFrame with both tabular features and a text column.
@@ -679,7 +680,7 @@ def build_fused_text(
         prefix_cols:    Subject prefix mapping (see tabular_to_text).
         yes_no_map:     Positive → negative verb map (see tabular_to_text).
                         Default: ``DEFAULT_YES_NO_MAP``.
-        separator:      String inserted between the tabular description and the narrative.
+        separator:      String inserted between the narrative and the tabular description.
                         Default is a blank line ("\\n\\n").
         group_symptoms: Group symptoms sharing the same verb into one sentence.
                         Default True (recommended — ~40–50% fewer tokens).
@@ -725,8 +726,8 @@ def build_fused_text(
         )
         narrative = str(row[text_col]) if pd.notna(row[text_col]) else ""
         if tab_text and narrative:
-            return f"{tab_text}{separator}{narrative}"
-        return tab_text or narrative
+            return f"{narrative}{separator}{tab_text}"
+        return narrative or tab_text
 
     fused = df.apply(_fuse_row, axis=1)
 

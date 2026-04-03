@@ -123,8 +123,14 @@ import numpy as np
 import pandas as pd
 
 from ..utils.types import PredictionResult
+from ..utils.numpy_compat import (
+    load_joblib_compat,
+    null_rng_pickler,
+    prepare_estimator_for_joblib,
+)
 
 logger = logging.getLogger(__name__)
+
 
 BaseModelSpec = dict
 
@@ -142,6 +148,7 @@ DEFAULT_META_LEARNER: dict = {
 DEFAULT_META_SEARCH_SPACES: dict[str, dict] = {
     "logistic_regression": {
         "C": ("log_float", 1e-3, 1e2),
+        "class_weight": ("categorical", [None, "balanced"]),
     },
     "lightgbm": {
         "n_estimators":      ("int",       50,  500),
@@ -388,6 +395,79 @@ def _score_meta_candidate(
 
     top1_df = pd.DataFrame({"true_label": true_str, "predicted_label": pred_str})
     return score_predictions(top1_df, metric=metric)
+
+
+def _learn_class_voter_weights(
+    prob_matrices: list[np.ndarray],
+    y_true: np.ndarray,
+    id2label: dict,
+    metric: str = "recall",
+    alpha: float = 1.0,
+    shrinkage: float = 0.25,
+) -> np.ndarray:
+    """Learn a per-model × per-class weight matrix from OOF probabilities."""
+    if not prob_matrices:
+        raise ValueError("prob_matrices must contain at least one matrix.")
+    if metric not in {"recall", "precision", "f1"}:
+        raise ValueError("metric must be one of: 'recall', 'precision', 'f1'.")
+    if alpha < 0:
+        raise ValueError("alpha must be >= 0.")
+    if not (0.0 <= shrinkage <= 1.0):
+        raise ValueError("shrinkage must be in [0, 1].")
+
+    sorted_ids = sorted(id2label.keys())
+    labels = [id2label[cid] for cid in sorted_ids]
+    true_labels = [id2label[int(y)] for y in y_true]
+    n_models = len(prob_matrices)
+    n_classes = len(sorted_ids)
+
+    scores = np.zeros((n_models, n_classes), dtype=float)
+    for i, probs in enumerate(prob_matrices):
+        pred_ids = np.argmax(probs, axis=1)
+        pred_labels = [id2label[sorted_ids[int(j)]] for j in pred_ids]
+        for j, label in enumerate(labels):
+            tp = sum((t == label) and (p == label) for t, p in zip(true_labels, pred_labels))
+            fp = sum((t != label) and (p == label) for t, p in zip(true_labels, pred_labels))
+            fn = sum((t == label) and (p != label) for t, p in zip(true_labels, pred_labels))
+            if metric == "recall":
+                denom = tp + fn
+                score = tp / denom if denom else 0.0
+            elif metric == "precision":
+                denom = tp + fp
+                score = tp / denom if denom else 0.0
+            else:
+                prec = tp / (tp + fp) if (tp + fp) else 0.0
+                rec = tp / (tp + fn) if (tp + fn) else 0.0
+                score = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+            scores[i, j] = score
+
+    scores = scores + alpha
+    scores = scores / scores.sum(axis=0, keepdims=True)
+    if shrinkage > 0:
+        uniform = np.full_like(scores, 1.0 / n_models)
+        scores = shrinkage * uniform + (1.0 - shrinkage) * scores
+        scores = scores / scores.sum(axis=0, keepdims=True)
+    return scores
+
+
+def _apply_class_voter(
+    prob_matrices: list[np.ndarray],
+    class_weights: np.ndarray,
+) -> np.ndarray:
+    """Combine base-model probability matrices with class-aware weights."""
+    if not prob_matrices:
+        raise ValueError("prob_matrices must contain at least one matrix.")
+    n_models = len(prob_matrices)
+    n_samples, n_classes = prob_matrices[0].shape
+    if class_weights.shape != (n_models, n_classes):
+        raise ValueError(
+            f"class_weights must have shape ({n_models}, {n_classes}), got {class_weights.shape}."
+        )
+    stacked = np.stack(prob_matrices, axis=0)               # (n_models, n_samples, n_classes)
+    combined = (stacked * class_weights[:, None, :]).sum(axis=0)
+    row_sums = combined.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0.0] = 1.0
+    return combined / row_sums
 
 
 def _meta_optuna_objective(
@@ -999,6 +1079,8 @@ class StackingClassifier:
         # Populated after train_meta_learner_stage()
         self.meta_learner: Any | None = None
         self.meta_scores:  dict       = {}
+        self.class_voter_weights: np.ndarray | None = None
+        self.class_voter_metadata: dict | None = None
 
         # Populated after predict_test()
         self.predictions: PredictionResult | None = None
@@ -1698,7 +1780,13 @@ class StackingClassifier:
         self.meta_learner = best_model
         self.meta_scores  = scores
 
-        joblib.dump(best_model, meta_dir / "meta_learner.joblib")
+        # Sanitize and strip all RNG objects before pickling to prevent
+        # cross-NumPy-version joblib failures (MT19937 path changed in NumPy 2.x).
+        # Three-layer defence: sanitize attrs → strip via __dict__ walk →
+        # copyreg patch catches anything missed (C-extension slots, etc.).
+        prepare_estimator_for_joblib(best_model)
+        with null_rng_pickler():
+            joblib.dump(best_model, meta_dir / "meta_learner.joblib")
         with open(meta_dir / "meta_scores.json", "w") as fh:
             json.dump(scores, fh, indent=2)
 
@@ -1721,6 +1809,90 @@ class StackingClassifier:
             "meta_scores":     scores,
             "best_meta_name":  best_name,
             "output_dir":      self.output_dir,
+        }
+
+    def train_class_voter_stage(
+        self,
+        metric: str = "recall",
+        alpha: float = 1.0,
+        shrinkage: float = 0.25,
+    ) -> dict:
+        """Stage 2 alternative: learn class-aware voting weights from OOF data.
+
+        Uses only the OOF meta-feature matrix and OOF labels. This is a linear,
+        interpretable combiner that learns a different model-weight profile for
+        each class, without fitting a meta-learner over the concatenated OOF
+        features.
+        """
+        self._ensure_oof_loaded()
+
+        oof_meta_path = self.output_dir / "oof" / "oof_metadata.json"
+        if not oof_meta_path.exists():
+            raise RuntimeError(
+                "OOF metadata not found at %s. Run train_base_models() first." % oof_meta_path
+            )
+        with open(oof_meta_path) as fh:
+            oof_meta = json.load(fh)
+        model_sources = oof_meta.get("model_sources") or []
+        if not model_sources:
+            raise RuntimeError("OOF metadata is missing model_sources; cannot train class voter.")
+
+        sorted_ids = sorted(self.id2label.keys())
+        prob_matrices = [
+            self.oof_meta_X[:, int(src["col_start"]): int(src["col_start"]) + int(src["n_cols"])]
+            for src in model_sources
+        ]
+        class_weights = _learn_class_voter_weights(
+            prob_matrices=prob_matrices,
+            y_true=self.oof_y,
+            id2label=self.id2label,
+            metric=metric,
+            alpha=alpha,
+            shrinkage=shrinkage,
+        )
+        combined_oof = _apply_class_voter(prob_matrices, class_weights)
+        true_labels = [self.id2label[int(y)] for y in self.oof_y]
+        oof_result = _assemble_prediction_result(combined_oof, true_labels, self.id2label, top_k=3)
+
+        from ..utils.metrics import score_predictions
+
+        metric_names = ["accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"]
+        scores = {name: float(score_predictions(oof_result.top1, metric=name)) for name in metric_names}
+
+        class_voter_dir = self.output_dir / "class_voter"
+        class_voter_dir.mkdir(parents=True, exist_ok=True)
+
+        np.save(class_voter_dir / "class_weights.npy", class_weights)
+        weights_payload = {
+            "model_names": [src["spec"]["model_name"] for src in model_sources],
+            "class_ids": sorted_ids,
+            "class_labels": [self.id2label[cid] for cid in sorted_ids],
+            "class_weights": class_weights.tolist(),
+        }
+        with open(class_voter_dir / "class_weights.json", "w") as fh:
+            json.dump(weights_payload, fh, indent=2)
+
+        metadata = {
+            "metric": metric,
+            "alpha": alpha,
+            "shrinkage": shrinkage,
+            "oof_meta_X_shape": list(self.oof_meta_X.shape),
+            "n_models": len(model_sources),
+            "n_classes": len(sorted_ids),
+            "model_names": [src["spec"]["model_name"] for src in model_sources],
+            "scores": scores,
+        }
+        with open(class_voter_dir / "class_voter_metadata.json", "w") as fh:
+            json.dump(metadata, fh, indent=2)
+
+        self.class_voter_weights = class_weights
+        self.class_voter_metadata = metadata
+
+        logger.info("Stage 2 complete. Class-aware voter saved to %s", class_voter_dir)
+        return {
+            "class_weights": class_weights,
+            "scores": scores,
+            "output_dir": self.output_dir,
         }
 
     # ------------------------------------------------------------------
@@ -1762,7 +1934,7 @@ class StackingClassifier:
                     "Meta-learner not found at %s.  "
                     "Run train_meta_learner_stage() first." % meta_model_path
                 )
-            self.meta_learner = joblib.load(meta_model_path)
+            self.meta_learner = load_joblib_compat(meta_model_path)
             logger.info("Meta-learner loaded from %s", meta_model_path)
 
         # Ensure label maps are loaded
@@ -1893,6 +2065,121 @@ class StackingClassifier:
         logger.info("Stage 3 complete. Test accuracy: %.4f", voted_acc)
 
         return self.predictions
+
+    def predict_test_class_voter(
+        self,
+        top_k: int = 3,
+        batch_size: int = 32,
+    ) -> PredictionResult:
+        """Stage 3 alternative: predict test data using saved class-aware weights."""
+        if self.class_voter_weights is None:
+            class_voter_dir = self.output_dir / "class_voter"
+            weights_path = class_voter_dir / "class_weights.npy"
+            meta_path = class_voter_dir / "class_voter_metadata.json"
+            if not weights_path.exists():
+                raise RuntimeError(
+                    "Class-aware voter weights not found at %s. Run train_class_voter_stage() first."
+                    % weights_path
+                )
+            self.class_voter_weights = np.load(weights_path)
+            if meta_path.exists():
+                with open(meta_path) as fh:
+                    self.class_voter_metadata = json.load(fh)
+
+        # Lazy imports
+        from ..text.dataset    import prepare_dataset as text_prepare
+        from ..text.predict    import predict          as text_predict
+        from ..tabular.dataset import prepare_dataset as tab_prepare
+        from ..tabular.predict import predict          as tab_predict
+
+        self._ensure_oof_loaded()
+
+        data_dir = self.output_dir / "data"
+        train_df = pd.read_csv(data_dir / "train_df.csv")
+        test_df = pd.read_csv(data_dir / "test_df.csv")
+
+        sorted_ids = sorted(self.id2label.keys())
+        n_classes = len(sorted_ids)
+
+        oof_meta_path = self.output_dir / "oof" / "oof_metadata.json"
+        with open(oof_meta_path) as fh:
+            oof_meta = json.load(fh)
+        model_sources = oof_meta.get("model_sources") or []
+        if not model_sources:
+            raise RuntimeError("OOF metadata is missing model_sources; cannot run class-aware voter.")
+
+        if self.class_voter_weights.shape != (len(model_sources), n_classes):
+            raise ValueError(
+                "Loaded class-aware weights shape %s does not match current model_sources/classes (%d, %d)."
+                % (self.class_voter_weights.shape, len(model_sources), n_classes)
+            )
+
+        X_test_npy = data_dir / "X_test.npy"
+        y_test_npy = data_dir / "y_test.npy"
+        _has_sklearn_tab = any(
+            s["type"] == "tabular" and s["spec"].get("model_name") != _INSILICOVA
+            for s in model_sources
+        )
+        X_test = y_test = None
+        if _has_sklearn_tab and X_test_npy.exists():
+            X_test = np.load(X_test_npy)
+            y_test = np.load(y_test_npy)
+        elif _has_sklearn_tab:
+            (_, X_test, _, y_test, _, _, _, _) = tab_prepare(
+                train_df, test_df,
+                feature_cols=self._feature_cols,
+                label_col=self._label_col,
+                encode_categoricals="ordinal",
+            )
+
+        prob_matrices = []
+        for source in model_sources:
+            model_dir = Path(source["final_dir"])
+            spec = source["spec"]
+            model_name = spec["model_name"]
+
+            if source["type"] == "text":
+                max_length = spec.get("max_length", 512)
+                logger.info(
+                    "Predicting test — text model %s (weights: %s) ...",
+                    model_name, model_dir,
+                )
+                _, test_text_ds, _, _ = text_prepare(
+                    train_df, test_df,
+                    text_col=self._text_col, label_col=self._label_col,
+                    model_name=model_name, max_length=max_length,
+                )
+                result = text_predict(model_dir, test_text_ds, batch_size=batch_size, top_k=1)
+                fold_probs = _extract_probs(result, sorted_ids)
+            else:
+                logger.info(
+                    "Predicting test — tabular model %s (weights: %s) ...",
+                    model_name, model_dir,
+                )
+                if model_name == _INSILICOVA:
+                    fold_probs = _insilicova_predict_df(
+                        model_dir, test_df, sorted_ids, train_df=train_df,
+                    )
+                else:
+                    result = tab_predict(model_dir, X_test, y_test, top_k=1)
+                    fold_probs = _extract_probs(result, sorted_ids)
+            prob_matrices.append(fold_probs)
+
+        combined = _apply_class_voter(prob_matrices, self.class_voter_weights)
+        true_labels = test_df[self._label_col].tolist()
+        predictions = _assemble_prediction_result(combined, true_labels, self.id2label, top_k)
+
+        pred_dir = self.output_dir / "class_voter" / "predictions"
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        predictions.top1.to_csv(pred_dir / "top1.csv", index=False)
+        predictions.topk.to_csv(pred_dir / "topk.csv", index=False)
+        predictions.full.to_csv(pred_dir / "full.csv", index=False)
+
+        voted_acc = (
+            predictions.top1["true_label"] == predictions.top1["predicted_label"]
+        ).mean()
+        logger.info("Class-aware voter Stage 3 complete. Test accuracy: %.4f", voted_acc)
+        return predictions
 
     # ------------------------------------------------------------------
     # Convenience: all stages in sequence
