@@ -1,35 +1,35 @@
 # MultimodalVA
 
-**Cause of death classification using verbal autopsy data.**
+MultimodalVA is a Python package for cause-of-death classification from verbal autopsy data.
+It supports:
 
-MultimodalVA provides a unified Python interface for building, tuning, and ensembling
-text-based (transformer), tabular (sklearn/LightGBM), and multimodal classifiers on
-verbal autopsy (VA) datasets.  All pipelines share a common `split → prepare → [HPO →] train → predict`
-interface and produce a `PredictionResult` that includes top-1 labels, full probability matrices,
-and top-k predictions.
+- text-only transformer models
+- tabular machine-learning models
+- multimodal fusion and ensemble pipelines
+- shared prediction outputs and visualization utilities
 
----
+All main pipelines follow the same pattern:
 
-## Requirements
+```text
+split -> prepare -> [HPO] -> train -> predict
+```
 
-- **Python 3.12** (tested on 3.12.2; Python 3.13+ not yet supported)
+and return a common `PredictionResult` with:
 
----
+- `top1`: top-1 predictions
+- `full`: full class probabilities
+- `topk`: top-k predictions
+- `id2label`: class-id mapping
 
 ## Installation
 
-### From GitHub (recommended)
+Recommended:
 
 ```bash
 pip install git+https://github.com/y-chu/MultimodalVA.git
 ```
 
-This installs the core package with all required dependencies automatically, including:
-`torch`, `transformers`, `accelerate`, `datasets`, `scikit-learn`, `pandas`, `numpy`,
-`optuna`, `ray[tune]`, `matplotlib`, `seaborn`, `sentencepiece`, and more.
-No additional manual dependency installation is needed for the text or tabular pipelines.
-
-### Development install (editable)
+Development install:
 
 ```bash
 git clone https://github.com/y-chu/MultimodalVA.git
@@ -37,32 +37,19 @@ cd MultimodalVA
 pip install -e ".[dev]"
 ```
 
-### Optional extras
-
-Install extras only when you need a specific feature:
+Optional extras:
 
 ```bash
-# Tabular gradient boosters (LightGBM, XGBoost, CatBoost)
-pip install "multimodalva[tabular]"
-
-# LoRA parameter-efficient fine-tuning
-pip install "multimodalva[lora]"
-
-# Feature-fusion ensemble (AutoGluon AutoMM)
-pip install "multimodalva[feature_fusion]"
-
-# InSilicoVA base model in stacking (requires Python <3.10 — separate environment)
-pip install "multimodalva[insilicova]"
-
-# All Python 3.12-compatible extras (excludes insilicova)
-pip install "multimodalva[all]"
+pip install "multimodalva[tabular]"         # LightGBM / XGBoost / CatBoost
+pip install "multimodalva[lora]"            # PEFT / LoRA
+pip install "multimodalva[feature_fusion]"  # AutoGluon AutoMM
+pip install "multimodalva[insilicova]"      # PyInSilicoVA support
+pip install "multimodalva[all]"             # all Python-3.12-compatible extras
 ```
-
----
 
 ## Quick Start
 
-### Text classification
+### Text
 
 ```python
 from multimodalva.text import TextClassifier
@@ -72,12 +59,13 @@ results = clf.run(
     df=df,
     text_col="narrative",
     label_col="cause",
-    hyperparams={"epochs": 5, "batch_size": 16, "learning_rate": 2e-5},
+    hyperparams={"epochs": 3, "batch_size": 16, "learning_rate": 2e-5},
 )
+
 print(results["predictions"].top1.head())
 ```
 
-### Tabular classification
+### Tabular
 
 ```python
 from multimodalva.tabular import TabularClassifier
@@ -85,16 +73,24 @@ from multimodalva.tabular import TabularClassifier
 clf = TabularClassifier(model_name="lightgbm", output_dir="runs/tabular")
 results = clf.run(
     df=df,
-    feature_cols=[...],
+    feature_cols=["age", "sex", "fever", "cough"],
     label_col="cause",
-    use_optimize=True,    # Optuna HPO
-    n_trials=50,
+    use_optimize=True,
+    n_trials=20,
     optimize_metric="f1_macro",
 )
+
+print(results["best_hyperparams"])
 print(results["predictions"].top1.head())
 ```
 
-### Ensemble — soft voting
+Tabular HPO defaults are adaptive:
+
+- the package infers a search-space profile from `X_train.shape`
+- the default profile is `search_space_profile="auto"`
+- user `search_space` overrides are still merged on top
+
+### Ensemble: Soft Voting
 
 ```python
 from multimodalva.ensemble import EnsembleClassifier
@@ -102,132 +98,159 @@ from multimodalva.ensemble import EnsembleClassifier
 clf = EnsembleClassifier(
     method="soft_voting",
     output_dir="runs/ensemble",
-    text_models=[{"model_name": "bioclinicalbert",
-                  "hyperparams": {"epochs": 5}}],
-    tabular_models=[{"model_name": "lightgbm",
-                     "hyperparams": {"n_estimators": 300}}],
+    text_models=[{"model_name": "bioclinicalbert"}],
+    tabular_models=[{"model_name": "lightgbm"}],
 )
-results = clf.run(df=df, text_col="narrative",
-                  feature_cols=[...], label_col="cause")
+
+results = clf.run(
+    df=df,
+    text_col="narrative",
+    feature_cols=["age", "sex", "fever", "cough"],
+    label_col="cause",
+)
 ```
 
-### Ensemble — stacking (stage-wise)
+### Ensemble: Stacking
 
 ```python
 from multimodalva.ensemble import EnsembleClassifier
 
 clf = EnsembleClassifier(
     method="stacking",
-    output_dir="runs/ensemble",
+    output_dir="runs/stacking",
     text_models=[{"model_name": "bioclinicalbert"}],
     tabular_models=[{"model_name": "lightgbm"}],
     n_folds=5,
 )
 
-# Stage 1 — OOF loop (long; can be restarted; resume-safe)
-clf.train_base_models(df=df, label_col="cause",
-                      text_col="narrative", feature_cols=[...])
+# Stage 1
+clf.train_base_models(
+    df=df,
+    text_col="narrative",
+    feature_cols=["age", "sex", "fever", "cough"],
+    label_col="cause",
+)
 
-# Stage 2 — meta-learner selection
+# Stage 2A: meta-learner
 clf.train_meta_learner_stage(meta_cv_folds=3)
+meta_pred = clf.predict_test()
 
-# Stage 3 — predict test set
-predictions = clf.predict_test()
+# Stage 2B: class-aware voting (alternative to meta-learner)
+clf.train_class_voter_stage(metric="recall", alpha=1.0, shrinkage=0.25)
+vote_pred = clf.predict_test_class_voter()
 ```
 
----
+## Supported Pipelines
 
-## Supported models
+### Text
 
-### Text (Transformers)
+Use a package alias, a HuggingFace checkpoint, or a local model path.
 
-Pass the alias string or the full HuggingFace checkpoint ID as `model_name`.
+Common aliases include:
 
-| Alias | HuggingFace checkpoint |
-|---|---|
-| `"bert"` | `bert-base-uncased` |
-| `"biobert"` | `dmis-lab/biobert-base-cased-v1.2` |
-| `"bioclinicalbert"` | `emilyalsentzer/Bio_ClinicalBERT` |
-| `"bluebert"` | `bionlp/bluebert_pubmed_mimic_uncased_L-12_H-768_A-12` |
-| `"biomedbert"` | `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext` |
-| `"clinicalbert"` | `medicalai/ClinicalBERT` |
-| `"biomedroberta"` | `allenai/biomed_roberta_base` |
-| `"bioelectra"` | `kamalkraj/bioelectra-base-discriminator-pubmed` |
-| `"longformer"` | `allenai/longformer-base-4096` |
-| `"clinicallongformer"` | `yikuan8/Clinical-Longformer` |
-| `"bigbird"` | `google/bigbird-roberta-base` |
-| `"clinicalbigbird"` | `yikuan8/Clinical-BigBird` |
+- `bert`
+- `biobert`
+- `bioclinicalbert`
+- `bluebert`
+- `biomedbert`
+- `clinicalbert`
+- `biomedroberta`
+- `bioelectra`
+- `longformer`
+- `clinicallongformer`
+- `bigbird`
+- `clinicalbigbird`
 
-**Remote model (not on HuggingFace Hub):**
+Remote model support:
 
-| Key | Source |
-|---|---|
-| `"roberta-pm"` | RoBERTa-PM-M3 — download via `download_model("roberta-pm")` |
+- `roberta-pm`
+  - downloaded automatically via `download_model("roberta-pm")`
+  - also resolved automatically inside AutoMM feature fusion
 
-Any public HuggingFace Hub ID or local model path is also accepted directly as `model_name`.
+### Tabular
 
-### Tabular (scikit-learn compatible)
+Supported model aliases:
 
-Requires `pip install "multimodalva[tabular]"` for the gradient boosters.
+- `lightgbm`
+- `xgboost`
+- `catboost`
+- `random_forest`
+- `gbdt`
+- `mlp`
+- `svm`
+- `knn`
+- `naive_bayes`
 
-| Alias | Library |
-|---|---|
-| `"lightgbm"` | LightGBM |
-| `"xgboost"` | XGBoost |
-| `"catboost"` | CatBoost |
-| `"random_forest"` | scikit-learn `RandomForestClassifier` |
-| `"gbdt"` | scikit-learn `GradientBoostingClassifier` |
-| `"mlp"` | scikit-learn `MLPClassifier` |
-| `"svm"` | scikit-learn `SVC` |
-| `"knn"` | scikit-learn `KNeighborsClassifier` |
-| `"naive_bayes"` | scikit-learn `GaussianNB` |
+### Ensemble
 
-### Ensemble strategies
+- `data_fusion`
+  - render tabular features as text and concatenate with the narrative
+- `feature_fusion`
+  - AutoGluon AutoMM joint text + tabular model
+- `soft_voting`
+  - probability averaging over independently trained base models
+- `stacking`
+  - Stage 1 OOF base models, then either:
+    - Stage 2 meta-learner
+    - Stage 2 class-aware voting learned from OOF predictions
 
-| `method=` | Description | Extra required |
-|---|---|---|
-| `"data_fusion"` | Tabular fields → natural language → concat with narrative → LM fine-tune | — |
-| `"feature_fusion"` | AutoGluon AutoMM joint text + tabular representation | `[feature_fusion]` |
-| `"soft_voting"` | Independent base models + weighted probability averaging | — |
-| `"stacking"` | k-fold OOF meta-features → meta-learner (super learner) | — |
+## Current Defaults and Behavior
 
----
+### Text pipeline
 
-## Demo scripts
+- best-model selection uses `eval_macro_f1`
+- LoRA / PEFT evaluation keeps labels visible via `label_names=["labels"]`
+- early stopping remains active whenever an eval split exists
+- `roberta-pm` nested archive extraction is handled automatically
 
-All demos are in `tests/` and use synthetic data unless noted:
+### Tabular pipeline
 
-| Script | Sections | Description |
-|---|---|---|
-| `demo_text_classification.py` | A–H | TextClassifier, HPO, LoRA, Ray Tune, focal loss |
-| `demo_tabular_classification.py` | A–F | TabularClassifier, HPO, model comparison |
-| `demo_ensemble_data_fusion.py` | A–E | DataFusionClassifier, tabular-to-text conversion |
-| `demo_ensemble_feature_fusion.py` | A–E | FeatureFusionClassifier, AutoMM fusion strategies |
-| `demo_ensemble_voting.py` | A–G | SoftVotingClassifier, vote_from_results |
-| `demo_ensemble_stacking.py` | A–I | StackingClassifier, stage-wise, InSilicoVA stacking |
-| `demo_results.py` | A–I | All visualization functions (synthetic data) |
+- adaptive default HPO search spaces based on dataset shape
+- LightGBM defaults now search:
+  - `subsample`
+  - `colsample_bytree`
+  - `reg_alpha`
+  - `reg_lambda`
+- Ray HPO auto-redirects to Optuna on non-CUDA environments
 
-Run a single section:
+### Stacking pipeline
 
-```bash
-python tests/demo_results.py G         # cause accuracy heatmap
-python tests/demo_ensemble_stacking.py D  # tabular-only stacking
-```
+- shared NumPy / joblib compatibility loader for old artifacts
+- stage-wise API supports:
+  - `train_base_models()`
+  - `train_meta_learner_stage()`
+  - `predict_test()`
+  - `train_class_voter_stage()`
+  - `predict_test_class_voter()`
 
----
+## Demo Scripts
+
+The demos in `tests/` are intentionally small and focused on core package usage.
+They use synthetic data where possible.
+
+- `demo_text_classification.py`
+  - wrapper usage, HPO, low-level pipeline steps
+- `demo_tabular_classification.py`
+  - wrapper usage, adaptive HPO, low-level pipeline steps
+- `demo_ensemble_data_fusion.py`
+  - core data-fusion workflow
+- `demo_ensemble_feature_fusion.py`
+  - core AutoMM feature-fusion workflow
+- `demo_ensemble_voting.py`
+  - simple voting from saved-like predictions and end-to-end soft voting
+- `demo_ensemble_stacking.py`
+  - stage-wise stacking plus class-aware voting
+- `demo_results.py`
+  - leaderboard, top-k, confusion, and heatmap visualization helpers
 
 ## Documentation
 
-Full API reference: [`docs/index.html`](docs/index.html)
+- API docs: [docs/index.html](docs/index.html)
+- rebuild docs:
 
----
-
-## Upcoming
-
-- Add support for [InSilicoVA](https://github.com/verbal-autopsy-software/pyinsilicova) in ensemble pipelines. 
-
-
----
+```bash
+python docs/build_docs.py
+```
 
 ## License
 

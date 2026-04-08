@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import platform
 import ssl
 from pathlib import Path
@@ -99,9 +100,50 @@ import pandas as pd
 
 from ..utils.split import split
 from ..utils.types import PredictionResult
-from ..text.train import SUPPORTED_MODELS as TEXT_BACKBONE_MODELS
+from ..text.train import REMOTE_MODELS, SUPPORTED_MODELS as TEXT_BACKBONE_MODELS, download_model
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_automm_gpu_logging() -> None:
+    """Make AutoMM GPU logging safe on non-NVIDIA machines.
+
+    AutoGluon AutoMM logs GPU memory via ``nvidia_smi.nvmlInit()`` inside
+    ``autogluon.multimodal.utils.log.get_gpu_message``. On Apple Silicon or
+    any CPU-only machine where NVML is unavailable, that logging step can
+    raise and abort training even though the model is not using CUDA.
+
+    We patch both the canonical utility function and the copy imported into
+    ``autogluon.multimodal.learners.base`` so AutoMM falls back to a minimal
+    GPU-count message instead of crashing.
+    """
+    try:
+        from autogluon.multimodal.learners import base as ag_base
+        from autogluon.multimodal.utils import log as ag_log
+    except ImportError:
+        return
+
+    original = ag_log.get_gpu_message
+    if getattr(original, "_multimodalva_safe", False):
+        return
+
+    def _fallback_message(detected_num_gpus: int, used_num_gpus: int) -> str:
+        return (
+            f"GPU Count: {detected_num_gpus}\n"
+            f"GPU Count to be Used: {used_num_gpus}\n"
+            "GPU details unavailable (non-NVIDIA or NVML unavailable)\n"
+        )
+
+    def _safe_get_gpu_message(detected_num_gpus: int, used_num_gpus: int, strategy: str) -> str:
+        try:
+            return original(detected_num_gpus, used_num_gpus, strategy)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AutoMM GPU logging skipped: %s", exc)
+            return _fallback_message(detected_num_gpus, used_num_gpus)
+
+    _safe_get_gpu_message._multimodalva_safe = True  # type: ignore[attr-defined]
+    ag_log.get_gpu_message = _safe_get_gpu_message
+    ag_base.get_gpu_message = _safe_get_gpu_message
 
 
 # ---------------------------------------------------------------------------
@@ -144,17 +186,28 @@ DEFAULT_HPO_SPACE: dict = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_checkpoint(model_name: str) -> str:
-    """Return the full HuggingFace checkpoint name for ``model_name``.
+def _resolve_checkpoint(model_name: str, cache_dir: str | Path | None = None) -> str:
+    """Return a resolved checkpoint path or HuggingFace model ID for ``model_name``.
 
     Accepts:
     - A shorthand key from TEXT_BACKBONE_MODELS (e.g. ``"bioclinicalbert"``)
+    - A shorthand key from REMOTE_MODELS that must be downloaded first
+      (e.g. ``"roberta-pm"``)
     - Any full HuggingFace Hub ID  (e.g. ``"emilyalsentzer/Bio_ClinicalBERT"``)
     - A local path to a saved model directory
 
     Unknown values are passed through unchanged.
     """
-    return TEXT_BACKBONE_MODELS.get(model_name, model_name)
+    if model_name in TEXT_BACKBONE_MODELS:
+        return TEXT_BACKBONE_MODELS[model_name]
+
+    # Allow both "roberta-pm" and "roberta_pm" style keys in Analysis scripts.
+    remote_key = model_name if model_name in REMOTE_MODELS else model_name.replace("_", "-")
+    if remote_key in REMOTE_MODELS:
+        resolved_cache_dir = Path(cache_dir) if cache_dir is not None else None
+        return download_model(remote_key, cache_dir=resolved_cache_dir)
+
+    return model_name
 
 
 def _build_automm_hyperparameters(
@@ -586,6 +639,8 @@ class FeatureFusionClassifier:
                 "Install with:  pip install autogluon.multimodal"
             ) from exc
 
+        _patch_automm_gpu_logging()
+
         # Fix macOS SSL cert errors and ensure NLTK corpora required by AutoMM.
         _ensure_nltk_deps()
 
@@ -628,7 +683,10 @@ class FeatureFusionClassifier:
         input_test  = self.test_df[ordered_cols + [label_col]].copy()
 
         # --- Step 4: build AutoMM hyperparameters ------------------------
-        checkpoint_name = _resolve_checkpoint(self.model_name)
+        checkpoint_name = _resolve_checkpoint(
+            self.model_name,
+            cache_dir=self.output_dir / ".model_cache" / str(self.model_name),
+        )
         automm_hp = _build_automm_hyperparameters(
             checkpoint_name, self.fusion_strategy, hyperparameters
         )

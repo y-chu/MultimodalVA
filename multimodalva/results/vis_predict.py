@@ -743,6 +743,7 @@ def _compute_cause_accuracy_matrix(
     top_k: int,
     topk_dfs: dict | None,
     percentage: bool,
+    insilicova_first: bool,
 ) -> pd.DataFrame:
     """Compute per-cause accuracy for each model; return a cause × model DataFrame.
 
@@ -757,6 +758,13 @@ def _compute_cause_accuracy_matrix(
     Returns:
         DataFrame indexed by cause with one column per model.
     """
+    def _reorder_insilicova_first(names: list[str]) -> list[str]:
+        if not insilicova_first:
+            return names
+        ins = [name for name in names if "insilicova" in str(name).lower()]
+        rest = [name for name in names if "insilicova" not in str(name).lower()]
+        return ins + rest
+
     model_accs: dict[str, pd.Series] = {}
 
     # --- step A: accuracy from wide df (exact match, top-1) -----------------
@@ -766,6 +774,7 @@ def _compute_cause_accuracy_matrix(
         cols = model_cols if model_cols is not None else [
             c for c in df.columns if c not in {true_col, "id"}
         ]
+        cols = _reorder_insilicova_first(list(cols))
         if not cols:
             raise ValueError("No model columns found in df.  Pass model_cols explicitly.")
         for col in cols:
@@ -813,12 +822,45 @@ def _compute_cause_accuracy_matrix(
     if not model_accs:
         raise ValueError("No model accuracy data could be computed.")
 
-    return pd.DataFrame(model_accs)
+    ordered_names = _reorder_insilicova_first(list(model_accs))
+    return pd.DataFrame(model_accs)[ordered_names]
+
+
+def _group_boundaries_from_sizes(group_sizes: list[int], n_cols: int) -> list[tuple[float, float]]:
+    """Convert group sizes to start/end spans in heatmap column-centre coordinates.
+
+    Example:
+        group_sizes=[5, 4] -> [(0.5, 4.5), (5.5, 8.5)]
+
+    This means:
+        - label 1 centered over columns 1–5, line from mid(col1) to mid(col5)
+        - label 2 centered over columns 6–9, line from mid(col6) to mid(col9)
+    """
+    if not group_sizes:
+        raise ValueError("group_sizes must contain at least one positive integer.")
+    if any((not isinstance(size, (int, np.integer))) or int(size) < 1 for size in group_sizes):
+        raise ValueError(
+            f"group_sizes must be positive integers, got {group_sizes!r}."
+        )
+
+    total = int(sum(int(size) for size in group_sizes))
+    if total != n_cols:
+        raise ValueError(
+            f"group_sizes sum to {total}, but the heatmap has {n_cols} columns."
+        )
+
+    boundaries: list[tuple[float, float]] = []
+    start = 0.5
+    for size in group_sizes:
+        size = int(size)
+        end = start + size - 1
+        boundaries.append((start, end))
+        start = end + 1
+    return boundaries
 
 
 def _draw_group_annotations(
     ax,
-    fig,
     group_boundaries: list[tuple[float, float]],
     group_labels: list[str],
     fontsize: int = 12,
@@ -834,12 +876,24 @@ def _draw_group_annotations(
     inverted space.  ``ax.set_ylim`` is extended so they are visible without
     relying on ``clip_on=False`` overlays.
 
+    Group-boundary semantics:
+    - Explicit centre span mode: pass the centres of the first and last columns
+      in a group. Example: ``(0.5, 4.5)`` spans columns 1–5 exactly.
+    - Contiguous-boundary mode: pass the centre of the first column in a group
+      and the centre of the first column in the next group. Example:
+      ``(0.5, 5.5)`` means the group spans columns 1–5.
+    - 1-based inclusive column mode: pass integer-like pairs such as ``(1, 5)``
+      to mean columns 1–5. This is normalized internally to ``(0.5, 4.5)``.
+
+    The helper auto-detects contiguous-group mode whenever adjacent groups share
+    a boundary (i.e. previous ``end`` equals next ``start``).
+
     Args:
         ax:               Matplotlib Axes (must already contain a seaborn heatmap).
-        fig:              Matplotlib Figure (unused; kept for API compatibility).
-        group_boundaries: List of ``(xmin, xmax)`` column-index pairs using the
-                          same data coordinates as ``ax.hlines()``
-                          (e.g. ``(0.5, 4.5)`` spans column-centre 0 to 4).
+        group_boundaries: List of ``(xmin, xmax)`` column-centre pairs using the
+                          same data coordinates as the heatmap cells
+                          (e.g. ``(0.5, 4.5)`` spans the first through fifth
+                          columns without extending into neighboring groups).
         group_labels:     One label per group; must match len(group_boundaries).
         fontsize:         Label font size.  Default 12.
     """
@@ -865,11 +919,50 @@ def _draw_group_annotations(
 
     y_bottom, _ = ax.get_ylim()   # n_rows (bottom of inverted axis)
 
-    gap = 0.15  # inset right end so adjacent lines don't touch; left starts at exact column boundary
-    for (start, end), label in zip(group_boundaries, group_labels):
-        ax.hlines(y=y_bar, xmin=start, xmax=end - gap, color="black", linewidth=2)
+    def _looks_like_column_numbers(start: float, end: float) -> bool:
+        return (
+            np.isclose(start, round(start))
+            and np.isclose(end, round(end))
+            and start >= 1
+            and end >= 1
+        )
+
+    normalized_boundaries: list[tuple[float, float]] = []
+    for start, end in group_boundaries:
+        if _looks_like_column_numbers(start, end):
+            normalized_boundaries.append((start - 0.5, end - 0.5))
+        else:
+            normalized_boundaries.append((start, end))
+
+    single_col_half_width = 0.45
+    contiguous_mode = any(
+        np.isclose(normalized_boundaries[i][1], normalized_boundaries[i + 1][0])
+        for i in range(len(normalized_boundaries) - 1)
+    )
+
+    for (start, end), label in zip(normalized_boundaries, group_labels):
+        if end < start:
+            raise ValueError(
+                f"Each group boundary must satisfy start <= end, got {(start, end)!r}."
+            )
+
+        if contiguous_mode:
+            if np.isclose(end - start, 1.0):
+                xmin = start - single_col_half_width
+                xmax = start + single_col_half_width
+            else:
+                xmin = start
+                xmax = end - 1.0
+        elif np.isclose(start, end):
+            xmin = start - single_col_half_width
+            xmax = end + single_col_half_width
+        else:
+            xmin = start
+            xmax = end
+
+        ax.hlines(y=y_bar, xmin=xmin, xmax=xmax, color="black", linewidth=2)
         ax.text(
-            (start + end) / 2 + 0.25, y_text, label,
+            (xmin + xmax) / 2, y_text, label,
             ha="center", va="bottom",
             fontsize=fontsize, fontweight="bold",
         )
@@ -895,6 +988,7 @@ def cause_accuracy_heatmap(
     model_rename: dict[str, str] | None = None,
     # --- column grouping annotations below x-axis ---
     group_boundaries: list[tuple[float, float]] | None = None,
+    group_sizes: list[int] | None = None,
     group_labels: list[str] | None = None,
     # --- aesthetics ---
     cmap=None,
@@ -908,6 +1002,7 @@ def cause_accuracy_heatmap(
     x_rotation: int = 45,
     y_rotation: int = 0,
     show_n: bool = False,
+    insilicova_first: bool = True,
     save_path: str | None = None,
     dpi: int = 150,
 ) -> tuple:
@@ -953,11 +1048,19 @@ def cause_accuracy_heatmap(
         cause_rename:   Dict ``{original → display}`` applied to row labels.
         model_rename:   Dict ``{original → display}`` applied to column labels.
 
-        group_boundaries: List of ``(start, end)`` pairs in heatmap column-index
-                          coordinates marking model groups.  For example,
-                          ``[(0.5, 3.5), (4.5, 6.5)]`` draws a bracket above
-                          columns 1–3 and 5–6 (0-based, 0.5-offset for centering).
-                          Drawn as horizontal lines just above the heatmap (top).
+        group_boundaries: List of ``(start, end)`` pairs in heatmap column-centre
+                          coordinates marking model groups. Two conventions are
+                          accepted:
+                          1. explicit span, e.g. ``(1.5, 5.5)`` for columns 1–5
+                          2. contiguous-group boundaries, e.g. ``(1.5, 6.5)``
+                             for columns 1–5 when the next group starts at 6.5
+                          Single-column groups can be passed as ``(0.5, 0.5)``
+                          in explicit span mode or ``(0.5, 1.5)`` in contiguous
+                          mode. Group lines are drawn only over their own columns.
+        group_sizes:      Alternative to ``group_boundaries``. One integer per
+                          group giving the number of displayed model columns in
+                          that group. Example: ``group_sizes=[5, 4]`` generates
+                          spans ``[(0.5, 4.5), (5.5, 8.5)]`` automatically.
         group_labels:   One label string per entry in ``group_boundaries``.
 
         cmap:           Colormap.  Default: custom light-cream → dark-red
@@ -979,6 +1082,10 @@ def cause_accuracy_heatmap(
                         ``df[true_col]`` when ``df`` is provided, otherwise
                         from the ``"true_label"`` column of the first entry
                         in ``topk_dfs``.  Default False.
+        insilicova_first:
+                        When True (default), any model whose name contains
+                        ``"insilicova"`` is moved to the far-left side of the
+                        heatmap before plotting and grouping.
         save_path:      Save figure to this path before returning.  Supports
                         any matplotlib extension (.png, .pdf, .svg).
         dpi:            Resolution when saving.  Default 150.
@@ -1043,6 +1150,7 @@ def cause_accuracy_heatmap(
     accuracy_df = _compute_cause_accuracy_matrix(
         df=df, true_col=true_col, model_cols=model_cols,
         top_k=top_k, topk_dfs=topk_dfs, percentage=percentage,
+        insilicova_first=insilicova_first,
     )
 
     # ------------------------------------------------------------------
@@ -1126,7 +1234,7 @@ def cause_accuracy_heatmap(
     # Step 8: column grouping annotations above heatmap
     # ------------------------------------------------------------------
     if group_boundaries and group_labels:
-        _draw_group_annotations(ax, fig, group_boundaries, group_labels)
+        _draw_group_annotations(ax, group_boundaries, group_labels)
 
     # Group annotations live inside the axes (via ax.set_ylim extension), so
     # tight_layout needs no rect constraint — it lays out the full figure normally.
@@ -1158,6 +1266,7 @@ def cause_accuracy_diff_heatmap(
     model_rename: dict[str, str] | None = None,
     # --- column grouping annotations below x-axis ---
     group_boundaries: list[tuple[float, float]] | None = None,
+    group_sizes: list[int] | None = None,
     group_labels: list[str] | None = None,
     # --- aesthetics ---
     cmap=None,
@@ -1170,6 +1279,7 @@ def cause_accuracy_diff_heatmap(
     cbar_label: str | None = None,
     x_rotation: int = 45,
     y_rotation: int = 0,
+    insilicova_first: bool = True,
     save_path: str | None = None,
     dpi: int = 150,
 ) -> tuple:
@@ -1213,8 +1323,15 @@ def cause_accuracy_diff_heatmap(
                          Applied to comparison model names **and** to
                          ``baseline_col`` when ``include_baseline=True``.
 
-        group_boundaries: ``(start, end)`` column-index pairs for bracket
-                          annotations below the x-axis ticks.
+        group_boundaries: ``(start, end)`` column-centre pairs for bracket
+                          annotations above the heatmap. Supports the same
+                          explicit-span and contiguous-group conventions as
+                          :func:`cause_accuracy_heatmap`. Group lines are drawn
+                          only over their own columns.
+        group_sizes:      Alternative to ``group_boundaries``. One integer per
+                          group giving the number of displayed model columns in
+                          that group. Example: ``group_sizes=[5, 4]`` generates
+                          spans ``[(0.5, 4.5), (5.5, 8.5)]`` automatically.
         group_labels:    One string per group boundary.
 
         cmap:            Diverging colormap.  Default ``"RdBu_r"``.
@@ -1230,6 +1347,10 @@ def cause_accuracy_diff_heatmap(
                          or ``"Difference in accuracy"`` depending on ``percentage``.
         x_rotation:      X-axis tick rotation.  Default 45.
         y_rotation:      Y-axis tick rotation.  Default 0.
+        insilicova_first:
+                         When True (default), any model whose name contains
+                         ``"insilicova"`` is moved to the far-left side of the
+                         heatmap before plotting and grouping.
         save_path:       Path to save the figure.  Supports .png, .pdf, .svg.
         dpi:             Save resolution.  Default 150.
 
@@ -1294,6 +1415,7 @@ def cause_accuracy_diff_heatmap(
     full_acc = _compute_cause_accuracy_matrix(
         df=df, true_col=true_col, model_cols=all_cols,
         top_k=top_k, topk_dfs=topk_dfs, percentage=percentage,
+        insilicova_first=insilicova_first,
     )
 
     # ------------------------------------------------------------------
@@ -1325,6 +1447,9 @@ def cause_accuracy_diff_heatmap(
     if include_baseline:
         diff_df.insert(0, baseline_col, 0.0)
 
+    if group_boundaries is not None and group_sizes is not None:
+        raise ValueError("Pass only one of group_boundaries or group_sizes, not both.")
+
     # ------------------------------------------------------------------
     # Step 3: cause ordering / filtering
     # ------------------------------------------------------------------
@@ -1344,6 +1469,9 @@ def cause_accuracy_diff_heatmap(
         display_df = display_df.rename(index=cause_rename)
     if model_rename:
         display_df = display_df.rename(columns=model_rename)
+
+    if group_sizes is not None:
+        group_boundaries = _group_boundaries_from_sizes(group_sizes, len(display_df.columns))
 
     # ------------------------------------------------------------------
     # Step 5: symmetric colormap bounds centred at 0
@@ -1384,12 +1512,12 @@ def cause_accuracy_diff_heatmap(
     ax.tick_params(axis="y", rotation=y_rotation)
 
     # ------------------------------------------------------------------
-    # Step 7: column grouping annotations below x-axis
+    # Step 7: column grouping annotations above heatmap
     # ------------------------------------------------------------------
     if group_boundaries and group_labels:
-        _draw_group_annotations(ax, fig, group_boundaries, group_labels)
+        _draw_group_annotations(ax, group_boundaries, group_labels)
 
-    plt.tight_layout(rect=[0, 0.05 if group_boundaries else 0, 1, 1])
+    plt.tight_layout()
 
     if save_path is not None:
         fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
@@ -1543,3 +1671,8 @@ def confusion_heatmap(
         logger.info("Heatmap saved to %s", save_path)
 
     return fig, ax
+    if group_boundaries is not None and group_sizes is not None:
+        raise ValueError("Pass only one of group_boundaries or group_sizes, not both.")
+
+    if group_sizes is not None:
+        group_boundaries = _group_boundaries_from_sizes(group_sizes, len(display_df.columns))

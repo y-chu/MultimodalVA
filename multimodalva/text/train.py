@@ -106,6 +106,46 @@ REMOTE_MODELS: dict[str, str] = {
 }
 
 
+def _looks_like_model_dir(path: Path) -> bool:
+    """Return True when ``path`` looks like a HF-style local model directory."""
+    if not path.is_dir():
+        return False
+
+    has_config = (path / "config.json").exists()
+    has_weights = any(
+        (path / filename).exists()
+        for filename in (
+            "pytorch_model.bin",
+            "model.safetensors",
+            "tf_model.h5",
+            "model.ckpt.index",
+            "flax_model.msgpack",
+        )
+    )
+    return has_config and has_weights
+
+
+def _find_extracted_model_dir(root: Path) -> Path | None:
+    """Find the actual extracted model directory under ``root``.
+
+    Some archives unpack directly into a single model directory, while others
+    add an extra wrapper directory and place the HuggingFace files one level
+    deeper. We return the shallowest directory that contains both
+    ``config.json`` and model weights.
+    """
+    if _looks_like_model_dir(root):
+        return root
+
+    candidates = sorted(
+        (
+            path for path in root.rglob("*")
+            if _looks_like_model_dir(path)
+        ),
+        key=lambda p: (len(p.relative_to(root).parts), str(p)),
+    )
+    return candidates[0] if candidates else None
+
+
 def download_model(key: str, cache_dir: str | Path | None = None) -> str:
     """Download and extract a remote model checkpoint from REMOTE_MODELS.
 
@@ -143,6 +183,11 @@ def download_model(key: str, cache_dir: str | Path | None = None) -> str:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
 
+    existing_model_dir = _find_extracted_model_dir(cache_dir)
+    if existing_model_dir is not None:
+        logger.info("Reusing cached model at: %s", existing_model_dir)
+        return str(existing_model_dir)
+
     archive_path = cache_dir / archive_name
 
     logger.info("Downloading %s ...", url)
@@ -154,9 +199,12 @@ def download_model(key: str, cache_dir: str | Path | None = None) -> str:
         tar.extractall(cache_dir)
     archive_path.unlink()  # remove archive after extraction
 
-    # The archive extracts to a single subdirectory; find it.
-    subdirs = [p for p in cache_dir.iterdir() if p.is_dir()]
-    model_dir = subdirs[0] if len(subdirs) == 1 else cache_dir
+    model_dir = _find_extracted_model_dir(cache_dir)
+    if model_dir is None:
+        raise FileNotFoundError(
+            "Downloaded archive extracted successfully, but no HuggingFace-style "
+            f"model directory was found under {cache_dir}."
+        )
 
     logger.info("Model ready at: %s", model_dir)
     return str(model_dir)

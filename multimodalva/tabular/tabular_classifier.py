@@ -93,6 +93,7 @@ class TabularClassifier:
         top_k: int = 3,
         n_jobs: int = -1,
         use_gpu: bool | None = None,
+        search_space_profile: str = "auto",
     ) -> dict:
         """Run the full tabular classification pipeline.
 
@@ -117,10 +118,16 @@ class TabularClassifier:
             hyperparams:      Fixed hyperparameter dict. Ignored when use_optimize=True.
             use_optimize:     Run Optuna HPO before final training. Default False.
             n_trials:         Optuna trial count (use_optimize=True only). Default 50.
-            optimize_metric:  Metric to maximise during HPO. Default "accuracy".
-                              Options: "accuracy", "f1_macro", "f1_weighted", "csmf_accuracy".
+            optimize_metric:  Metric to optimise during HPO. Default "accuracy".
+                              Options: "accuracy", "balanced_accuracy",
+                              "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss".
             search_space:     Custom Optuna search space dict (use_optimize=True only).
-                              Merged over DEFAULT_SEARCH_SPACES[model_name].
+                              Merged over the adaptive default space chosen from
+                              X_train.shape.
+            search_space_profile:
+                              One of "auto", "small", "balanced", "wide", "large".
+                              "auto" infers a profile from the prepared feature
+                              matrix shape before HPO.
             top_k:            Number of top classes in the topk output. Default 3.
 
         Returns:
@@ -175,6 +182,7 @@ class TabularClassifier:
                 n_trials=n_trials,
                 metric=optimize_metric,
                 search_space=search_space,
+                search_space_profile=search_space_profile,
                 random_state=random_state,
                 n_jobs=n_jobs,
                 use_gpu=use_gpu,

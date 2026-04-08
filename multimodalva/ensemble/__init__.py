@@ -1,58 +1,12 @@
-"""
-Ensemble classification subpackage — combines text and tabular modalities.
+"""Ensemble classification subpackage with lazy imports.
 
-Four fusion strategies are available, ranging from shallow data combination
-to deep learnable ensembles:
-
-    1. Data-level fusion    (DataFusionClassifier)
-       Convert tabular features to natural language, concatenate with the free-text
-       narrative, and fine-tune a long-context language model (Longformer, BigBird,
-       Clinical Longformer) on the combined text.  One unified model, no explicit
-       ensemble; the LM learns cross-modal interactions in the attention layers.
-
-    2. Feature-level fusion (FeatureFusionClassifier)
-       Feed raw text and tabular features jointly to AutoGluon's MultiModalPredictor
-       (AutoMM), which handles tokenisation, embedding, and fusion internally.
-       Best when you want a strong automated baseline with minimal setup.
-
-    3. Decision-level fusion — soft voting  (SoftVotingClassifier)
-       Train a set of text base-models and a set of tabular base-models independently
-       on the full training set.  At inference time, average (or weight-average) the
-       predicted probability distributions from all base-models and take the argmax.
-       Fast and interpretable; no meta-learner training required.
-
-    4. Decision-level fusion — stacking / super learner  (StackingClassifier)
-       Train base-models with k-fold cross-validation and collect out-of-fold (OOF)
-       probability predictions.  Concatenate OOF predictions into a meta-feature matrix
-       and train a meta-learner (e.g. logistic regression, LightGBM) to map them to
-       final class labels.  Final base-models are retrained on the full training set;
-       test predictions pass through the same meta-learner.
-
-Usage quick-start::
-
-    # Option A — use the unified wrapper (recommended for most users)
-    from multimodalva.ensemble import EnsembleClassifier
-
-    clf = EnsembleClassifier(method="soft_voting", output_dir="runs/ensemble")
-    results = clf.run(df, text_col="narrative", feature_cols=[...], label_col="cause")
-
-    # Option B — use a specific classifier directly (more control)
-    from multimodalva.ensemble import SoftVotingClassifier
-
-    clf = SoftVotingClassifier(
-        text_models=[{"model_name": "bert-base-uncased", "hyperparams": {...}}],
-        tabular_models=[{"model_name": "lightgbm", "hyperparams": {...}}],
-        output_dir="runs/ensemble/voting",
-    )
-    results = clf.run(df, text_col="narrative", feature_cols=[...], label_col="cause")
+This keeps lightweight entry points, such as synthetic voting demos, from
+pulling in transformer and AutoMM dependencies until they are actually used.
 """
 
-from .data_fusion_classifier import DataFusionClassifier
-from .data_fusion import qdesc_feature_overlap
-from .feature_fusion import FeatureFusionClassifier
-from .voting import SoftVotingClassifier
-from .stacking import StackingClassifier
-from .ensemble_classifier import EnsembleClassifier
+from __future__ import annotations
+
+from importlib import import_module
 
 __all__ = [
     "EnsembleClassifier",
@@ -62,3 +16,29 @@ __all__ = [
     "StackingClassifier",
     "qdesc_feature_overlap",
 ]
+
+
+_EXPORTS = {
+    "EnsembleClassifier": ("multimodalva.ensemble.ensemble_classifier", "EnsembleClassifier"),
+    "DataFusionClassifier": ("multimodalva.ensemble.data_fusion_classifier", "DataFusionClassifier"),
+    "FeatureFusionClassifier": ("multimodalva.ensemble.feature_fusion", "FeatureFusionClassifier"),
+    "SoftVotingClassifier": ("multimodalva.ensemble.voting", "SoftVotingClassifier"),
+    "StackingClassifier": ("multimodalva.ensemble.stacking", "StackingClassifier"),
+    "qdesc_feature_overlap": ("multimodalva.ensemble.data_fusion", "qdesc_feature_overlap"),
+}
+
+
+def __getattr__(name: str):
+    """Resolve exported symbols on first access."""
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _EXPORTS[name]
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose the lazy exports in tab completion and help()."""
+    return sorted(set(globals()) | set(__all__))

@@ -65,13 +65,13 @@ HEATMAP_SEQ: list[str] = [
 #          cause_accuracy_diff_heatmap().
 
 HEATMAP_DIV: list[str] = [
-    "#3B4CC0",  # strong blue  (negative extreme)
-    "#7785D9",
-    "#B0B8E6",
-    "#E0E0E0",  # neutral grey (zero / midpoint)
-    "#F2A7A0",
-    "#E16462",
-    "#B40426",  # strong red   (positive extreme)
+    "#053061",  # deep navy    (negative extreme)
+    "#2166AC",
+    "#67A9CF",
+    "#F7F7F7",  # near-white   (zero / midpoint)
+    "#FDDBC7",
+    "#EF8A62",
+    "#B2182B",  # deep red     (positive extreme)
 ]
 
 # ---------------------------------------------------------------------------

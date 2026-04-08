@@ -350,6 +350,30 @@ class EnsembleClassifier:
         self._require_method("stacking", "train_meta_learner_stage")
         return self.classifier.train_meta_learner_stage(**kwargs)
 
+    def train_class_voter_stage(self, **kwargs) -> dict:
+        """Stage 2 alternative for stacking: learn class-aware voting weights.
+
+        Requires ``method="stacking"``. Delegates to
+        :meth:`~multimodalva.ensemble.stacking.StackingClassifier.train_class_voter_stage`.
+
+        Uses the Stage 1 OOF predictions to learn a per-model × per-class weight
+        matrix for an interpretable class-aware voter.
+
+        Args:
+            **kwargs: Forwarded to
+                      :meth:`~multimodalva.ensemble.stacking.StackingClassifier.train_class_voter_stage`.
+                      Key options:
+                      metric (str), alpha (float), shrinkage (float).
+
+        Returns:
+            dict with class-voter artifacts and metadata.
+
+        Raises:
+            ValueError: If ``method`` is not ``"stacking"``.
+        """
+        self._require_method("stacking", "train_class_voter_stage")
+        return self.classifier.train_class_voter_stage(**kwargs)
+
     def predict_test(self, **kwargs):
         """Stage 3 of stacking: predict the test set via the trained meta-learner.
 
@@ -376,6 +400,33 @@ class EnsembleClassifier:
         """
         self._require_method("stacking", "predict_test")
         result = self.classifier.predict_test(**kwargs)
+        self.predictions = result
+        return result
+
+    def predict_test_class_voter(self, **kwargs):
+        """Stage 3 alternative for stacking: predict test data via class-aware voting.
+
+        Requires ``method="stacking"``. Delegates to
+        :meth:`~multimodalva.ensemble.stacking.StackingClassifier.predict_test_class_voter`.
+
+        Reloads final base models and the saved class-aware weight matrix from
+        disk if needed, then combines base-model probabilities with the learned
+        per-class weights.
+
+        Args:
+            **kwargs: Forwarded to
+                      :meth:`~multimodalva.ensemble.stacking.StackingClassifier.predict_test_class_voter`.
+                      Key options:
+                      top_k (int), batch_size (int).
+
+        Returns:
+            :class:`~multimodalva.utils.types.PredictionResult`.
+
+        Raises:
+            ValueError: If ``method`` is not ``"stacking"``.
+        """
+        self._require_method("stacking", "predict_test_class_voter")
+        result = self.classifier.predict_test_class_voter(**kwargs)
         self.predictions = result
         return result
 

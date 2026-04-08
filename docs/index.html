@@ -315,21 +315,12 @@ pip install -e ".[dev]"</code></pre>
 
     <a class="anchor" id="install-deps"></a>
     <h3>Dependencies</h3>
-    <p>Core dependencies are installed automatically.  Optional extras:</p>
-    <pre><code># Gradient boosting backends
-pip install lightgbm xgboost catboost
-
-# LoRA fine-tuning
-pip install peft
-
-# Feature-fusion ensemble (AutoGluon)
-pip install autogluon.multimodal
-
-# Distributed HPO (Ray Tune)
-pip install "ray[tune]" optuna-integration
-
-# Visualization
-pip install matplotlib seaborn</code></pre>
+    <p>Core dependencies are installed automatically. Optional extras:</p>
+    <pre><code>pip install "multimodalva[tabular]"         # LightGBM / XGBoost / CatBoost
+pip install "multimodalva[lora]"            # PEFT / LoRA
+pip install "multimodalva[feature_fusion]"  # AutoGluon AutoMM
+pip install "multimodalva[insilicova]"      # PyInSilicoVA support
+pip install "multimodalva[all]"             # all Python-3.12-compatible extras</code></pre>
 
     <table>
       <thead>
@@ -339,7 +330,8 @@ pip install matplotlib seaborn</code></pre>
         <tr><td><code>[tabular]</code></td><td>lightgbm, xgboost, catboost</td><td>Gradient boosting models</td></tr>
         <tr><td><code>[lora]</code></td><td>peft ≥ 0.6</td><td><code>use_lora=True</code> in text pipeline</td></tr>
         <tr><td><code>[feature_fusion]</code></td><td>autogluon.multimodal ≥ 1.0</td><td><code>FeatureFusionClassifier</code></td></tr>
-        <tr><td><code>[ray]</code></td><td>ray[tune], optuna-integration</td><td><code>optimize_ray()</code></td></tr>
+        <tr><td><em>core dependency</em></td><td>ray[tune], optuna-integration</td><td><code>optimize_ray()</code> for text and tabular HPO</td></tr>
+        <tr><td><code>[insilicova]</code></td><td>pyinsilicova</td><td>InSilicoVA base model inside stacking</td></tr>
         <tr><td><code>[dev]</code></td><td>pytest, pytest-cov</td><td>Running tests</td></tr>
       </tbody>
     </table>
@@ -355,18 +347,15 @@ pip install matplotlib seaborn</code></pre>
     <h3>Text classification</h3>
     <pre><code>from multimodalva.text import TextClassifier
 
-clf = TextClassifier(model_name="emilyalsentzer/Bio_ClinicalBERT",
-                     output_dir="runs/text")
+clf = TextClassifier(model_name="bioclinicalbert", output_dir="runs/text")
 results = clf.run(
     df=df,
     text_col="narrative",
     label_col="cause",
-    hyperparams={"epochs": 5, "batch_size": 16, "learning_rate": 2e-5},
+    hyperparams={"epochs": 3, "batch_size": 16, "learning_rate": 2e-5},
 )
-# Inspect results
 print(results["predictions"].top1.head())
-print(results["predictions"].topk.head())
-print(results["label2id"])</code></pre>
+</code></pre>
 
     <h3>Tabular classification</h3>
     <pre><code>from multimodalva.tabular import TabularClassifier
@@ -374,12 +363,13 @@ print(results["label2id"])</code></pre>
 clf = TabularClassifier(model_name="lightgbm", output_dir="runs/tabular")
 results = clf.run(
     df=df,
-    feature_cols=["age", "sex", "symptom_fever", ...],
+    feature_cols=["age", "sex", "fever", "cough"],
     label_col="cause",
     use_optimize=True,
-    n_trials=30,
+    n_trials=20,
     optimize_metric="f1_macro",
 )
+print(results["best_hyperparams"])
 print(results["predictions"].top1.head())</code></pre>
 
     <h3>Ensemble — soft voting</h3>
@@ -388,27 +378,36 @@ print(results["predictions"].top1.head())</code></pre>
 clf = EnsembleClassifier(
     method="soft_voting",
     output_dir="runs/ensemble",
-    text_models=[{"model_name": "emilyalsentzer/Bio_ClinicalBERT",
-                  "hyperparams": {"epochs": 5, "batch_size": 16}}],
-    tabular_models=[{"model_name": "lightgbm",
-                     "hyperparams": {"n_estimators": 300}}],
+    text_models=[{"model_name": "bioclinicalbert"}],
+    tabular_models=[{"model_name": "lightgbm"}],
 )
-results = clf.run(df=df, text_col="narrative",
-                  feature_cols=[...], label_col="cause")</code></pre>
+results = clf.run(
+    df=df,
+    text_col="narrative",
+    feature_cols=["age", "sex", "fever", "cough"],
+    label_col="cause",
+)</code></pre>
 
     <h3>Ensemble — stacking (stage-wise)</h3>
     <pre><code>clf = EnsembleClassifier(
     method="stacking",
-    output_dir="runs/ensemble",
-    text_models=[{"model_name": "emilyalsentzer/Bio_ClinicalBERT"}],
+    output_dir="runs/stacking",
+    text_models=[{"model_name": "bioclinicalbert"}],
     tabular_models=[{"model_name": "lightgbm"}],
     n_folds=5,
 )
 
-clf.train_base_models(df=df, label_col="cause",
-                      text_col="narrative", feature_cols=[...])
+clf.train_base_models(
+    df=df,
+    text_col="narrative",
+    feature_cols=["age", "sex", "fever", "cough"],
+    label_col="cause",
+)
 clf.train_meta_learner_stage(meta_cv_folds=3)
-predictions = clf.predict_test()</code></pre>
+meta_pred = clf.predict_test()
+
+clf.train_class_voter_stage(metric="recall", alpha=1.0, shrinkage=0.25)
+vote_pred = clf.predict_test_class_voter()</code></pre>
   </section>
 
   <hr>
@@ -612,7 +611,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
     <a class="anchor" id="text-train"></a>
     <h3>train()</h3>
     <div class="sig">
-      <span class="fn-name">train</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">hyperparams=None</span>, <span class="param">val_size=0.1</span>, <span class="param">use_lora=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=None</span>, <span class="param">resume=True</span>, <span class="param">cleanup_checkpoints=False</span>, <span class="param">use_fast=False</span>) → <span class="returns">(trainer, tokenizer, metadata)</span>
+      <span class="fn-name">train</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">hyperparams=None</span>, <span class="param">val_size=0.1</span>, <span class="param">use_lora=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=None</span>, <span class="param">resume=True</span>, <span class="param">cleanup_checkpoints=False</span>, <span class="param">use_fast=False</span>, <span class="param">eval_batch_size=4</span>) → <span class="returns">(trainer, tokenizer, metadata)</span>
     </div>
     <p>Fine-tune a BERT-family model for multiclass classification.</p>
     <p>Saves the following to output_dir: - Fine-tuned model weights and config - Tokenizer - label2id.json / id2label.json - hyperparams.json - training_metadata.json  (full log history + eval metrics)</p>
@@ -628,14 +627,15 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
       <tr><td><code>val_size</code></td><td>Fraction of train_dataset to hold out as a validation split for in-training evaluation (loss monitoring, best-checkpoint selection, early stopping). Stratified by class. Default 0.1. Set to None to train on all training data with no in-training eval.</td></tr>
       <tr><td><code>use_lora</code></td><td>Apply LoRA adapters during training. Default False.</td></tr>
       <tr><td><code>gradient_checkpointing</code></td><td>Enable gradient checkpointing to reduce GPU memory. Default False.</td></tr>
-      <tr><td><code>early_stopping_patience</code></td><td>Stop training if eval metric does not improve for this many epochs. Only active when eval_dataset is provided. Default None (disabled).</td></tr>
+      <tr><td><code>early_stopping_patience</code></td><td>Stop training if eval_macro_f1 does not improve for this many epochs. Active whenever val_size &gt; 0. Default None (disabled).</td></tr>
       <tr><td><code>resume</code></td><td>Resume training from the latest checkpoint in output_dir. Default True.</td></tr>
       <tr><td><code>cleanup_checkpoints</code></td><td>Delete intermediate <code>checkpoint-*/</code> subdirectories from output_dir after training completes successfully. These checkpoints are only needed to resume an interrupted run; once training is done they consume significant disk space (equal to the full model size per checkpoint, up to <code>save_total_limit=2</code>).  The final model weights saved directly in output_dir are unaffected.  Default False.</td></tr>
       <tr><td><code>use_fast</code></td><td>Use the HuggingFace fast (Rust) tokenizer. Default False. Set False for models that lack a fast tokenizer (e.g. BlueBERT) to avoid a falling-back warning.</td></tr>
+      <tr><td><code>eval_batch_size</code></td><td>Per-device batch size used exclusively for eval forward passes. Decoupled from training batch_size to prevent eval OOM when training uses large batches. Default 4. Only relevant when val_size &gt; 0.</td></tr>
     </table>
     <table>
       <tr><th>Returns</th><th>Description</th></tr>
-      <tr><td><code>trainer</code></td><td>HuggingFace Trainer with the fine-tuned model at trainer.model. When load_best_model_at_end=True (i.e. val_size is set), trainer.model holds the best checkpoint rather than the final epoch's weights.</td></tr>
+      <tr><td><code>trainer</code></td><td>HuggingFace Trainer with the fine-tuned model at trainer.model. When val_size &gt; 0, trainer.model holds the best checkpoint (by eval_macro_f1) rather than the final epoch's weights.</td></tr>
       <tr><td><code>tokenizer</code></td><td>Tokenizer matching the model, ready for DataCollatorWithPadding.</td></tr>
       <tr><td><code>metadata</code></td><td>Dict with keys output_dir, model_name, hyperparams, label2id, id2label, log_history. Contains everything needed for in-memory prediction without reloading from disk.</td></tr>
     </table>
@@ -707,7 +707,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
 
     <h4>optimize_ray()</h4>
     <div class="sig">
-      <span class="fn-name">optimize_ray</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=None</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">use_lora=True</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=2</span>, <span class="param">ray_address=None</span>, <span class="param">num_gpus_per_trial=0.0</span>, <span class="param">num_cpus_per_trial=4</span>, <span class="param">max_concurrent_trials=None</span>, <span class="param">resume=True</span>, <span class="param">experiment_name=None</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">use_asha=False</span>, <span class="param">use_fast=False</span>) → <span class="returns">(dict, tune.ResultGrid)</span>
+      <span class="fn-name">optimize_ray</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=None</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">use_lora=True</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=2</span>, <span class="param">ray_address=None</span>, <span class="param">num_gpus_per_trial=0.0</span>, <span class="param">num_cpus_per_trial=4</span>, <span class="param">max_concurrent_trials=None</span>, <span class="param">resume=True</span>, <span class="param">experiment_name=None</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">use_asha=False</span>, <span class="param">use_fast=False</span>) → <span class="returns">(dict, Any)</span>
     </div>
     <p>Distributed HPO using Ray Tune.</p>
     <p>Extra args vs the original signature:</p>
@@ -730,7 +730,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
       <tr><td><code>"biobert"</code></td><td>dmis-lab/biobert-base-cased-v1.2</td><td></td></tr>
       <tr><td><code>"pubmedbert"</code></td><td>microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext</td><td></td></tr>
       <tr><td><code>"roberta-base"</code></td><td>roberta-base</td><td></td></tr>
-      <tr><td><code>"roberta-pm"</code></td><td>allenai/roberta-pm (remote download)</td><td>Download via <code>download_model("roberta-pm")</code></td></tr>
+      <tr><td><code>"roberta-pm"</code></td><td>Facebook Bio-LM RoBERTa-base-PM-M3-Voc-distill (downloaded archive)</td><td>Resolved automatically via <code>download_model("roberta-pm")</code></td></tr>
       <tr><td><code>"longformer-base"</code></td><td>allenai/longformer-base-4096</td><td>Long context (4096 tokens)</td></tr>
       <tr><td><code>"bigbird-roberta"</code></td><td>google/bigbird-roberta-base</td><td>Long context (4096 tokens)</td></tr>
     </table>
@@ -775,7 +775,7 @@ results = clf.run(
 
     <h4>.run()</h4>
     <div class="sig">
-        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">feature_cols</span>, <span class="param">label_col</span>, <span class="param">test_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">stratify=True</span>, <span class="param">cat_cols=None</span>, <span class="param">num_cols=None</span>, <span class="param">drop_missing_label=True</span>, <span class="param">encode_categoricals='ordinal'</span>, <span class="param">scale_numeric=False</span>, <span class="param">hyperparams=None</span>, <span class="param">use_optimize=False</span>, <span class="param">n_trials=50</span>, <span class="param">optimize_metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">top_k=3</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>) → <span class="returns">dict</span>
+        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">feature_cols</span>, <span class="param">label_col</span>, <span class="param">test_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">stratify=True</span>, <span class="param">cat_cols=None</span>, <span class="param">num_cols=None</span>, <span class="param">drop_missing_label=True</span>, <span class="param">encode_categoricals='ordinal'</span>, <span class="param">scale_numeric=False</span>, <span class="param">hyperparams=None</span>, <span class="param">use_optimize=False</span>, <span class="param">n_trials=50</span>, <span class="param">optimize_metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">top_k=3</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">dict</span>
     </div>
     <p>Run the full tabular classification pipeline.</p>
     <p>Steps executed in order: 1. split()           — stratified train/test split 2. prepare_dataset() — imputation, encoding, scaling; label encoding 3. optimize()        — (optional) Optuna HPO on internal val split 4. train()           — fit model with best/given hyperparams 5. predict()         — generate labels and probabilities on test set</p>
@@ -793,8 +793,9 @@ results = clf.run(
       <tr><td><code>hyperparams</code></td><td>Fixed hyperparameter dict. Ignored when use_optimize=True.</td></tr>
       <tr><td><code>use_optimize</code></td><td>Run Optuna HPO before final training. Default False.</td></tr>
       <tr><td><code>n_trials</code></td><td>Optuna trial count (use_optimize=True only). Default 50.</td></tr>
-      <tr><td><code>optimize_metric</code></td><td>Metric to maximise during HPO. Default "accuracy". Options: "accuracy", "f1_macro", "f1_weighted", "csmf_accuracy".</td></tr>
-      <tr><td><code>search_space</code></td><td>Custom Optuna search space dict (use_optimize=True only). Merged over DEFAULT_SEARCH_SPACES[model_name].</td></tr>
+      <tr><td><code>optimize_metric</code></td><td>Metric to optimise during HPO. Default "accuracy". Options: "accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss".</td></tr>
+      <tr><td><code>search_space</code></td><td>Custom Optuna search space dict (use_optimize=True only). Merged over the adaptive default space chosen from X_train.shape.</td></tr>
+      <tr><td><code>search_space_profile</code></td><td>One of "auto", "small", "balanced", "wide", "large". "auto" infers a profile from the prepared feature matrix shape before HPO.</td></tr>
       <tr><td><code>top_k</code></td><td>Number of top classes in the topk output. Default 3.</td></tr>
     </table>
     <p><strong>Returns</strong> <code>dict with keys</code>: "predictions":      PredictionResult(top1, full, topk, id2label) "train_metadata":   metadata dict from train() "best_hyperparams": hyperparams used for final training "label2id":         label encoding map "id2label":         reverse label encoding map "output_dir":       Path to the root output directory</p>
@@ -895,7 +896,7 @@ results = clf.run(
 
     <h4>optimize()</h4>
     <div class="sig">
-      <span class="fn-name">optimize</span>(<span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=50</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">study_name='tabular_hpo'</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=False</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>) → <span class="returns">(best_hyperparams, study)</span>
+      <span class="fn-name">optimize</span>(<span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=50</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">study_name='tabular_hpo'</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=False</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">(best_hyperparams, study)</span>
     </div>
     <p>Run Optuna hyperparameter search for a tabular model.</p>
     <p>Internally splits (X_train, y_train) into opt-train / opt-val using a stratified split. Each trial trains on opt-train and is scored on opt-val. The held-out test set from prepare_dataset() is never used here.</p>
@@ -909,8 +910,9 @@ results = clf.run(
       <tr><td><code>model_name</code></td><td>Model alias — one of SUPPORTED_MODELS keys.</td></tr>
       <tr><td><code>output_dir</code></td><td>Root directory for trial outputs and study database.</td></tr>
       <tr><td><code>n_trials</code></td><td>Total Optuna trials. Default 50.</td></tr>
-      <tr><td><code>metric</code></td><td>Metric to maximise — "accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy". Default "accuracy". Use "balanced_accuracy", "csmf_accuracy", or "f1_macro" for imbalanced VA data.</td></tr>
-      <tr><td><code>search_space</code></td><td>Custom search space dict. Merged over DEFAULT_SEARCH_SPACES[model_name].</td></tr>
+      <tr><td><code>metric</code></td><td>Metric to optimise — "accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", or "log_loss". Default "accuracy". Use "balanced_accuracy", "csmf_accuracy", or "f1_macro" for imbalanced VA data.</td></tr>
+      <tr><td><code>search_space</code></td><td>Custom search space dict. Merged over the adaptive default search space selected for this dataset.</td></tr>
+      <tr><td><code>search_space_profile</code></td><td>One of "auto", "small", "balanced", "wide", "large". "auto" infers a profile from X_train.shape.</td></tr>
       <tr><td><code>val_size</code></td><td>Fraction of X_train for trial evaluation. Default 0.2.</td></tr>
       <tr><td><code>random_state</code></td><td>Seed for stratified split and Optuna sampler. Default 42.</td></tr>
       <tr><td><code>study_name</code></td><td>Optuna study name. Default "tabular_hpo".</td></tr>
@@ -932,7 +934,7 @@ results = clf.run(
 
     <h4>optimize_ray()</h4>
     <div class="sig">
-      <span class="fn-name">optimize_ray</span>(<span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=50</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">ray_address=None</span>, <span class="param">num_gpus_per_trial=0.0</span>, <span class="param">num_cpus_per_trial=4</span>, <span class="param">max_concurrent_trials=None</span>, <span class="param">resume=True</span>, <span class="param">experiment_name=None</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>) → <span class="returns">(best_hyperparams, results)</span>
+      <span class="fn-name">optimize_ray</span>(<span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=50</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">ray_address=None</span>, <span class="param">num_gpus_per_trial=0.0</span>, <span class="param">num_cpus_per_trial=4</span>, <span class="param">max_concurrent_trials=None</span>, <span class="param">resume=True</span>, <span class="param">experiment_name=None</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">(best_hyperparams, results)</span>
     </div>
     <p>Run distributed HPO with Ray Tune across multiple CPUs/GPUs or cluster nodes.</p>
     <p>Mirrors the interface of :func:`optimize` (Optuna backend) but executes trials **concurrently** across all available CPU/GPU resources using the Ray distributed runtime.</p>
@@ -956,8 +958,9 @@ results = clf.run(
       <tr><td><code>model_name</code></td><td>Model alias — one of SUPPORTED_MODELS keys.</td></tr>
       <tr><td><code>output_dir</code></td><td>Root directory for all Ray Tune artifacts.  Use a shared filesystem path for multi-node clusters.</td></tr>
       <tr><td><code>n_trials</code></td><td>Total number of trials. Default 50.</td></tr>
-      <tr><td><code>metric</code></td><td>Metric to maximise — <code>"accuracy"</code>, <code>"balanced_accuracy"</code>, <code>"f1_macro"</code>, <code>"f1_weighted"</code>, <code>"csmf_accuracy"</code>. Default <code>"accuracy"</code>.</td></tr>
-      <tr><td><code>search_space</code></td><td>Custom search space dict (same format as :func:`optimize`). Merged over <code>DEFAULT_SEARCH_SPACES[model_name]</code>.</td></tr>
+      <tr><td><code>metric</code></td><td>Metric to optimise — <code>"accuracy"</code>, <code>"balanced_accuracy"</code>, <code>"f1_macro"</code>, <code>"f1_weighted"</code>, <code>"csmf_accuracy"</code>, or <code>"log_loss"</code>. Default <code>"accuracy"</code>.</td></tr>
+      <tr><td><code>search_space</code></td><td>Custom search space dict (same format as :func:`optimize`). Merged over the adaptive default search space selected for this dataset.</td></tr>
+      <tr><td><code>search_space_profile</code></td><td>One of "auto", "small", "balanced", "wide", "large". "auto" infers a profile from X_train.shape.</td></tr>
       <tr><td><code>val_size</code></td><td>Fraction of X_train held out for trial evaluation. Default 0.2.</td></tr>
       <tr><td><code>random_state</code></td><td>Seed for stratified split and OptunaSearch sampler. Default 42.</td></tr>
       <tr><td><code>n_jobs</code></td><td>CPU parallelism *within* each trial.  Default -1 (all cores), but automatically capped to <code>num_cpus_per_trial</code> when running in parallel to prevent CPU contention.</td></tr>
@@ -1085,6 +1088,23 @@ results = clf.run(
       <tr><td><code>ValueError</code></td><td>If <code>method</code> is not <code>"stacking"</code>.</td></tr>
     </table>
 
+    <h4>.train_class_voter_stage()</h4>
+    <div class="sig">
+        <span class="fn-name">train_class_voter_stage</span>(<span class="param">**kwargs</span>) → <span class="returns">dict</span>
+    </div>
+    <p>Stage 2 alternative for stacking: learn class-aware voting weights.</p>
+    <p>Requires <code>method="stacking"</code>. Delegates to :meth:`~multimodalva.ensemble.stacking.StackingClassifier.train_class_voter_stage`.</p>
+    <p>Uses the Stage 1 OOF predictions to learn a per-model × per-class weight matrix for an interpretable class-aware voter.</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>**kwargs</code></td><td>Forwarded to :meth:`~multimodalva.ensemble.stacking.StackingClassifier.train_class_voter_stage`. Key options: metric (str), alpha (float), shrinkage (float).</td></tr>
+    </table>
+    <p><strong>Returns:</strong> dict with class-voter artifacts and metadata.</p>
+    <table>
+      <tr><th>Raises</th><th>Description</th></tr>
+      <tr><td><code>ValueError</code></td><td>If <code>method</code> is not <code>"stacking"</code>.</td></tr>
+    </table>
+
     <h4>.predict_test()</h4>
     <div class="sig">
         <span class="fn-name">predict_test</span>(<span class="param">**kwargs</span>)
@@ -1096,6 +1116,23 @@ results = clf.run(
     <table>
       <tr><th>Parameter</th><th>Description</th></tr>
       <tr><td><code>**kwargs</code></td><td>Forwarded to :meth:`~multimodalva.ensemble.stacking.StackingClassifier.predict_test`. Key options: top_k (int), batch_size (int).</td></tr>
+    </table>
+    <p><strong>Returns:</strong> class:`~multimodalva.utils.types.PredictionResult`.</p>
+    <table>
+      <tr><th>Raises</th><th>Description</th></tr>
+      <tr><td><code>ValueError</code></td><td>If <code>method</code> is not <code>"stacking"</code>.</td></tr>
+    </table>
+
+    <h4>.predict_test_class_voter()</h4>
+    <div class="sig">
+        <span class="fn-name">predict_test_class_voter</span>(<span class="param">**kwargs</span>)
+    </div>
+    <p>Stage 3 alternative for stacking: predict test data via class-aware voting.</p>
+    <p>Requires <code>method="stacking"</code>. Delegates to :meth:`~multimodalva.ensemble.stacking.StackingClassifier.predict_test_class_voter`.</p>
+    <p>Reloads final base models and the saved class-aware weight matrix from disk if needed, then combines base-model probabilities with the learned per-class weights.</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>**kwargs</code></td><td>Forwarded to :meth:`~multimodalva.ensemble.stacking.StackingClassifier.predict_test_class_voter`. Key options: top_k (int), batch_size (int).</td></tr>
     </table>
     <p><strong>Returns:</strong> class:`~multimodalva.utils.types.PredictionResult`.</p>
     <table>
@@ -1389,20 +1426,38 @@ proba = predictor.predict_proba(new_df)</code></pre>
 
     <h4>.train_meta_learner_stage()</h4>
     <div class="sig">
-        <span class="fn-name">train_meta_learner_stage</span>(<span class="param">meta_learners=None</span>, <span class="param">metric=None</span>, <span class="param">meta_cv_folds=3</span>, <span class="param">random_state=42</span>, <span class="param">n_jobs=-1</span>) → <span class="returns">dict</span>
+        <span class="fn-name">train_meta_learner_stage</span>(<span class="param">meta_learners=None</span>, <span class="param">metric=None</span>, <span class="param">meta_cv_folds=3</span>, <span class="param">random_state=42</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_optimize=False</span>, <span class="param">n_trials=30</span>, <span class="param">search_space=None</span>) → <span class="returns">dict</span>
     </div>
     <p>Stage 2: train meta-learner candidates and select the best.</p>
     <p>Can be called after <code>train_base_models()</code> in the same session, or in a fresh session (OOF data loaded automatically from disk).</p>
-    <p>When multiple meta-learner specs are provided, each is scored via stratified <code>meta_cv_folds</code>-fold CV on the OOF meta-features.  The highest-scoring model is fitted on all OOF data and saved.</p>
+    <p>**No data leakage guarantee:** this stage uses only the OOF meta-feature matrix (<code>oof_meta_X</code>) and OOF labels (<code>oof_y</code>).  Test data is never accessed here, whether Optuna search is enabled or not.</p>
+    <p>**Fixed-spec selection (default, <code>use_optimize=False</code>):** When multiple meta-learner specs are provided, each is scored via stratified <code>meta_cv_folds</code>-fold CV on the OOF meta-features.  The highest-scoring model is fitted on all OOF data and saved.</p>
+    <p>**Optuna HP search (<code>use_optimize=True</code>):** Exactly one meta-learner spec must be provided (the model type to search).  Optuna runs <code>n_trials</code> trials, each scored via stratified <code>meta_cv_folds</code>-fold CV on the OOF meta-features.  The best hyperparameters are used to fit the final meta-learner on all OOF data. This is a single round of selection — no two-stage leakage risk.</p>
     <table>
       <tr><th>Parameter</th><th>Description</th></tr>
       <tr><td><code>meta_learners</code></td><td>Override <code>self.meta_learner_specs</code>.  One dict or a list of dicts.  <code>None</code> uses the specs from <code>__init__</code>.</td></tr>
       <tr><td><code>metric</code></td><td>Selection metric.  Default: <code>self.meta_select_metric</code> (<code>f1_macro</code> unless overridden at init).</td></tr>
-      <tr><td><code>meta_cv_folds</code></td><td>CV folds for meta-learner selection. Default 3.</td></tr>
+      <tr><td><code>meta_cv_folds</code></td><td>CV folds for meta-learner scoring. Default 3.</td></tr>
       <tr><td><code>random_state</code></td><td>Seed. Default 42.</td></tr>
       <tr><td><code>n_jobs</code></td><td>CPU parallelism for meta-learner instantiation.</td></tr>
+      <tr><td><code>use_optimize</code></td><td>Run Optuna HP search instead of fixed-spec selection.  Requires exactly one spec.  Default <code>False</code>.</td></tr>
+      <tr><td><code>n_trials</code></td><td>Number of Optuna trials when <code>use_optimize=True</code>. Default 30.</td></tr>
+      <tr><td><code>search_space</code></td><td>HP search space dict for Optuna.  Keys are param names; values are tuple specs <code>("log_float", lo, hi)</code>, <code>("float", lo, hi)</code>, <code>("int", lo, hi)</code>, <code>("categorical", [...])</code>, or a fixed scalar.  <code>None</code> uses <code>DEFAULT_META_SEARCH_SPACES[model_name]</code>. Only used when <code>use_optimize=True</code>.</td></tr>
     </table>
     <p><strong>Returns:</strong> dict with <code>meta_learner</code>, <code>meta_scores</code>, <code>best_meta_name</code>, <code>output_dir</code>.</p>
+
+    <h4>.train_class_voter_stage()</h4>
+    <div class="sig">
+        <span class="fn-name">train_class_voter_stage</span>(<span class="param">metric='recall'</span>, <span class="param">alpha=1.0</span>, <span class="param">shrinkage=0.25</span>) → <span class="returns">dict</span>
+    </div>
+    <p>Stage 2 alternative: learn class-aware voting weights from OOF data.</p>
+    <p>Uses only the OOF meta-feature matrix and OOF labels. This is a linear, interpretable combiner that learns a different model-weight profile for each class, without fitting a meta-learner over the concatenated OOF features.</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>metric</code></td><td>Per-class OOF score used to compare models within each class. One of <code>"recall"</code>, <code>"precision"</code>, <code>"f1"</code>.</td></tr>
+      <tr><td><code>alpha</code></td><td>Additive smoothing constant applied to every model/class score before normalizing. Higher values flatten the learned class-specific weights and make the voter less aggressive.</td></tr>
+      <tr><td><code>shrinkage</code></td><td>Blend factor toward uniform per-class weights. <code>0.0</code> = trust the learned OOF class weights directly. <code>1.0</code> = ignore OOF differences and use equal weights for every class.</td></tr>
+    </table>
 
     <h4>.predict_test()</h4>
     <div class="sig">
@@ -1418,9 +1473,15 @@ proba = predictor.predict_proba(new_df)</code></pre>
     </table>
     <p><strong>Returns:</strong> class:`~multimodalva.utils.types.PredictionResult`.</p>
 
+    <h4>.predict_test_class_voter()</h4>
+    <div class="sig">
+        <span class="fn-name">predict_test_class_voter</span>(<span class="param">top_k=3</span>, <span class="param">batch_size=32</span>) → <span class="returns">PredictionResult</span>
+    </div>
+    <p>Stage 3 alternative: predict test data using saved class-aware weights.</p>
+
     <h4>.run()</h4>
     <div class="sig">
-        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">label_col</span>, <span class="param">text_col=None</span>, <span class="param">feature_cols=None</span>, <span class="param">test_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">stratify=True</span>, <span class="param">val_size=0.1</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=3</span>, <span class="param">batch_size=32</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">encode_categoricals='ordinal'</span>, <span class="param">scale_numeric=False</span>, <span class="param">save_fold_models=False</span>, <span class="param">cleanup_fold_files=True</span>, <span class="param">meta_learners=None</span>, <span class="param">meta_select_metric=None</span>, <span class="param">meta_cv_folds=3</span>, <span class="param">top_k=3</span>) → <span class="returns">dict</span>
+        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">label_col</span>, <span class="param">text_col=None</span>, <span class="param">feature_cols=None</span>, <span class="param">test_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">stratify=True</span>, <span class="param">val_size=0.1</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=3</span>, <span class="param">batch_size=32</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">encode_categoricals='ordinal'</span>, <span class="param">scale_numeric=False</span>, <span class="param">save_fold_models=False</span>, <span class="param">cleanup_fold_files=True</span>, <span class="param">meta_learners=None</span>, <span class="param">meta_select_metric=None</span>, <span class="param">meta_cv_folds=3</span>, <span class="param">meta_use_optimize=False</span>, <span class="param">meta_n_trials=30</span>, <span class="param">meta_search_space=None</span>, <span class="param">top_k=3</span>) → <span class="returns">dict</span>
     </div>
     <p>Convenience wrapper: Stage 1 → Stage 2 → Stage 3 in sequence.</p>
     <p>Equivalent to calling:</p>
@@ -1611,7 +1672,7 @@ board = performance_leaderboard(
 
     <h4>cause_accuracy_heatmap()</h4>
     <div class="sig">
-      <span class="fn-name">cause_accuracy_heatmap</span>(<span class="param">df</span>, <span class="param">true_col</span>, <span class="param">model_cols=None</span>, <span class="param">top_k=1</span>, <span class="param">topk_dfs=None</span>, <span class="param">cause_order=None</span>, <span class="param">drop_causes=None</span>, <span class="param">cause_rename=None</span>, <span class="param">model_rename=None</span>, <span class="param">group_boundaries=None</span>, <span class="param">group_labels=None</span>, <span class="param">cmap=None</span>, <span class="param">vmin=None</span>, <span class="param">vmax=None</span>, <span class="param">percentage=True</span>, <span class="param">annot=True</span>, <span class="param">fmt='.1f'</span>, <span class="param">figsize=(9, 4.5)</span>, <span class="param">cbar_label=None</span>, <span class="param">x_rotation=45</span>, <span class="param">y_rotation=0</span>, <span class="param">show_n=False</span>, <span class="param">save_path=None</span>, <span class="param">dpi=150</span>) → <span class="returns">tuple</span>
+      <span class="fn-name">cause_accuracy_heatmap</span>(<span class="param">df</span>, <span class="param">true_col</span>, <span class="param">model_cols=None</span>, <span class="param">top_k=1</span>, <span class="param">topk_dfs=None</span>, <span class="param">cause_order=None</span>, <span class="param">drop_causes=None</span>, <span class="param">cause_rename=None</span>, <span class="param">model_rename=None</span>, <span class="param">group_boundaries=None</span>, <span class="param">group_sizes=None</span>, <span class="param">group_labels=None</span>, <span class="param">cmap=None</span>, <span class="param">vmin=None</span>, <span class="param">vmax=None</span>, <span class="param">percentage=True</span>, <span class="param">annot=True</span>, <span class="param">fmt='.1f'</span>, <span class="param">figsize=(9, 4.5)</span>, <span class="param">cbar_label=None</span>, <span class="param">x_rotation=45</span>, <span class="param">y_rotation=0</span>, <span class="param">show_n=False</span>, <span class="param">insilicova_first=True</span>, <span class="param">save_path=None</span>, <span class="param">dpi=150</span>) → <span class="returns">tuple</span>
     </div>
     <p>Cause-specific accuracy heatmap across selected models.</p>
     <p>Rows = causes, columns = models.  Each cell shows the fraction (or percentage) of samples of that cause that are correctly classified by that model.</p>
@@ -1628,7 +1689,8 @@ board = performance_leaderboard(
       <tr><td><code>drop_causes</code></td><td>Causes to exclude from the heatmap (applied after <code>cause_order</code>).</td></tr>
       <tr><td><code>cause_rename</code></td><td>Dict <code>{original → display}</code> applied to row labels.</td></tr>
       <tr><td><code>model_rename</code></td><td>Dict <code>{original → display}</code> applied to column labels.</td></tr>
-      <tr><td><code>group_boundaries</code></td><td>List of <code>(start, end)</code> pairs in heatmap column-index coordinates marking model groups.  For example, <code>[(0.5, 3.5), (4.5, 6.5)]</code> draws a bracket under columns 1–3 and 5–6 (0-based, 0.5-offset for centering). Drawn as horizontal lines just below the x-axis ticks.</td></tr>
+      <tr><td><code>group_boundaries</code></td><td>List of <code>(start, end)</code> pairs in heatmap column-centre coordinates marking model groups. Two conventions are accepted: 1. explicit span, e.g. <code>(1.5, 5.5)</code> for columns 1–5 2. contiguous-group boundaries, e.g. <code>(1.5, 6.5)</code> for columns 1–5 when the next group starts at 6.5 Single-column groups can be passed as <code>(0.5, 0.5)</code> in explicit span mode or <code>(0.5, 1.5)</code> in contiguous mode. Group lines are drawn only over their own columns.</td></tr>
+      <tr><td><code>group_sizes</code></td><td>Alternative to <code>group_boundaries</code>. One integer per group giving the number of displayed model columns in that group. Example: <code>group_sizes=[5, 4]</code> generates spans <code>[(0.5, 4.5), (5.5, 8.5)]</code> automatically.</td></tr>
       <tr><td><code>group_labels</code></td><td>One label string per entry in <code>group_boundaries</code>.</td></tr>
       <tr><td><code>cmap</code></td><td>Colormap.  Default: custom light-cream → dark-red <code>LinearSegmentedColormap</code> calibrated for accuracy.</td></tr>
       <tr><td><code>vmin</code></td><td>Colormap lower bound.  Default: min of data.</td></tr>
@@ -1641,6 +1703,7 @@ board = performance_leaderboard(
       <tr><td><code>x_rotation</code></td><td>X-axis tick rotation.  Default 45.</td></tr>
       <tr><td><code>y_rotation</code></td><td>Y-axis tick rotation.  Default 0.</td></tr>
       <tr><td><code>show_n</code></td><td>Append true-label sample size to each y-axis tick, e.g. <code>"Malaria (n=42)"</code>.  Counts are taken from <code>df[true_col]</code> when <code>df</code> is provided, otherwise from the <code>"true_label"</code> column of the first entry in <code>topk_dfs</code>.  Default False.</td></tr>
+      <tr><td><code>insilicova_first</code></td><td>When True (default), any model whose name contains <code>"insilicova"</code> is moved to the far-left side of the heatmap before plotting and grouping.</td></tr>
       <tr><td><code>save_path</code></td><td>Save figure to this path before returning.  Supports any matplotlib extension (.png, .pdf, .svg).</td></tr>
       <tr><td><code>dpi</code></td><td>Resolution when saving.  Default 150.</td></tr>
     </table>
@@ -1654,7 +1717,7 @@ board = performance_leaderboard(
 
     <h4>cause_accuracy_diff_heatmap()</h4>
     <div class="sig">
-      <span class="fn-name">cause_accuracy_diff_heatmap</span>(<span class="param">df</span>, <span class="param">true_col</span>, <span class="param">baseline_col</span>, <span class="param">model_cols=None</span>, <span class="param">include_baseline=False</span>, <span class="param">top_k=1</span>, <span class="param">topk_dfs=None</span>, <span class="param">cause_order=None</span>, <span class="param">drop_causes=None</span>, <span class="param">cause_rename=None</span>, <span class="param">model_rename=None</span>, <span class="param">group_boundaries=None</span>, <span class="param">group_labels=None</span>, <span class="param">cmap='RdBu_r'</span>, <span class="param">vmin=None</span>, <span class="param">vmax=None</span>, <span class="param">percentage=True</span>, <span class="param">annot=True</span>, <span class="param">fmt='.1f'</span>, <span class="param">figsize=(9, 4.5)</span>, <span class="param">cbar_label=None</span>, <span class="param">x_rotation=45</span>, <span class="param">y_rotation=0</span>, <span class="param">save_path=None</span>, <span class="param">dpi=150</span>) → <span class="returns">tuple</span>
+      <span class="fn-name">cause_accuracy_diff_heatmap</span>(<span class="param">df</span>, <span class="param">true_col</span>, <span class="param">baseline_col</span>, <span class="param">model_cols=None</span>, <span class="param">include_baseline=False</span>, <span class="param">top_k=1</span>, <span class="param">topk_dfs=None</span>, <span class="param">cause_order=None</span>, <span class="param">drop_causes=None</span>, <span class="param">cause_rename=None</span>, <span class="param">model_rename=None</span>, <span class="param">group_boundaries=None</span>, <span class="param">group_sizes=None</span>, <span class="param">group_labels=None</span>, <span class="param">cmap=None</span>, <span class="param">vmin=None</span>, <span class="param">vmax=None</span>, <span class="param">percentage=True</span>, <span class="param">annot=True</span>, <span class="param">fmt='.1f'</span>, <span class="param">figsize=(9, 4.5)</span>, <span class="param">cbar_label=None</span>, <span class="param">x_rotation=45</span>, <span class="param">y_rotation=0</span>, <span class="param">insilicova_first=True</span>, <span class="param">save_path=None</span>, <span class="param">dpi=150</span>) → <span class="returns">tuple</span>
     </div>
     <p>Cause-specific accuracy difference heatmap vs. a baseline model.</p>
     <p>Same rows-as-causes, columns-as-models layout as :func:`cause_accuracy_heatmap`, but each cell shows the **difference** in per-cause accuracy relative to a chosen baseline model: <code>accuracy(model) − accuracy(baseline)</code>.</p>
@@ -1672,7 +1735,8 @@ board = performance_leaderboard(
       <tr><td><code>drop_causes</code></td><td>Causes to exclude (applied after <code>cause_order</code>).</td></tr>
       <tr><td><code>cause_rename</code></td><td><code>{original → display}</code> row-label mapping.</td></tr>
       <tr><td><code>model_rename</code></td><td><code>{original → display}</code> column-label mapping. Applied to comparison model names **and** to <code>baseline_col</code> when <code>include_baseline=True</code>.</td></tr>
-      <tr><td><code>group_boundaries</code></td><td><code>(start, end)</code> column-index pairs for bracket annotations below the x-axis ticks.</td></tr>
+      <tr><td><code>group_boundaries</code></td><td><code>(start, end)</code> column-centre pairs for bracket annotations above the heatmap. Supports the same explicit-span and contiguous-group conventions as :func:`cause_accuracy_heatmap`. Group lines are drawn only over their own columns.</td></tr>
+      <tr><td><code>group_sizes</code></td><td>Alternative to <code>group_boundaries</code>. One integer per group giving the number of displayed model columns in that group. Example: <code>group_sizes=[5, 4]</code> generates spans <code>[(0.5, 4.5), (5.5, 8.5)]</code> automatically.</td></tr>
       <tr><td><code>group_labels</code></td><td>One string per group boundary.</td></tr>
       <tr><td><code>cmap</code></td><td>Diverging colormap.  Default <code>"RdBu_r"</code>.</td></tr>
       <tr><td><code>vmin</code></td><td>Colormap lower bound.  Defaults to symmetric around the data range (i.e. <code>-max_abs</code>).</td></tr>
@@ -1684,6 +1748,7 @@ board = performance_leaderboard(
       <tr><td><code>cbar_label</code></td><td>Colorbar label.  Default: <code>"Difference in accuracy (%)"</code> or <code>"Difference in accuracy"</code> depending on <code>percentage</code>.</td></tr>
       <tr><td><code>x_rotation</code></td><td>X-axis tick rotation.  Default 45.</td></tr>
       <tr><td><code>y_rotation</code></td><td>Y-axis tick rotation.  Default 0.</td></tr>
+      <tr><td><code>insilicova_first</code></td><td>When True (default), any model whose name contains <code>"insilicova"</code> is moved to the far-left side of the heatmap before plotting and grouping.</td></tr>
       <tr><td><code>save_path</code></td><td>Path to save the figure.  Supports .png, .pdf, .svg.</td></tr>
       <tr><td><code>dpi</code></td><td>Save resolution.  Default 150.</td></tr>
     </table>
@@ -1696,7 +1761,7 @@ board = performance_leaderboard(
 
     <h4>confusion_heatmap()</h4>
     <div class="sig">
-      <span class="fn-name">confusion_heatmap</span>(<span class="param">y_true</span>, <span class="param">y_pred</span>, <span class="param">label_order=None</span>, <span class="param">model_name='Model'</span>, <span class="param">true_name='True'</span>, <span class="param">label_abbr=False</span>, <span class="param">annot=True</span>, <span class="param">figsize=(10, 8)</span>, <span class="param">cmap='Blues'</span>, <span class="param">x_rotation=90</span>, <span class="param">y_rotation=0</span>, <span class="param">normalize=False</span>, <span class="param">save_path=None</span>) → <span class="returns">Example</span>
+      <span class="fn-name">confusion_heatmap</span>(<span class="param">y_true</span>, <span class="param">y_pred</span>, <span class="param">label_order=None</span>, <span class="param">model_name='Model'</span>, <span class="param">true_name='True'</span>, <span class="param">label_abbr=False</span>, <span class="param">annot=True</span>, <span class="param">figsize=(10, 8)</span>, <span class="param">cmap=None</span>, <span class="param">x_rotation=90</span>, <span class="param">y_rotation=0</span>, <span class="param">normalize=False</span>, <span class="param">save_path=None</span>) → <span class="returns">Example</span>
     </div>
     <p>Heatmap of predicted vs. true labels for a single model.</p>
     <p>Rows = true labels (y-axis), columns = predicted labels (x-axis), cells = count (or proportion when <code>normalize=True</code>).</p>
@@ -1728,25 +1793,22 @@ board = performance_leaderboard(
   <section id="demos">
     <a class="anchor" id="demos"></a>
     <h2>Demo scripts</h2>
-    <p>All demos are in <code>tests/</code>. Each demo is self-contained and covers one pipeline.
-    Most use synthetic data — no model download required unless noted.</p>
+    <p>All demos are in <code>tests/</code>. They are intentionally small, synthetic where possible, and focused on one good path at a time.</p>
     <table>
-      <tr><th>Script</th><th>Sections</th><th>Requires GPU?</th></tr>
-      <tr><td><code>demo_text_classification.py</code></td><td>A–G: TextClassifier, HPO, LoRA, Ray Tune HPO</td><td>Recommended</td></tr>
-      <tr><td><code>demo_tabular_classification.py</code></td><td>A–F: TabularClassifier, HPO, model comparison, Ray Tune HPO</td><td>No</td></tr>
-      <tr><td><code>demo_ensemble_data_fusion.py</code></td><td>A–E: DataFusionClassifier, tabular-to-text (section C: no model)</td><td>Recommended</td></tr>
-      <tr><td><code>demo_ensemble_feature_fusion.py</code></td><td>A–E: FeatureFusionClassifier, AutoMM strategies, HPO</td><td>Recommended</td></tr>
-      <tr><td><code>demo_ensemble_voting.py</code></td><td>A–G: SoftVotingClassifier, vote_from_results (section A: no model)</td><td>Recommended</td></tr>
-      <tr><td><code>demo_ensemble_stacking.py</code></td><td>A–H: StackingClassifier, stage-wise, OOF (sections A–D: no model)</td><td>Optional</td></tr>
-      <tr><td><code>demo_results.py</code></td><td>A–H: all visualization functions (all synthetic data)</td><td>No</td></tr>
+      <tr><th>Script</th><th>Focus</th><th>Default mode</th></tr>
+      <tr><td><code>demo_text_classification.py</code></td><td>TextClassifier wrapper, tiny HPO, low-level text pipeline steps</td><td><code>preview</code> (no download)</td></tr>
+      <tr><td><code>demo_tabular_classification.py</code></td><td>TabularClassifier wrapper, adaptive HPO, low-level tabular steps</td><td><code>preview</code></td></tr>
+      <tr><td><code>demo_ensemble_data_fusion.py</code></td><td>Tabular-to-text conversion plus one end-to-end data-fusion run</td><td><code>text</code> (no model run)</td></tr>
+      <tr><td><code>demo_ensemble_feature_fusion.py</code></td><td>AutoMM feature fusion with a small fixed run</td><td><code>preview</code></td></tr>
+      <tr><td><code>demo_ensemble_voting.py</code></td><td>Synthetic soft vote, tabular-only vote, mixed vote</td><td><code>synthetic</code></td></tr>
+      <tr><td><code>demo_ensemble_stacking.py</code></td><td>Stage-wise stacking with meta-learner and class-aware voter</td><td><code>meta</code></td></tr>
+      <tr><td><code>demo_results.py</code></td><td>Leaderboard, top-k, confusion, and heatmap utilities</td><td><code>leaderboard</code></td></tr>
     </table>
     <pre><code># Run a single section
-python tests/demo_results.py G
-python tests/demo_results.py H
-python tests/demo_ensemble_stacking.py D
-
-# Run all sections
-python tests/demo_results.py</code></pre>
+python tests/demo_text_classification.py preview
+python tests/demo_tabular_classification.py hpo
+python tests/demo_ensemble_stacking.py class-voter
+python tests/demo_results.py heatmaps</code></pre>
   </section>
 
   <hr>

@@ -405,7 +405,24 @@ def _learn_class_voter_weights(
     alpha: float = 1.0,
     shrinkage: float = 0.25,
 ) -> np.ndarray:
-    """Learn a per-model × per-class weight matrix from OOF probabilities."""
+    """Learn a per-model × per-class weight matrix from OOF probabilities.
+
+    Weighting rule:
+    1. Compute a per-class score for each model from OOF predictions
+       (recall, precision, or F1).
+    2. Add ``alpha`` to every model/class score before normalization.
+       This prevents exact zero weights and stabilizes rare classes.
+    3. Normalize within each class so model weights sum to 1.
+    4. Blend the learned weights toward uniform weights by ``shrinkage``.
+       This reduces overfitting on low-support classes.
+
+    Interpretation:
+    - Larger ``alpha`` -> flatter per-class weights; weaker preference for the
+      empirically best OOF model on that class.
+    - Larger ``shrinkage`` -> stronger pull toward equal-weight voting.
+      ``shrinkage=0`` keeps the learned class-specific weights untouched;
+      ``shrinkage=1`` becomes uniform voting for every class.
+    """
     if not prob_matrices:
         raise ValueError("prob_matrices must contain at least one matrix.")
     if metric not in {"recall", "precision", "f1"}:
@@ -441,9 +458,13 @@ def _learn_class_voter_weights(
                 score = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
             scores[i, j] = score
 
+    # Additive smoothing: prevents brittle zero-weight columns when a model has
+    # zero recall / precision / F1 for a rare class in OOF data.
     scores = scores + alpha
     scores = scores / scores.sum(axis=0, keepdims=True)
     if shrinkage > 0:
+        # Shrink toward uniform class weights so tiny OOF classes do not create
+        # overly extreme model preferences.
         uniform = np.full_like(scores, 1.0 / n_models)
         scores = shrinkage * uniform + (1.0 - shrinkage) * scores
         scores = scores / scores.sum(axis=0, keepdims=True)
@@ -1823,6 +1844,18 @@ class StackingClassifier:
         interpretable combiner that learns a different model-weight profile for
         each class, without fitting a meta-learner over the concatenated OOF
         features.
+
+        Args:
+            metric: Per-class OOF score used to compare models within each
+                    class. One of ``"recall"``, ``"precision"``, ``"f1"``.
+            alpha:  Additive smoothing constant applied to every model/class
+                    score before normalizing. Higher values flatten the learned
+                    class-specific weights and make the voter less aggressive.
+            shrinkage:
+                    Blend factor toward uniform per-class weights.
+                    ``0.0`` = trust the learned OOF class weights directly.
+                    ``1.0`` = ignore OOF differences and use equal weights for
+                    every class.
         """
         self._ensure_oof_loaded()
 
