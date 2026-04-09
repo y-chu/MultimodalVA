@@ -1,12 +1,15 @@
-"""Small demos for result tables and visualizations.
+"""Demos for result tables and visualizations.
 
 Usage:
     python tests/demo_results.py leaderboard
     python tests/demo_results.py topk
     python tests/demo_results.py heatmaps
 
-All demos use synthetic prediction objects and save figures under
-``runs/demo_results/figures``.
+Key flags:
+    --output-dir    Where to save figure files (default: runs/demo_results)
+
+All demos use synthetic prediction objects to illustrate result utilities.
+Figures are saved under ``<output-dir>/figures/``.
 """
 
 from __future__ import annotations
@@ -49,14 +52,12 @@ def _make_predictions(n_samples: int = 60, seed: int = 60):
     full_b = build_full(probs_b)
     full_c = build_full(probs_c)
 
-    pred_df = pd.DataFrame(
-        {
-            "true_label": true_labels,
-            "tabular_model": [id2label[int(i)] for i in probs_a.argmax(axis=1)],
-            "text_model": [id2label[int(i)] for i in probs_b.argmax(axis=1)],
-            "ensemble_model": [id2label[int(i)] for i in probs_c.argmax(axis=1)],
-        }
-    )
+    pred_df = pd.DataFrame({
+        "true_label": true_labels,
+        "tabular_model": [id2label[int(i)] for i in probs_a.argmax(axis=1)],
+        "text_model": [id2label[int(i)] for i in probs_b.argmax(axis=1)],
+        "ensemble_model": [id2label[int(i)] for i in probs_c.argmax(axis=1)],
+    })
     topk_dfs = {
         "tabular_model": topk_from_full(full_a, id2label, k=3),
         "text_model": topk_from_full(full_b, id2label, k=3),
@@ -70,7 +71,7 @@ def _make_predictions(n_samples: int = 60, seed: int = 60):
     return pred_df, prob_dfs, topk_dfs
 
 
-def leaderboard_demo() -> None:
+def leaderboard_demo(args: argparse.Namespace) -> None:
     pred_df, prob_dfs, topk_dfs = _make_predictions()
     board = performance_leaderboard(
         df=pred_df,
@@ -85,9 +86,9 @@ def leaderboard_demo() -> None:
     print(board.round(2).to_string())
 
 
-def topk_demo() -> None:
+def topk_demo(args: argparse.Namespace) -> None:
     _, _, topk_dfs = _make_predictions()
-    fig_dir = ensure_dir("runs/demo_results/figures")
+    fig_dir = ensure_dir(f"{args.output_dir}/figures")
     fig, _ = plot_topk_accuracy(
         data=topk_dfs,
         kind="grouped",
@@ -99,9 +100,9 @@ def topk_demo() -> None:
     fig.clear()
 
 
-def heatmap_demo() -> None:
+def heatmap_demo(args: argparse.Namespace) -> None:
     pred_df, _, topk_dfs = _make_predictions()
-    fig_dir = ensure_dir("runs/demo_results/figures")
+    fig_dir = ensure_dir(f"{args.output_dir}/figures")
 
     _, _, acc_df = cause_accuracy_heatmap(
         df=pred_df,
@@ -134,22 +135,28 @@ def heatmap_demo() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "mode",
         nargs="?",
         default="leaderboard",
         choices=["leaderboard", "topk", "heatmaps"],
-        help="Which demo to run.",
+        help="Which result demo to run (default: leaderboard).",
     )
+    parser.add_argument("--output-dir", default="runs/demo_results", dest="output_dir",
+                        help="Directory for saved figures (default: runs/demo_results).")
+
     args = parser.parse_args()
 
     if args.mode == "leaderboard":
-        leaderboard_demo()
+        leaderboard_demo(args)
     elif args.mode == "topk":
-        topk_demo()
+        topk_demo(args)
     else:
-        heatmap_demo()
+        heatmap_demo(args)
 
 
 if __name__ == "__main__":

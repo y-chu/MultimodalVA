@@ -1,12 +1,7 @@
 # MultimodalVA
 
 MultimodalVA is a Python package for cause-of-death classification from verbal autopsy data.
-It supports:
-
-- text-only transformer models
-- tabular machine-learning models
-- multimodal fusion and ensemble pipelines
-- shared prediction outputs and visualization utilities
+It supports text-only transformer models, tabular machine-learning models, multimodal fusion and ensemble pipelines, and shared prediction / visualization utilities.
 
 All main pipelines follow the same pattern:
 
@@ -16,10 +11,12 @@ split -> prepare -> [HPO] -> train -> predict
 
 and return a common `PredictionResult` with:
 
-- `top1`: top-1 predictions
-- `full`: full class probabilities
-- `topk`: top-k predictions
-- `id2label`: class-id mapping
+| Field | Description |
+|---|---|
+| `top1` | Top-1 predictions |
+| `full` | Full class probabilities |
+| `topk` | Top-k predictions |
+| `id2label` | Class ID to label mapping |
 
 ## Installation
 
@@ -27,14 +24,6 @@ Recommended:
 
 ```bash
 pip install git+https://github.com/y-chu/MultimodalVA.git
-```
-
-Development install:
-
-```bash
-git clone https://github.com/y-chu/MultimodalVA.git
-cd MultimodalVA
-pip install -e ".[dev]"
 ```
 
 Optional extras:
@@ -49,7 +38,7 @@ pip install "multimodalva[all]"             # all Python-3.12-compatible extras
 
 ## Quick Start
 
-### Text
+### Text Classification
 
 ```python
 from multimodalva.text import TextClassifier
@@ -65,7 +54,7 @@ results = clf.run(
 print(results["predictions"].top1.head())
 ```
 
-### Tabular
+### Tabular Classification
 
 ```python
 from multimodalva.tabular import TabularClassifier
@@ -76,19 +65,13 @@ results = clf.run(
     feature_cols=["age", "sex", "fever", "cough"],
     label_col="cause",
     use_optimize=True,
-    n_trials=20,
+    n_trials=50,
     optimize_metric="f1_macro",
 )
 
 print(results["best_hyperparams"])
 print(results["predictions"].top1.head())
 ```
-
-Tabular HPO defaults are adaptive:
-
-- the package infers a search-space profile from `X_train.shape`
-- the default profile is `search_space_profile="auto"`
-- user `search_space` overrides are still merged on top
 
 ### Ensemble: Soft Voting
 
@@ -123,7 +106,7 @@ clf = EnsembleClassifier(
     n_folds=5,
 )
 
-# Stage 1
+# Stage 1: base models + OOF predictions
 clf.train_base_models(
     df=df,
     text_col="narrative",
@@ -140,117 +123,68 @@ clf.train_class_voter_stage(metric="recall", alpha=1.0, shrinkage=0.25)
 vote_pred = clf.predict_test_class_voter()
 ```
 
-## Supported Pipelines
+## Supported Models
 
-### Text
+### Text Models
 
-Use a package alias, a HuggingFace checkpoint, or a local model path.
+Use either a package alias, a HuggingFace checkpoint, or a local model path.
 
-Common aliases include:
+| Alias | Checkpoint | Notes |
+|---|---|---|
+| `bioclinicalbert` | `emilyalsentzer/Bio_ClinicalBERT` | Common default |
+| `bert` | `bert-base-uncased` | Generic baseline |
+| `biobert` | `dmis-lab/biobert-base-cased-v1.2` | Biomedical BERT |
+| `bluebert` | `bionlp/bluebert_pubmed_mimic_uncased_L-12_H-768_A-12` | Clinical + PubMed |
+| `biomedbert` | `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext` | PubMed full-text |
+| `clinicalbert` | `medicalai/ClinicalBERT` | Clinical-domain BERT |
+| `biomedroberta` | `allenai/biomed_roberta_base` | Biomedical RoBERTa |
+| `bioelectra` | `kamalkraj/bioelectra-base-discriminator-pubmed` | ELECTRA variant |
+| `longformer` | `allenai/longformer-base-4096` | Long context |
+| `clinicallongformer` | `yikuan8/Clinical-Longformer` | Long clinical narratives |
+| `bigbird` | `google/bigbird-roberta-base` | Long context |
+| `clinicalbigbird` | `yikuan8/Clinical-BigBird` | Long clinical narratives |
+| `roberta-pm` | Facebook Bio-LM RoBERTa-base-PM-M3-Voc-distill | Downloaded automatically via `download_model("roberta-pm")`; also resolved automatically in AutoMM feature fusion |
 
-- `bert`
-- `biobert`
-- `bioclinicalbert`
-- `bluebert`
-- `biomedbert`
-- `clinicalbert`
-- `biomedroberta`
-- `bioelectra`
-- `longformer`
-- `clinicallongformer`
-- `bigbird`
-- `clinicalbigbird`
+### Tabular Models
 
-Remote model support:
+| Alias | Backend |
+|---|---|
+| `lightgbm` | `lightgbm.LGBMClassifier` |
+| `xgboost` | `xgboost.XGBClassifier` |
+| `catboost` | `catboost.CatBoostClassifier` |
+| `random_forest` | `sklearn.ensemble.RandomForestClassifier` |
+| `gbdt` | `sklearn.ensemble.GradientBoostingClassifier` |
+| `mlp` | `sklearn.neural_network.MLPClassifier` |
+| `svm` | `sklearn.svm.SVC` |
+| `knn` | `sklearn.neighbors.KNeighborsClassifier` |
+| `naive_bayes` | `sklearn.naive_bayes.GaussianNB` |
 
-- `roberta-pm`
-  - downloaded automatically via `download_model("roberta-pm")`
-  - also resolved automatically inside AutoMM feature fusion
+### Ensemble Strategies
 
-### Tabular
-
-Supported model aliases:
-
-- `lightgbm`
-- `xgboost`
-- `catboost`
-- `random_forest`
-- `gbdt`
-- `mlp`
-- `svm`
-- `knn`
-- `naive_bayes`
-
-### Ensemble
-
-- `data_fusion`
-  - render tabular features as text and concatenate with the narrative
-- `feature_fusion`
-  - AutoGluon AutoMM joint text + tabular model
-- `soft_voting`
-  - probability averaging over independently trained base models
-- `stacking`
-  - Stage 1 OOF base models, then either:
-    - Stage 2 meta-learner
-    - Stage 2 class-aware voting learned from OOF predictions
-
-## Current Defaults and Behavior
-
-### Text pipeline
-
-- best-model selection uses `eval_macro_f1`
-- LoRA / PEFT evaluation keeps labels visible via `label_names=["labels"]`
-- early stopping remains active whenever an eval split exists
-- `roberta-pm` nested archive extraction is handled automatically
-
-### Tabular pipeline
-
-- adaptive default HPO search spaces based on dataset shape
-- LightGBM defaults now search:
-  - `subsample`
-  - `colsample_bytree`
-  - `reg_alpha`
-  - `reg_lambda`
-- Ray HPO auto-redirects to Optuna on non-CUDA environments
-
-### Stacking pipeline
-
-- shared NumPy / joblib compatibility loader for old artifacts
-- stage-wise API supports:
-  - `train_base_models()`
-  - `train_meta_learner_stage()`
-  - `predict_test()`
-  - `train_class_voter_stage()`
-  - `predict_test_class_voter()`
+| Method | Description |
+|---|---|
+| `data_fusion` | Convert tabular features to text and concatenate with the narrative |
+| `feature_fusion` | AutoGluon AutoMM joint text + tabular model |
+| `soft_voting` | Probability averaging over independently trained base models |
+| `stacking` | Stage 1 OOF base models, then either a Stage 2 meta-learner or Stage 2 class-aware voting |
 
 ## Demo Scripts
 
-The demos in `tests/` are intentionally small and focused on core package usage.
-They use synthetic data where possible.
+The demos in `tests/` are intentionally small, synthetic where possible, and focused on one core workflow at a time.
 
-- `demo_text_classification.py`
-  - wrapper usage, HPO, low-level pipeline steps
-- `demo_tabular_classification.py`
-  - wrapper usage, adaptive HPO, low-level pipeline steps
-- `demo_ensemble_data_fusion.py`
-  - core data-fusion workflow
-- `demo_ensemble_feature_fusion.py`
-  - core AutoMM feature-fusion workflow
-- `demo_ensemble_voting.py`
-  - simple voting from saved-like predictions and end-to-end soft voting
-- `demo_ensemble_stacking.py`
-  - stage-wise stacking plus class-aware voting
-- `demo_results.py`
-  - leaderboard, top-k, confusion, and heatmap visualization helpers
+| Script | What it shows | Default mode |
+|---|---|---|
+| `demo_text_classification.py` | TextClassifier wrapper, small HPO example, low-level pipeline steps, `roberta-pm` resolution | `preview` |
+| `demo_tabular_classification.py` | TabularClassifier wrapper, adaptive HPO, low-level tabular steps | `preview` |
+| `demo_ensemble_data_fusion.py` | Tabular-to-text conversion and one end-to-end data-fusion run | `text` |
+| `demo_ensemble_feature_fusion.py` | AutoMM feature fusion with a small fixed run | `preview` |
+| `demo_ensemble_voting.py` | Synthetic soft voting, tabular-only voting, mixed voting | `synthetic` |
+| `demo_ensemble_stacking.py` | Stage-wise stacking with meta-learner and class-aware voter | `meta` |
+| `demo_results.py` | Leaderboard, top-k, confusion, and cause-specific heatmap utilities | `leaderboard` |
 
 ## Documentation
 
 - API docs: [docs/index.html](docs/index.html)
-- rebuild docs:
-
-```bash
-python docs/build_docs.py
-```
 
 ## License
 
