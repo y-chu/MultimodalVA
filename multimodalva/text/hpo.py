@@ -19,6 +19,7 @@ Output: best_hyperparams dict and backend study / ResultGrid object
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import os
 import shutil
@@ -66,101 +67,14 @@ from multimodalva.text.predict import predict
 
 logger = logging.getLogger(__name__)
 
-
-# Updated for ~20 classes and 3k-5k samples
-
-# Default search space: (type, *args)
-#   float_log  — log-uniform float:  (low, high)       best for scale-sensitive params like LR
-#   float      — uniform float:       (low, high)
-#   int        — uniform int:         (low, high)
-#   categorical — discrete choice:   ([values])
-DEFAULT_SEARCH_SPACE: dict = {
-    # AdamW learning rate — most influential hyperparameter for BERT fine-tuning.
-    # BERT paper recommends 2e-5 to 5e-5; log-uniform covers the relevant scale.
-    # Wider range (1e-5, 1e-4) if the default range consistently hits a boundary.
-    "learning_rate": ("float_log", 8e-6, 4e-5),
-
-    # Per-device training batch size.
-    # 16 is the standard for 16 GB GPUs; use 8 if hitting OOM, or add 32 for larger GPUs.
-    # Effective batch size = batch_size × gradient_accumulation_steps × n_GPUs.
-    "batch_size": ("categorical", [8, 16, 32]),
-
-    # Number of full passes over the training data.
-    # 3–5 epochs is typical for BERT fine-tuning; small datasets may benefit from more (5–10).
-    # Always included so that optimize() returns an epoch count for the final train() call.
-    "epochs": ("categorical", [3, 5, 7]),
-
-    # L2 regularisation on non-bias / non-LayerNorm parameters (AdamW decoupled decay).
-    # 0.01 is the HuggingFace default; 0.0–0.1 covers most reasonable settings.
-    # Increase toward 0.1–0.3 if overfitting on small datasets.
-    "weight_decay": ("float", 0.0, 0.15),
-
-    # Fraction of total training steps used for linear LR warmup.
-    # BERT paper uses 0.1 (10%); 0.0–0.06 is common in practice.
-    # Larger values (0.1–0.2) can help stabilize training on noisy or imbalanced data.
-    "warmup_ratio": ("float", 0.0, 0.1),
-
-    # Number of gradient steps to accumulate before an optimizer update.
-    # Simulates a larger effective batch size without extra GPU memory.
-    # Use 4 or 8 when batch_size is forced low by memory constraints.
-    "gradient_accumulation_steps": ("categorical", [1, 2]),
-
-    # Number of encoder layers to freeze from the bottom (embeddings + N layers).
-    # Freezing reduces trainable parameters and acts as regularisation, which is
-    # especially useful for small or domain-specific datasets like VA narratives.
-    # 0  — full fine-tuning; best when data is large or domain is very different from
-    #       BERT's pre-training corpus.
-    # 2  — light freeze (default); good starting point for most VA datasets.
-    # 4  — moderate; useful when the dataset is small (<2 000 samples).
-    # 6  — aggressive (half of BERT-base's 12 layers); use when heavily overfitting
-    #       or as a final check that lower layers are not needed.
-    # Note: values above 6 rarely help and reduce model capacity significantly.
-    "freeze_layers": ("categorical", [2, 4, 6]),
-
-    # Classifier dropout (high impact for small/imbalanced data) 
-    # strong regularizer for small datasets with 20-60 classes; 0.1–0.3 is a good range to explore. 0.0 (no dropout) can work well for larger datasets.
-    "classifier_dropout": ("float", 0.1, 0.4),
-
-    # Label smoothing (stabilizes multi-class training)
-    "label_smoothing": ("float", 0.0, 0.1),
-
-}
-
-# Focal loss search space (merged in when use_focal=True).
-# loss_type is fixed to "focal" — only the tunable focal parameters are searched.
-# Recommended HPO metric when using focal: "f1_macro", "balanced_accuracy",
-# or "csmf_accuracy".  Avoid "log_loss" (focal loss distorts calibration).
-FOCAL_SEARCH_SPACE: dict = {
-    # Focus strength γ — how aggressively easy examples are down-weighted.
-    # γ=0 reduces to standard CE.  γ=2 is the RetinaNet default and covers
-    # most VA imbalance settings.  γ>3 is rarely beneficial and can cause
-    # gradient instability on very small classes.
-    "focal_gamma": ("float", 1.0, 4.0),
-
-    # Per-class alpha weights (α) — rebalances the gradient contribution
-    # across classes before the focal term is applied.
-    # "effective_n" (Cui et al. 2019) is recommended when any class has
-    # fewer than ~10 training samples; it prevents weight blow-up.
-    # "balanced" (sklearn) is adequate for moderate imbalance.
-    "class_weights": ("categorical", ["balanced", "effective_n"]),
-}
-
-# Additional LoRA search space entries (merged in when use_lora=True)
-LORA_SEARCH_SPACE: dict = {
-    # Rank of the LoRA low-rank decomposition — controls adapter capacity.
-    # Higher rank = more trainable parameters and expressiveness, but slower.
-    # r=8 is the LoRA paper default; r=16–32 for complex tasks or large label sets.
-    "lora_r": ("categorical", [4, 8, 16]),
-
-    # LoRA scaling factor applied to the adapter output (output *= lora_alpha / lora_r).
-    # Common heuristic: set lora_alpha = 2 × lora_r (e.g. r=8 → alpha=16).
-    # Larger alpha amplifies adapter contributions; too large can destabilise training.
-    "lora_alpha": ("categorical", [8, 16, 32, 64]),
-
-    # Dropout applied inside LoRA adapters for regularisation.
-    # 0.05 is the LoRA paper default; 0.0 (no dropout) often works well for small adapters.
-    "lora_dropout": ("float", 0.0, 0.1),
-}
+from .search_spaces import (  # noqa: E402
+    DEFAULT_SEARCH_SPACE,
+    FOCAL_SEARCH_SPACE,
+    LORA_SEARCH_SPACE,
+    _sample_tier,
+    _class_tier,
+    get_default_search_space,
+)
 
 
 def optimize(
@@ -279,8 +193,15 @@ def optimize(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build effective search space
-    active_space = dict(DEFAULT_SEARCH_SPACE)
+    # Build effective search space: data-adaptive base → LoRA/focal merges → caller overrides
+    n_samples = len(train_dataset)
+    n_classes = len(id2label)
+    active_space = get_default_search_space(n_samples, n_classes)
+    logger.info(
+        "Text HPO adaptive search space: sample_tier=%s, class_tier=%s "
+        "(n_samples=%d, n_classes=%d).",
+        _sample_tier(n_samples), _class_tier(n_classes), n_samples, n_classes,
+    )
     if use_lora:
         active_space.update(LORA_SEARCH_SPACE)
     if use_focal:
@@ -530,6 +451,14 @@ def _to_ray_space(search_space: dict) -> dict:
 
     ray_space: dict = {}
     for key, spec in search_space.items():
+        if not isinstance(spec, (tuple, list)) or not spec:
+            raise ValueError(
+                f"Search space entry {key!r} has an invalid spec {spec!r}. "
+                "Each entry must be a non-empty tuple: "
+                "('float_log', low, high), ('float', low, high), "
+                "('int', low, high), or ('categorical', [values]). "
+                f"Got type {type(spec).__name__!r}."
+            )
         kind, *args = spec
         if kind == "float_log":
             ray_space[key] = tune.loguniform(args[0], args[1])
@@ -541,8 +470,10 @@ def _to_ray_space(search_space: dict) -> dict:
             ray_space[key] = tune.choice(args[0])
         else:
             raise ValueError(
-                f"Unknown search space type {kind!r}. "
-                "Valid types: 'float_log', 'float', 'int', 'categorical'."
+                f"Search space entry {key!r} has unknown type {kind!r} "
+                f"(full spec: {spec!r}). "
+                "Valid types: 'float_log', 'float', 'int', 'categorical'. "
+                "Example: ('categorical', [8, 16, 32]) or ('float_log', 1e-5, 1e-4)."
             )
     return ray_space
 
@@ -786,8 +717,15 @@ def optimize_ray(
     exp_storage = output_dir / "ray_experiment"
     exp_path    = exp_storage / exp_name
 
-    # --- Build effective search space ---
-    active_space = dict(DEFAULT_SEARCH_SPACE)
+    # --- Build effective search space: data-adaptive base → LoRA/focal merges → caller overrides ---
+    n_samples = len(train_dataset)
+    n_classes = len(id2label)
+    active_space = get_default_search_space(n_samples, n_classes)
+    logger.info(
+        "Text HPO adaptive search space: sample_tier=%s, class_tier=%s "
+        "(n_samples=%d, n_classes=%d).",
+        _sample_tier(n_samples), _class_tier(n_classes), n_samples, n_classes,
+    )
     if use_lora:
         active_space.update(LORA_SEARCH_SPACE)
     if use_focal:
@@ -850,12 +788,16 @@ def optimize_ray(
 
     _ray_mode = "min" if METRIC_DIRECTION.get(metric, "maximize") == "minimize" else "max"
 
-    search_alg = OptunaSearch(
-        metric=metric,
-        mode=_ray_mode,
-        seed=random_state,
-        storage=None,   # explicit None ensures self._storage is always initialized
-    )
+    optuna_search_kwargs = {
+        "metric": metric,
+        "mode": _ray_mode,
+        "seed": random_state,
+    }
+    # Ray Tune changed OptunaSearch's constructor across releases.
+    # Older cluster environments reject `storage`, while newer ones accept it.
+    if "storage" in inspect.signature(OptunaSearch.__init__).parameters:
+        optuna_search_kwargs["storage"] = None
+    search_alg = OptunaSearch(**optuna_search_kwargs)
     if max_concurrent_trials is not None:
         search_alg = ConcurrencyLimiter(search_alg, max_concurrent=max_concurrent_trials)
 

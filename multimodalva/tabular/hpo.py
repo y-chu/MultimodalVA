@@ -54,402 +54,21 @@ from .train import SUPPORTED_MODELS, train
 
 logger = logging.getLogger(__name__)
 
-# Baseline search spaces per model alias.
-# Spec format mirrors text/hpo.py:
-#   ("float_log", low, high)   — log-uniform float (best for learning rates)
-#   ("float",     low, high)   — uniform float
-#   ("int",       low, high)   — uniform int
-#   ("categorical", [values])  — discrete choices
-#
-# These serve as a balanced middle-ground profile. `get_default_search_space()`
-# adapts them for small / wide / large tabular problems using X_train.shape.
-DEFAULT_SEARCH_SPACES: dict[str, dict] = {
-    "catboost": {
-        "iterations":    ("int",         100, 1000),    # number of trees; more = higher capacity but slower training
-        "learning_rate": ("float_log",   1e-3, 0.3),   # shrinkage per tree; lower = better generalization but needs more iterations
-        "depth":         ("int",         4, 10),        # tree depth; deeper captures more interactions but risks overfitting; >10 rarely helps
-        "l2_leaf_reg":   ("float_log",   1e-2, 10.0),  # L2 penalty on leaf weights; higher = smoother predictions, less overfitting
-        "boosting_type": ("categorical", ["Ordered", "Plain"]),  # Ordered = CatBoost permutation-based (better for small data); Plain = standard GBDT
-    },
-    "lightgbm": {
-        "n_estimators":      ("int",         100, 1000),           # number of boosting rounds; more = better fit; too many = overfit without early stopping
-        "learning_rate":     ("float_log",   1e-3, 0.3),          # smaller = more robust but needs proportionally more n_estimators
-        "max_depth":         ("categorical", [-1, 6, 8, 10]),      # -1 = no limit (complexity governed by num_leaves instead)
-        "num_leaves":        ("int",         20, 150),             # primary complexity knob for leaf-wise growth; more leaves = finer partitions, higher variance
-        "min_child_samples": ("int",         5, 100),              # larger = coarser leaves, less overfitting on rare causes; critical for imbalanced VA data
-        "subsample":         ("float",       0.6, 1.0),            # row sampling per tree; useful regularizer and often important on medium/large data
-        "colsample_bytree":  ("float",       0.5, 1.0),            # feature sampling per tree; especially important once feature count grows
-        "reg_alpha":         ("float_log",   1e-4, 10.0),          # L1 penalty; helps prune noisy splits in wide sparse-ish tabular data
-        "reg_lambda":        ("float_log",   1e-4, 20.0),          # L2 penalty; stabilizes leaf weights and probability estimates
-    },
-    "gbdt": {
-        "n_estimators":      ("int",       50, 500),    # number of sequential trees; more = lower bias, risk of overfitting
-        "learning_rate":     ("float_log", 1e-3, 0.3), # smaller = each tree contributes less, needs more trees but generalizes better
-        "max_depth":         ("int",       2, 8),       # shallow trees (2-4) often best for boosting; deep trees overfit and slow training
-        "min_samples_split": ("int",       2, 20),      # larger = fewer splits made, simpler trees, less overfitting to small subgroups
-        "min_samples_leaf":  ("int",       1, 10),      # larger = smoother leaf predictions; prevents fitting leaves from very few samples
-        "subsample":         ("float",     0.5, 1.0),   # row subsampling per tree; <1 adds randomness like bagging, reduces variance
-    },
-    "xgboost": {
-        "n_estimators":      ("int",       100, 1000),  # number of trees; combine with learning_rate (lower lr → more trees needed)
-        "learning_rate":     ("float_log", 1e-3, 0.3), # eta; smaller = more conservative updates, better generalization
-        "max_depth":         ("int",       3, 10),      # deeper trees capture more complex patterns but overfit and are slower
-        "subsample":         ("float",     0.5, 1.0),   # fraction of rows per tree; <1 introduces stochasticity, reduces overfitting
-        "colsample_bytree":  ("float",     0.5, 1.0),   # fraction of features per tree; lower = more diverse trees, similar to random forest effect
-        "gamma":             ("float",     0.0, 1.0),   # min loss reduction required to split a node; larger = fewer splits, more conservative trees
-        "min_child_weight":  ("int",       1, 10),      # larger = prevents learning from small leaf groups; important for rare cause classes
-        "reg_alpha":         ("float_log", 1e-4, 10.0), # L1 regularization; helps when feature space is wide or noisy
-        "reg_lambda":        ("float_log", 1e-4, 20.0), # L2 regularization; smooths leaf weights and combats overfit
-    },
-    "mlp": {
-        "hidden_layer_sizes": ("categorical", [(64,), (128,), (128, 64), (256, 128), (256, 128, 64)]),  # network depth/width; wider or deeper = more capacity, more data needed to avoid overfitting
-        "activation":         ("categorical", ["tanh", "relu"]),   # relu = sparse, fast, better for deep nets; tanh = smoother, bounded, better for shallow nets
-        "learning_rate_init": ("float_log",   1e-4, 1e-1),        # too large = unstable training; too small = slow convergence
-        "alpha":              ("float_log",   1e-5, 1e-1),         # L2 weight decay; larger = stronger regularization, smaller weights, better generalization
-        "batch_size":         ("categorical", [32, 64, 128, 256]), # smaller = noisier gradients (can escape local minima); larger = faster but may overfit
-    },
-    "random_forest": {
-        "n_estimators":      ("int",         50, 500),                   # more trees = more stable predictions; gains plateau around 200-300
-        "max_depth":         ("categorical", [None, 5, 10, 20, 30]),     # None = fully grown (may overfit); limiting depth regularizes leaf predictions
-        "min_samples_split": ("int",         2, 20),                     # larger = more conservative node splits; reduces overfitting on small subgroups
-        "min_samples_leaf":  ("int",         1, 10),                     # larger = smoother predicted probabilities; prevents leaves from very few samples
-        "max_features":      ("categorical", ["sqrt", "log2", 0.5]),     # fewer features per split = more diverse trees, stronger ensemble effect; sqrt is RF default for classification
-    },
-    "naive_bayes": {
-        "var_smoothing": ("float_log", 1e-9, 1e-1),  # variance floor per feature; larger = more shrinkage toward uniform, useful when features have near-zero variance
-    },
-    "knn": {
-        "n_neighbors": ("int",         3, 15),                                    # larger k = smoother boundary, less sensitive to noise; smaller k = complex boundary, overfits
-        "weights":     ("categorical", ["uniform", "distance"]),                  # distance weighting emphasizes closest neighbors; useful when local structure matters
-        "metric":      ("categorical", ["euclidean", "manhattan", "chebyshev"]),  # euclidean = L2 (sensitive to scale); manhattan = L1 (robust to outliers); chebyshev = max coordinate difference
-    },
-    "svm": {
-        "C":      ("float_log",  1e-3, 1e3),                         # larger C = smaller margin, fits training data tightly (may overfit); smaller C = wider margin, more regularized
-        "kernel": ("categorical", ["linear", "rbf", "poly"]),        # linear = fast for high-dim data; rbf = flexible nonlinear boundary; poly = polynomial feature interactions
-        "gamma":  ("categorical", ["scale", "auto"]),                 # rbf bandwidth; "scale" = 1/(n_features * X.var()), adapts to feature spread; "auto" = 1/n_features
-    },
-}
-
-SEARCH_SPACE_PROFILES = {"auto", "small", "balanced", "wide", "large"}
-
-
-def _int_spec(low: int | float, high: int | float) -> tuple[str, int, int]:
-    low_i = max(1, int(round(low)))
-    high_i = max(low_i, int(round(high)))
-    return ("int", low_i, high_i)
-
-
-def _float_spec(low: float, high: float) -> tuple[str, float, float]:
-    low_f = float(low)
-    high_f = max(low_f, float(high))
-    return ("float", low_f, high_f)
-
-
-def _float_log_spec(low: float, high: float) -> tuple[str, float, float]:
-    low_f = max(1e-12, float(low))
-    high_f = max(low_f, float(high))
-    return ("float_log", low_f, high_f)
-
-
-def _categorical_spec(values: list) -> tuple[str, list]:
-    deduped = list(dict.fromkeys(values))
-    return ("categorical", deduped)
-
-
-def infer_search_space_profile(X_train: np.ndarray) -> str:
-    """Infer a coarse HPO profile from feature matrix shape.
-
-    Heuristic goals:
-    - ``small``: few rows, so bias toward stronger regularization / smaller models.
-    - ``wide``: many features or low samples-per-feature ratio, so search stronger
-      feature subsampling / regularization and avoid underpowered defaults.
-    - ``large``: enough rows to justify broader-capacity spaces.
-    - ``balanced``: reasonable middle ground for the common case.
-    """
-    n_samples, n_features = X_train.shape
-    samples_per_feature = n_samples / max(n_features, 1)
-
-    if n_features >= 200 or samples_per_feature < 8:
-        return "wide"
-    if n_samples <= 1500:
-        return "small"
-    if n_samples >= 20000 and samples_per_feature >= 20:
-        return "large"
-    return "balanced"
-
-
-def _resolve_search_space_profile(
-    X_train: np.ndarray,
-    search_space_profile: str,
-) -> str:
-    if search_space_profile not in SEARCH_SPACE_PROFILES:
-        raise ValueError(
-            f"Unknown search_space_profile {search_space_profile!r}. "
-            f"Valid values: {sorted(SEARCH_SPACE_PROFILES)}"
-        )
-    return infer_search_space_profile(X_train) if search_space_profile == "auto" else search_space_profile
-
-
-def _max_features_choices(n_features: int, profile: str) -> list:
-    choices = ["sqrt", "log2"]
-    if profile == "wide":
-        choices.extend([0.1, 0.2, 0.5])
-    elif n_features >= 100:
-        choices.extend([0.2, 0.5])
-    else:
-        choices.extend([0.5, None])
-    return list(dict.fromkeys(choices))
-
-
-def get_default_search_space(
-    model_name: str,
-    X_train: np.ndarray,
-    search_space_profile: str = "auto",
-) -> dict:
-    """Return the default HPO search space adapted to the current data shape.
-
-    The returned space is still just a baseline. Callers should merge any
-    explicit user ``search_space`` on top of it.
-    """
-    profile = _resolve_search_space_profile(X_train, search_space_profile)
-    n_samples, n_features = X_train.shape
-    max_neighbor_hi = min(50, max(10, n_samples // 20))
-    min_leaf_hi = min(20, max(5, n_samples // 50))
-    min_split_hi = min(50, max(10, n_samples // 25))
-
-    if model_name == "lightgbm":
-        if profile == "small":
-            return {
-                "n_estimators": _int_spec(100, 700),
-                "learning_rate": _float_log_spec(5e-3, 0.15),
-                "max_depth": _categorical_spec([-1, 4, 6, 8]),
-                "num_leaves": _int_spec(15, 96),
-                "min_child_samples": _int_spec(10, min(80, max(20, n_samples // 10))),
-                "subsample": _float_spec(0.7, 1.0),
-                "colsample_bytree": _float_spec(0.5 if n_features >= 40 else 0.7, 1.0),
-                "reg_alpha": _float_log_spec(1e-4, 10.0),
-                "reg_lambda": _float_log_spec(1e-4, 20.0),
-            }
-        if profile == "wide":
-            return {
-                "n_estimators": _int_spec(150, 1200),
-                "learning_rate": _float_log_spec(5e-3, 0.15),
-                "max_depth": _categorical_spec([-1, 4, 6, 8, 10]),
-                "num_leaves": _int_spec(31, 127),
-                "min_child_samples": _int_spec(10, min(150, max(40, n_samples // 20))),
-                "subsample": _float_spec(0.6, 1.0),
-                "colsample_bytree": _float_spec(0.3, 0.9),
-                "reg_alpha": _float_log_spec(1e-4, 20.0),
-                "reg_lambda": _float_log_spec(1e-4, 30.0),
-            }
-        if profile == "large":
-            return {
-                "n_estimators": _int_spec(200, 2000),
-                "learning_rate": _float_log_spec(1e-2, 0.2),
-                "max_depth": _categorical_spec([-1, 6, 8, 10, 12]),
-                "num_leaves": _int_spec(31, 255),
-                "min_child_samples": _int_spec(5, min(200, max(60, n_samples // 50))),
-                "subsample": _float_spec(0.6, 1.0),
-                "colsample_bytree": _float_spec(0.5, 1.0),
-                "reg_alpha": _float_log_spec(1e-4, 10.0),
-                "reg_lambda": _float_log_spec(1e-4, 20.0),
-            }
-        return {
-            "n_estimators": _int_spec(150, 1500),
-            "learning_rate": _float_log_spec(5e-3, 0.2),
-            "max_depth": _categorical_spec([-1, 5, 7, 9, 12]),
-            "num_leaves": _int_spec(20, 160),
-            "min_child_samples": _int_spec(5, min(120, max(30, n_samples // 30))),
-            "subsample": _float_spec(0.6, 1.0),
-            "colsample_bytree": _float_spec(0.5, 1.0),
-            "reg_alpha": _float_log_spec(1e-4, 10.0),
-            "reg_lambda": _float_log_spec(1e-4, 20.0),
-        }
-
-    if model_name == "xgboost":
-        if profile == "small":
-            return {
-                "n_estimators": _int_spec(100, 700),
-                "learning_rate": _float_log_spec(5e-3, 0.15),
-                "max_depth": _int_spec(3, 8),
-                "subsample": _float_spec(0.7, 1.0),
-                "colsample_bytree": _float_spec(0.5, 1.0),
-                "gamma": _float_spec(0.0, 3.0),
-                "min_child_weight": _int_spec(1, 12),
-                "reg_alpha": _float_log_spec(1e-4, 10.0),
-                "reg_lambda": _float_log_spec(1e-4, 20.0),
-            }
-        if profile == "wide":
-            return {
-                "n_estimators": _int_spec(150, 1200),
-                "learning_rate": _float_log_spec(5e-3, 0.15),
-                "max_depth": _int_spec(3, 7),
-                "subsample": _float_spec(0.6, 1.0),
-                "colsample_bytree": _float_spec(0.3, 0.9),
-                "gamma": _float_spec(0.0, 5.0),
-                "min_child_weight": _int_spec(2, 16),
-                "reg_alpha": _float_log_spec(1e-4, 20.0),
-                "reg_lambda": _float_log_spec(1e-4, 30.0),
-            }
-        if profile == "large":
-            return {
-                "n_estimators": _int_spec(200, 1500),
-                "learning_rate": _float_log_spec(1e-2, 0.2),
-                "max_depth": _int_spec(3, 10),
-                "subsample": _float_spec(0.6, 1.0),
-                "colsample_bytree": _float_spec(0.5, 1.0),
-                "gamma": _float_spec(0.0, 3.0),
-                "min_child_weight": _int_spec(1, 12),
-                "reg_alpha": _float_log_spec(1e-4, 10.0),
-                "reg_lambda": _float_log_spec(1e-4, 20.0),
-            }
-        return {
-            "n_estimators": _int_spec(150, 1200),
-            "learning_rate": _float_log_spec(5e-3, 0.2),
-            "max_depth": _int_spec(3, 9),
-            "subsample": _float_spec(0.6, 1.0),
-            "colsample_bytree": _float_spec(0.5, 1.0),
-            "gamma": _float_spec(0.0, 3.0),
-            "min_child_weight": _int_spec(1, 12),
-            "reg_alpha": _float_log_spec(1e-4, 10.0),
-            "reg_lambda": _float_log_spec(1e-4, 20.0),
-        }
-
-    if model_name == "catboost":
-        if profile == "small":
-            return {
-                "iterations": _int_spec(100, 800),
-                "learning_rate": _float_log_spec(5e-3, 0.2),
-                "depth": _int_spec(4, 8),
-                "l2_leaf_reg": _float_log_spec(1e-2, 20.0),
-                "boosting_type": _categorical_spec(["Ordered", "Plain"]),
-            }
-        if profile == "large":
-            return {
-                "iterations": _int_spec(200, 1500),
-                "learning_rate": _float_log_spec(5e-3, 0.2),
-                "depth": _int_spec(4, 10),
-                "l2_leaf_reg": _float_log_spec(1e-2, 20.0),
-                "boosting_type": _categorical_spec(["Ordered", "Plain"]),
-            }
-        if profile == "wide":
-            return {
-                "iterations": _int_spec(150, 1200),
-                "learning_rate": _float_log_spec(5e-3, 0.15),
-                "depth": _int_spec(4, 8),
-                "l2_leaf_reg": _float_log_spec(1e-2, 30.0),
-                "boosting_type": _categorical_spec(["Ordered", "Plain"]),
-            }
-        return dict(DEFAULT_SEARCH_SPACES["catboost"])
-
-    if model_name == "gbdt":
-        if profile == "small":
-            return {
-                "n_estimators": _int_spec(50, 400),
-                "learning_rate": _float_log_spec(5e-3, 0.2),
-                "max_depth": _int_spec(2, 5),
-                "min_samples_split": _int_spec(2, min_split_hi),
-                "min_samples_leaf": _int_spec(1, min_leaf_hi),
-                "subsample": _float_spec(0.7, 1.0),
-            }
-        if profile == "large":
-            return {
-                "n_estimators": _int_spec(100, 1000),
-                "learning_rate": _float_log_spec(5e-3, 0.2),
-                "max_depth": _int_spec(2, 6),
-                "min_samples_split": _int_spec(2, min_split_hi),
-                "min_samples_leaf": _int_spec(1, min_leaf_hi),
-                "subsample": _float_spec(0.5, 1.0),
-            }
-        if profile == "wide":
-            return {
-                "n_estimators": _int_spec(100, 700),
-                "learning_rate": _float_log_spec(5e-3, 0.15),
-                "max_depth": _int_spec(2, 5),
-                "min_samples_split": _int_spec(2, min_split_hi),
-                "min_samples_leaf": _int_spec(1, min_leaf_hi),
-                "subsample": _float_spec(0.5, 1.0),
-            }
-        return {
-            "n_estimators": _int_spec(50, 700),
-            "learning_rate": _float_log_spec(5e-3, 0.2),
-            "max_depth": _int_spec(2, 6),
-            "min_samples_split": _int_spec(2, min_split_hi),
-            "min_samples_leaf": _int_spec(1, min_leaf_hi),
-            "subsample": _float_spec(0.5, 1.0),
-        }
-
-    if model_name == "random_forest":
-        if profile == "small":
-            return {
-                "n_estimators": _int_spec(100, 400),
-                "max_depth": _categorical_spec([None, 5, 10, 20]),
-                "min_samples_split": _int_spec(2, min_split_hi),
-                "min_samples_leaf": _int_spec(1, min_leaf_hi),
-                "max_features": _categorical_spec(_max_features_choices(n_features, profile)),
-            }
-        if profile == "large":
-            return {
-                "n_estimators": _int_spec(200, 1000),
-                "max_depth": _categorical_spec([None, 10, 20, 30, 40]),
-                "min_samples_split": _int_spec(2, min_split_hi),
-                "min_samples_leaf": _int_spec(1, min(30, max(10, n_samples // 80))),
-                "max_features": _categorical_spec(_max_features_choices(n_features, profile)),
-            }
-        if profile == "wide":
-            return {
-                "n_estimators": _int_spec(150, 800),
-                "max_depth": _categorical_spec([None, 10, 20, 30]),
-                "min_samples_split": _int_spec(2, min_split_hi),
-                "min_samples_leaf": _int_spec(1, min_leaf_hi),
-                "max_features": _categorical_spec(_max_features_choices(n_features, profile)),
-            }
-        return {
-            "n_estimators": _int_spec(100, 800),
-            "max_depth": _categorical_spec([None, 5, 10, 20, 30]),
-            "min_samples_split": _int_spec(2, min_split_hi),
-            "min_samples_leaf": _int_spec(1, min_leaf_hi),
-            "max_features": _categorical_spec(_max_features_choices(n_features, profile)),
-        }
-
-    if model_name == "mlp":
-        if profile == "small":
-            hidden_sizes = [(64,), (128,), (128, 64), (256, 128)]
-            batch_sizes = [16, 32, 64, 128]
-        elif profile == "wide":
-            hidden_sizes = [(128,), (256,), (256, 128), (512, 256), (256, 128, 64)]
-            batch_sizes = [32, 64, 128, 256]
-        elif profile == "large":
-            hidden_sizes = [(128,), (256,), (256, 128), (512, 256), (512, 256, 128)]
-            batch_sizes = [64, 128, 256, 512]
-        else:
-            hidden_sizes = [(64,), (128,), (128, 64), (256, 128), (256, 128, 64), (512, 256)]
-            batch_sizes = [32, 64, 128, 256]
-        return {
-            "hidden_layer_sizes": _categorical_spec(hidden_sizes),
-            "activation": _categorical_spec(["tanh", "relu"]),
-            "learning_rate_init": _float_log_spec(1e-4, 5e-2),
-            "alpha": _float_log_spec(1e-6, 1e-1),
-            "batch_size": _categorical_spec(batch_sizes),
-        }
-
-    if model_name == "knn":
-        return {
-            "n_neighbors": _int_spec(3, max_neighbor_hi),
-            "weights": _categorical_spec(["uniform", "distance"]),
-            "metric": _categorical_spec(["euclidean", "manhattan", "chebyshev"]),
-        }
-
-    if model_name == "svm":
-        kernels = ["linear", "rbf"] if profile in {"wide", "large"} else ["linear", "rbf", "poly"]
-        return {
-            "C": _float_log_spec(1e-3, 1e3),
-            "kernel": _categorical_spec(kernels),
-            "gamma": _categorical_spec(["scale", "auto"]),
-        }
-
-    return dict(DEFAULT_SEARCH_SPACES.get(model_name, {}))
-
+from .search_spaces import (  # noqa: E402
+    DEFAULT_SEARCH_SPACES,
+    SEARCH_SPACE_PROFILES,
+    _int_spec,
+    _float_spec,
+    _float_log_spec,
+    _categorical_spec,
+    _class_tier,
+    _apply_nclasses_adjustments,
+    infer_search_space_profile,
+    _resolve_search_space_profile,
+    _max_features_choices,
+    _build_profile_space,
+    get_default_search_space,
+)
 
 def optimize(
     X_train: np.ndarray,
@@ -544,19 +163,22 @@ def optimize(
             f"Unsupported model '{model_name}'. Choose from: {list(SUPPORTED_MODELS)}."
         )
 
-    # Build effective search space from the data-aware default profile, then
-    # merge any explicit caller overrides on top.
+    # Build effective search space: data/class-adaptive base → caller overrides
+    n_classes = len(id2label)
     resolved_profile = _resolve_search_space_profile(X_train, search_space_profile)
     active_space = get_default_search_space(
         model_name=model_name,
         X_train=X_train,
         search_space_profile=resolved_profile,
+        n_classes=n_classes,
     )
     if search_space:
         active_space.update(search_space)
     logger.info(
-        "Tabular HPO search-space profile: %s (n_samples=%d, n_features=%d)",
-        resolved_profile, X_train.shape[0], X_train.shape[1],
+        "Tabular HPO adaptive search space: profile=%s, class_tier=%s "
+        "(n_samples=%d, n_features=%d, n_classes=%d).",
+        resolved_profile, _class_tier(n_classes),
+        X_train.shape[0], X_train.shape[1], n_classes,
     )
 
     if storage_path is None:
@@ -743,6 +365,14 @@ def _to_ray_space(search_space: dict) -> dict:
 
     ray_space: dict = {}
     for key, spec in search_space.items():
+        if not isinstance(spec, (tuple, list)) or not spec:
+            raise ValueError(
+                f"Search space entry {key!r} has an invalid spec {spec!r}. "
+                "Each entry must be a non-empty tuple: "
+                "('float_log', low, high), ('float', low, high), "
+                "('int', low, high), or ('categorical', [values]). "
+                f"Got type {type(spec).__name__!r}."
+            )
         kind, *args = spec
         if kind == "float_log":
             ray_space[key] = tune.loguniform(args[0], args[1])
@@ -754,8 +384,10 @@ def _to_ray_space(search_space: dict) -> dict:
             ray_space[key] = tune.choice(args[0])
         else:
             raise ValueError(
-                f"Unknown search space type {kind!r}. "
-                "Valid types: 'float_log', 'float', 'int', 'categorical'."
+                f"Search space entry {key!r} has unknown type {kind!r} "
+                f"(full spec: {spec!r}). "
+                "Valid types: 'float_log', 'float', 'int', 'categorical'. "
+                "Example: ('categorical', [8, 16, 32]) or ('float_log', 1e-5, 1e-4)."
             )
     return ray_space
 
@@ -1060,19 +692,23 @@ def optimize_ray(
     exp_storage = output_dir / "ray_experiment"
     exp_path    = exp_storage / exp_name
 
-    # --- Build effective search space ---
+    # --- Build effective search space: data/class-adaptive base → caller overrides ---
+    n_classes = len(id2label)
     resolved_profile = _resolve_search_space_profile(X_train, search_space_profile)
     active_space = get_default_search_space(
         model_name=model_name,
         X_train=X_train,
         search_space_profile=resolved_profile,
+        n_classes=n_classes,
     )
     if search_space:
         active_space.update(search_space)
     ray_space = _to_ray_space(active_space)
     logger.info(
-        "Tabular HPO search-space profile: %s (n_samples=%d, n_features=%d)",
-        resolved_profile, X_train.shape[0], X_train.shape[1],
+        "Tabular HPO adaptive search space: profile=%s, class_tier=%s "
+        "(n_samples=%d, n_features=%d, n_classes=%d).",
+        resolved_profile, _class_tier(n_classes),
+        X_train.shape[0], X_train.shape[1], n_classes,
     )
 
     # --- Stratified internal split (mirrors optimize()) ---
