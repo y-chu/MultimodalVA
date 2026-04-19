@@ -14,7 +14,8 @@ Sub-modules:
                    (performance_leaderboard, topk_from_full,
                     topk_accuracy, plot_topk_accuracy,
                     cause_accuracy_heatmap,
-                    cause_accuracy_diff_heatmap, confusion_heatmap)
+                    cause_accuracy_diff_heatmap, csmf_scatterplot,
+                    confusion_heatmap)
 """
 
 from .palettes import (
@@ -42,6 +43,7 @@ from .vis_predict import (
     plot_topk_accuracy,
     cause_accuracy_heatmap,
     cause_accuracy_diff_heatmap,
+    csmf_scatterplot,
     confusion_heatmap,
 )
 
@@ -69,5 +71,6 @@ __all__ = [
     "plot_topk_accuracy",
     "cause_accuracy_heatmap",
     "cause_accuracy_diff_heatmap",
+    "csmf_scatterplot",
     "confusion_heatmap",
 ]

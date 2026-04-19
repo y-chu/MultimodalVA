@@ -7,6 +7,7 @@ Chains: split → prepare_dataset → [hpo →] train → predict
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -18,11 +19,39 @@ import pandas as pd
 # from .hpo import optimize
 
 from multimodalva.utils.split import split
+from multimodalva.utils.runtime import RuntimeTracker
 from multimodalva.text.dataset import prepare_dataset
 from multimodalva.text.train import train
 from multimodalva.text.predict import predict, PredictionResult
 
 logger = logging.getLogger(__name__)
+
+
+def _distributed_state() -> tuple[int, int]:
+    """Return (rank, world_size) from env vars used by torchrun."""
+    try:
+        rank = int(os.environ.get("RANK", "0"))
+    except ValueError:
+        rank = 0
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError:
+        world_size = 1
+    return rank, max(1, world_size)
+
+
+def _resolve_seed(random_state: int, set_seed: int | None) -> int:
+    """Resolve an effective seed value, with `set_seed` taking precedence."""
+    if set_seed is None:
+        return int(random_state)
+    resolved = int(set_seed)
+    if resolved != int(random_state):
+        logger.info(
+            "set_seed=%d provided; overriding random_state=%d.",
+            resolved,
+            random_state,
+        )
+    return resolved
 
 
 class TextClassifier:
@@ -74,6 +103,7 @@ class TextClassifier:
         label_col: str,
         test_size: float = 0.2,
         random_state: int = 42,
+        set_seed: int | None = None,
         stratify: bool = True,
         max_length: int = 512,
         hyperparams: dict | None = None,
@@ -86,10 +116,13 @@ class TextClassifier:
         use_lora: bool = True,
         use_focal: bool = False,
         gradient_checkpointing: bool = False,
-        early_stopping_patience: int | None = 2,
+        early_stopping_patience: int | None = 4,
         resume_hpo: bool = True,
         resume_training: bool = True,
-        use_fast: bool = False,
+        use_fast: bool = True,
+        use_cv: bool = True,
+        n_cv_folds: int = 3,
+        use_compile: bool = False,
     ) -> dict:
         """Run the full text classification pipeline.
 
@@ -116,6 +149,9 @@ class TextClassifier:
             label_col: Name of the label column.
             test_size: Fraction of data held out for testing. Default 0.2.
             random_state: Random seed for splitting and HPO. Default 42.
+            set_seed: Optional alias for a single run-level seed. When provided,
+                      overrides ``random_state`` so one value controls split, HPO,
+                      and training seeds end-to-end.
             stratify: Stratified split. Default True.
             max_length: Max token length for the tokenizer. Default 512.
             hyperparams: Fixed hyperparameter dict. Ignored when use_optimize=True.
@@ -141,14 +177,21 @@ class TextClassifier:
                        "focal", "focal_gamma": 2.0}. Default False.
             gradient_checkpointing: Enable gradient checkpointing to reduce GPU memory
                                     at the cost of slightly slower training. Default False.
-            early_stopping_patience: Stop training early if eval loss does not improve
-                                     for this many evaluations. None = disabled. Default 2.
+            early_stopping_patience: Stop training early if eval metric does not improve
+                                     for this many epochs. None = disabled. Default 4.
             resume_hpo: Resume an existing Optuna study if one exists at
                         output_dir/hpo/ (load_if_exists). Default True.
             resume_training: Resume final training from the latest checkpoint in
                              output_dir/final/ if one exists. Default True.
-            use_fast: Use the HuggingFace fast (Rust) tokenizer. Default False.
+            use_fast: Use the HuggingFace fast (Rust) tokenizer. Default True.
                       Set False for models that lack a fast tokenizer (e.g. BlueBERT).
+            use_cv: Use k-fold CV scoring in HPO trials (only when use_optimize=True).
+                    Default True.
+            n_cv_folds: Number of CV folds. Default 3.
+            use_compile: Apply torch.compile() to the model for the final train() call.
+                         Not forwarded to HPO trials (compilation overhead per trial is
+                         counterproductive). Uses aot_eager backend on MPS, inductor on
+                         CUDA. Default False.
 
         Returns:
             results: Dict with keys:
@@ -160,54 +203,86 @@ class TextClassifier:
                 - "id2label": reverse label encoding map
                 - "output_dir": Path to the root output directory
         """
+        runtime_tracker = RuntimeTracker(
+            self.output_dir,
+            report_name="pipeline_runtime.json",
+            metadata={
+                "pipeline": "text_classifier",
+                "model_name": self.model_name,
+                "text_col": text_col,
+                "label_col": label_col,
+                "use_optimize": use_optimize,
+            },
+            logger_=logger,
+        )
+        effective_seed = _resolve_seed(random_state=random_state, set_seed=set_seed)
         # --- Step 1: split ---
-        self.train_df, self.test_df = split(
-            df,
-            text_col=text_col,
-            label_col=label_col,
-            test_size=test_size,
-            random_state=random_state,
-            stratify=stratify,
-        )
-        logger.info(
-            "Split: %d train, %d test samples.",
-            len(self.train_df), len(self.test_df),
-        )
-
-        # --- Step 2: prepare datasets ---
-        self.train_dataset, self.test_dataset, self.label2id, self.id2label = (
-            prepare_dataset(
-                self.train_df,
-                self.test_df,
+        with runtime_tracker.stage(
+            "split",
+            details={
+                "rows": len(df),
+                "test_size": test_size,
+                "random_state": effective_seed,
+                "stratify": stratify,
+            },
+        ):
+            self.train_df, self.test_df = split(
+                df,
                 text_col=text_col,
                 label_col=label_col,
-                model_name=self.model_name,
-                max_length=max_length,
-                use_fast=use_fast,
+                test_size=test_size,
+                random_state=effective_seed,
+                stratify=stratify,
             )
-        )
-        logger.info("Prepared datasets: %d classes.", len(self.label2id))
+            logger.info(
+                "Split: %d train, %d test samples.",
+                len(self.train_df), len(self.test_df),
+            )
+
+        # --- Step 2: prepare datasets ---
+        with runtime_tracker.stage(
+            "prepare_dataset",
+            details={"max_length": max_length, "use_fast": use_fast},
+        ):
+            self.train_dataset, self.test_dataset, self.label2id, self.id2label = (
+                prepare_dataset(
+                    self.train_df,
+                    self.test_df,
+                    text_col=text_col,
+                    label_col=label_col,
+                    model_name=self.model_name,
+                    max_length=max_length,
+                    use_fast=use_fast,
+                )
+            )
+            logger.info("Prepared datasets: %d classes.", len(self.label2id))
 
         # --- Step 3: optional HPO ---
         if use_optimize:
             from multimodalva.text.hpo import optimize  # noqa: PLC0415
-            self.best_hyperparams, self.study = optimize(
-                train_dataset=self.train_dataset,
-                label2id=self.label2id,
-                id2label=self.id2label,
-                model_name=self.model_name,
-                output_dir=self.output_dir / "hpo",
-                n_trials=n_trials,
-                metric=optimize_metric,
-                search_space=search_space,
-                random_state=random_state,
-                use_lora=use_lora,
-                use_focal=use_focal,
-                gradient_checkpointing=gradient_checkpointing,
-                early_stopping_patience=early_stopping_patience,
-                load_if_exists=resume_hpo,
-                use_fast=use_fast,
-            )
+            with runtime_tracker.stage(
+                "hpo",
+                details={"n_trials": n_trials, "metric": optimize_metric},
+            ):
+                self.best_hyperparams, self.study = optimize(
+                    train_dataset=self.train_dataset,
+                    label2id=self.label2id,
+                    id2label=self.id2label,
+                    model_name=self.model_name,
+                    output_dir=self.output_dir / "hpo",
+                    n_trials=n_trials,
+                    metric=optimize_metric,
+                    search_space=search_space,
+                    random_state=effective_seed,
+                    use_lora=use_lora,
+                    use_focal=use_focal,
+                    gradient_checkpointing=gradient_checkpointing,
+                    early_stopping_patience=early_stopping_patience,
+                    load_if_exists=resume_hpo,
+                    use_fast=use_fast,
+                    use_cv=use_cv,
+                    n_cv_folds=n_cv_folds,
+                )
             final_hyperparams = self.best_hyperparams
             # HPO already determined epochs; train on full training data.
             final_val_size = None
@@ -218,30 +293,58 @@ class TextClassifier:
             final_val_size = 0.1
 
         # --- Step 4: final training ---
-        _, _, self.train_metadata = train(
-            train_dataset=self.train_dataset,
-            label2id=self.label2id,
-            id2label=self.id2label,
-            model_name=self.model_name,
-            output_dir=self.output_dir / "final",
-            hyperparams=final_hyperparams,
-            val_size=final_val_size,
-            use_lora=use_lora,
-            gradient_checkpointing=gradient_checkpointing,
-            early_stopping_patience=early_stopping_patience,
-            resume=resume_training,
-            use_fast=use_fast,
-        )
+        with runtime_tracker.stage(
+            "train",
+            details={"resume_training": resume_training, "val_size": final_val_size},
+        ):
+            _, _, self.train_metadata = train(
+                train_dataset=self.train_dataset,
+                label2id=self.label2id,
+                id2label=self.id2label,
+                model_name=self.model_name,
+                output_dir=self.output_dir / "final",
+                hyperparams=final_hyperparams,
+                val_size=final_val_size,
+                use_lora=use_lora,
+                gradient_checkpointing=gradient_checkpointing,
+                early_stopping_patience=early_stopping_patience,
+                resume=resume_training,
+                use_fast=use_fast,
+                random_state=effective_seed,
+                use_compile=use_compile,  # NOT forwarded to HPO — compile overhead per trial is counterproductive
+            )
+
+        rank, world_size = _distributed_state()
+        if world_size > 1 and rank != 0:
+            logger.info(
+                "Skipping predict() on non-zero rank %d/%d in DDP run.",
+                rank, world_size,
+            )
+            self.predictions = None
+            return {
+                "predictions": None,
+                "train_metadata": self.train_metadata,
+                "best_hyperparams": final_hyperparams,
+                "label2id": self.label2id,
+                "id2label": self.id2label,
+                "output_dir": self.output_dir,
+                "runtime_report": runtime_tracker.report_path,
+                "runtime_stage_csv": runtime_tracker.stage_csv_path,
+            }
 
         # --- Step 5: predict on test set ---
-        self.predictions = predict(
-            output_dir=self.output_dir / "final",
-            test_dataset=self.test_dataset,
-            batch_size=batch_size,
-            top_k=top_k,
-            save_dir=self.output_dir / "predictions",
-            use_fast=use_fast,
-        )
+        with runtime_tracker.stage(
+            "predict",
+            details={"batch_size": batch_size, "top_k": top_k},
+        ):
+            self.predictions = predict(
+                output_dir=self.output_dir / "final",
+                test_dataset=self.test_dataset,
+                batch_size=batch_size,
+                top_k=top_k,
+                save_dir=self.output_dir / "predictions",
+                use_fast=use_fast,
+            )
 
         return {
             "predictions": self.predictions,
@@ -250,6 +353,8 @@ class TextClassifier:
             "label2id": self.label2id,
             "id2label": self.id2label,
             "output_dir": self.output_dir,
+            "runtime_report": runtime_tracker.report_path,
+            "runtime_stage_csv": runtime_tracker.stage_csv_path,
         }
 
     def _run_from_datasets(
@@ -265,11 +370,16 @@ class TextClassifier:
         use_lora: bool = True,
         use_focal: bool = False,
         gradient_checkpointing: bool = False,
-        early_stopping_patience: int | None = 2,
+        early_stopping_patience: int | None = 4,
         resume_hpo: bool = True,
         resume_training: bool = True,
         random_state: int = 42,
-        use_fast: bool = False,
+        set_seed: int | None = None,
+        use_fast: bool = True,
+        use_cv: bool = True,
+        n_cv_folds: int = 3,
+        use_compile: bool = False,
+        _runtime_tracker: RuntimeTracker | None = None,
     ) -> dict:
         """Run Steps 3–5 (HPO → train → predict) on pre-loaded datasets.
 
@@ -286,26 +396,45 @@ class TextClassifier:
                 "label2id, and id2label to be set on self before calling."
             )
 
+        runtime_tracker = _runtime_tracker or RuntimeTracker(
+            self.output_dir,
+            report_name="pipeline_runtime.json",
+            metadata={
+                "pipeline": "text_classifier_from_datasets",
+                "model_name": self.model_name,
+                "label_col": label_col,
+                "use_optimize": use_optimize,
+            },
+            logger_=logger,
+        )
+        effective_seed = _resolve_seed(random_state=random_state, set_seed=set_seed)
+
         # --- Step 3: optional HPO ---
         if use_optimize:
             from multimodalva.text.hpo import optimize  # noqa: PLC0415
-            self.best_hyperparams, self.study = optimize(
-                train_dataset=self.train_dataset,
-                label2id=self.label2id,
-                id2label=self.id2label,
-                model_name=self.model_name,
-                output_dir=self.output_dir / "hpo",
-                n_trials=n_trials,
-                metric=optimize_metric,
-                search_space=search_space,
-                random_state=random_state,
-                use_lora=use_lora,
-                use_focal=use_focal,
-                gradient_checkpointing=gradient_checkpointing,
-                early_stopping_patience=early_stopping_patience,
-                load_if_exists=resume_hpo,
-                use_fast=use_fast,
-            )
+            with runtime_tracker.stage(
+                "hpo",
+                details={"n_trials": n_trials, "metric": optimize_metric},
+            ):
+                self.best_hyperparams, self.study = optimize(
+                    train_dataset=self.train_dataset,
+                    label2id=self.label2id,
+                    id2label=self.id2label,
+                    model_name=self.model_name,
+                    output_dir=self.output_dir / "hpo",
+                    n_trials=n_trials,
+                    metric=optimize_metric,
+                    search_space=search_space,
+                    random_state=effective_seed,
+                    use_lora=use_lora,
+                    use_focal=use_focal,
+                    gradient_checkpointing=gradient_checkpointing,
+                    early_stopping_patience=early_stopping_patience,
+                    load_if_exists=resume_hpo,
+                    use_fast=use_fast,
+                    use_cv=use_cv,
+                    n_cv_folds=n_cv_folds,
+                )
             final_hyperparams = self.best_hyperparams
             final_val_size = None
         else:
@@ -314,30 +443,58 @@ class TextClassifier:
             final_val_size = 0.1
 
         # --- Step 4: final training ---
-        _, _, self.train_metadata = train(
-            train_dataset=self.train_dataset,
-            label2id=self.label2id,
-            id2label=self.id2label,
-            model_name=self.model_name,
-            output_dir=self.output_dir / "final",
-            hyperparams=final_hyperparams,
-            val_size=final_val_size,
-            use_lora=use_lora,
-            gradient_checkpointing=gradient_checkpointing,
-            early_stopping_patience=early_stopping_patience,
-            resume=resume_training,
-            use_fast=use_fast,
-        )
+        with runtime_tracker.stage(
+            "train",
+            details={"resume_training": resume_training, "val_size": final_val_size},
+        ):
+            _, _, self.train_metadata = train(
+                train_dataset=self.train_dataset,
+                label2id=self.label2id,
+                id2label=self.id2label,
+                model_name=self.model_name,
+                output_dir=self.output_dir / "final",
+                hyperparams=final_hyperparams,
+                val_size=final_val_size,
+                use_lora=use_lora,
+                gradient_checkpointing=gradient_checkpointing,
+                early_stopping_patience=early_stopping_patience,
+                resume=resume_training,
+                use_fast=use_fast,
+                random_state=effective_seed,
+                use_compile=use_compile,  # NOT forwarded to HPO — compile overhead per trial is counterproductive
+            )
+
+        rank, world_size = _distributed_state()
+        if world_size > 1 and rank != 0:
+            logger.info(
+                "Skipping predict() on non-zero rank %d/%d in DDP run.",
+                rank, world_size,
+            )
+            self.predictions = None
+            return {
+                "predictions": None,
+                "train_metadata": self.train_metadata,
+                "best_hyperparams": final_hyperparams,
+                "label2id": self.label2id,
+                "id2label": self.id2label,
+                "output_dir": self.output_dir,
+                "runtime_report": runtime_tracker.report_path,
+                "runtime_stage_csv": runtime_tracker.stage_csv_path,
+            }
 
         # --- Step 5: predict on test set ---
-        self.predictions = predict(
-            output_dir=self.output_dir / "final",
-            test_dataset=self.test_dataset,
-            batch_size=batch_size,
-            top_k=top_k,
-            save_dir=self.output_dir / "predictions",
-            use_fast=use_fast,
-        )
+        with runtime_tracker.stage(
+            "predict",
+            details={"batch_size": batch_size, "top_k": top_k},
+        ):
+            self.predictions = predict(
+                output_dir=self.output_dir / "final",
+                test_dataset=self.test_dataset,
+                batch_size=batch_size,
+                top_k=top_k,
+                save_dir=self.output_dir / "predictions",
+                use_fast=use_fast,
+            )
 
         return {
             "predictions": self.predictions,
@@ -346,4 +503,6 @@ class TextClassifier:
             "label2id": self.label2id,
             "id2label": self.id2label,
             "output_dir": self.output_dir,
+            "runtime_report": runtime_tracker.report_path,
+            "runtime_stage_csv": runtime_tracker.stage_csv_path,
         }

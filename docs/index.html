@@ -318,9 +318,14 @@ pip install -e ".[dev]"</code></pre>
     <p>Core dependencies are installed automatically. Optional extras:</p>
     <pre><code>pip install "multimodalva[tabular]"         # LightGBM / XGBoost / CatBoost
 pip install "multimodalva[lora]"            # PEFT / LoRA
-pip install "multimodalva[feature_fusion]"  # AutoGluon AutoMM
-pip install "multimodalva[insilicova]"      # PyInSilicoVA support
+pip install "multimodalva[feature_fusion]"  # AutoGluon AutoMM (tested on autogluon.multimodal 1.5.x)
 pip install "multimodalva[all]"             # all Python-3.12-compatible extras</code></pre>
+
+    <p>Compatibility notes:</p>
+    <ul>
+      <li><code>[feature_fusion]</code> is pinned to the AutoGluon MultiModal 1.5.x stack, which expects <code>torch&gt;=2.6,&lt;2.10</code>, <code>transformers&gt;=4.51,&lt;4.58</code>, and <code>accelerate&gt;=0.34,&lt;2.0</code>.</li>
+      <li>Python InSilicoVA support is not currently installable under this package's supported Python range (<code>&gt;=3.12,&lt;3.14</code>). Use the R-based InSilicoVA workflow instead, or a separate legacy environment if <code>pyinsilicova</code> is required.</li>
+    </ul>
 
     <table>
       <thead>
@@ -328,10 +333,10 @@ pip install "multimodalva[all]"             # all Python-3.12-compatible extras<
       </thead>
       <tbody>
         <tr><td><code>[tabular]</code></td><td>lightgbm, xgboost, catboost</td><td>Gradient boosting models</td></tr>
-        <tr><td><code>[lora]</code></td><td>peft ≥ 0.6</td><td><code>use_lora=True</code> in text pipeline</td></tr>
-        <tr><td><code>[feature_fusion]</code></td><td>autogluon.multimodal ≥ 1.0</td><td><code>FeatureFusionClassifier</code></td></tr>
+        <tr><td><code>[lora]</code></td><td>peft ≥ 0.7</td><td><code>use_lora=True</code> in text pipeline</td></tr>
+        <tr><td><code>[feature_fusion]</code></td><td>autogluon.multimodal 1.5.x, torch 2.6–2.9, transformers 4.51–4.57, accelerate 0.34–1.x</td><td><code>FeatureFusionClassifier</code></td></tr>
         <tr><td><em>core dependency</em></td><td>ray[tune], optuna-integration</td><td><code>optimize_ray()</code> for text and tabular HPO</td></tr>
-        <tr><td><code>[insilicova]</code></td><td>pyinsilicova</td><td>InSilicoVA base model inside stacking</td></tr>
+        <tr><td><code>[insilicova]</code></td><td>placeholder only</td><td>Reserved; Python InSilicoVA install path is unavailable on Python 3.12+</td></tr>
         <tr><td><code>[dev]</code></td><td>pytest, pytest-cov</td><td>Running tests</td></tr>
       </tbody>
     </table>
@@ -538,7 +543,7 @@ vote_pred = clf.predict_test_class_voter()</code></pre>
     <p>Typical usage (with HPO): Typical usage (fixed hyperparams):</p>
     <pre><code>clf = TextClassifier(model_name="bert-base-uncased", output_dir="runs/text")
 results = clf.run(df, text_col="narrative", label_col="cause_of_death",
-                  use_optimize=True, n_trials=20)</code></pre>
+                  use_optimize=True, n_trials=20, use_cv=True, n_cv_folds=3)</code></pre>
     <pre><code>clf = TextClassifier(model_name="bert-base-uncased", output_dir="runs/text")
 results = clf.run(df, text_col="narrative", label_col="cause_of_death",
                   hyperparams={"learning_rate": 3e-5, "epochs": 4})</code></pre>
@@ -550,7 +555,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
 
     <h4>.run()</h4>
     <div class="sig">
-        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">text_col</span>, <span class="param">label_col</span>, <span class="param">test_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">stratify=True</span>, <span class="param">max_length=512</span>, <span class="param">hyperparams=None</span>, <span class="param">use_optimize=False</span>, <span class="param">n_trials=30</span>, <span class="param">optimize_metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">batch_size=32</span>, <span class="param">top_k=3</span>, <span class="param">use_lora=True</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=2</span>, <span class="param">resume_hpo=True</span>, <span class="param">resume_training=True</span>, <span class="param">use_fast=False</span>) → <span class="returns">results</span>
+        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">text_col</span>, <span class="param">label_col</span>, <span class="param">test_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">stratify=True</span>, <span class="param">max_length=512</span>, <span class="param">hyperparams=None</span>, <span class="param">use_optimize=False</span>, <span class="param">n_trials=30</span>, <span class="param">optimize_metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">use_cv=True</span>, <span class="param">n_cv_folds=3</span>, <span class="param">batch_size=32</span>, <span class="param">top_k=3</span>, <span class="param">use_lora=True</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=4</span>, <span class="param">resume_hpo=True</span>, <span class="param">resume_training=True</span>, <span class="param">use_fast=True</span>, <span class="param">use_compile=False</span>) → <span class="returns">results</span>
     </div>
     <p>Run the full text classification pipeline.</p>
     <p>Steps executed in order: 1. split()           — stratified train/test split 2. prepare_dataset() — tokenize and encode labels 3. optimize()        — (optional) Optuna HPO on 80/20 sub-split of train_ds 4. train()           — fine-tune model with best/given hyperparams 5. predict()         — generate labels and probabilities on test set</p>
@@ -568,24 +573,27 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
       <tr><td><code>hyperparams</code></td><td>Fixed hyperparameter dict. Ignored when use_optimize=True. Keys use short names: learning_rate, batch_size, epochs, weight_decay, warmup_ratio, gradient_accumulation_steps, freeze_layers. See train() for the full list.</td></tr>
       <tr><td><code>use_optimize</code></td><td>Run Optuna HPO before final training. Default False.</td></tr>
       <tr><td><code>n_trials</code></td><td>Number of Optuna trials (only used when use_optimize=True). Default 30.</td></tr>
-      <tr><td><code>optimize_metric</code></td><td>Metric to maximize during HPO — "accuracy", "f1_macro", "f1_weighted", "csmf_accuracy". Default "accuracy".</td></tr>
+      <tr><td><code>optimize_metric</code></td><td>Metric to maximize during HPO — "accuracy", "f1_macro", "f1_weighted", "balanced_accuracy", "csmf_accuracy", "log_loss". Default "accuracy".</td></tr>
       <tr><td><code>search_space</code></td><td>Custom Optuna search space dict (only used when use_optimize=True). Merged over DEFAULT_SEARCH_SPACE.</td></tr>
+      <tr><td><code>use_cv</code></td><td>Score HPO trials with k-fold cross-validation instead of a fixed 80/20 split. Reduces variance on small datasets. All folds are pre-built once — every trial sees identical splits. Default True.</td></tr>
+      <tr><td><code>n_cv_folds</code></td><td>Number of CV folds when use_cv=True. Default 3. Ignored when use_cv=False.</td></tr>
       <tr><td><code>batch_size</code></td><td>Inference batch size for predict(). Default 32.</td></tr>
       <tr><td><code>top_k</code></td><td>Number of top classes in topk output. Default 3.</td></tr>
       <tr><td><code>use_lora</code></td><td>Apply LoRA adapters for parameter-efficient fine-tuning. Reduces GPU memory and improves generalisation on small datasets. When True, LoRA hyperparameters (lora_r, lora_alpha, lora_dropout) are also searched during HPO. Default True.</td></tr>
       <tr><td><code>use_focal</code></td><td>Use focal loss during HPO trials (use_optimize=True only). Merges FOCAL_SEARCH_SPACE and injects loss_type="focal" into every trial. For non-HPO focal loss, pass hyperparams={"loss_type": "focal", "focal_gamma": 2.0}. Default False.</td></tr>
       <tr><td><code>gradient_checkpointing</code></td><td>Enable gradient checkpointing to reduce GPU memory at the cost of slightly slower training. Default False.</td></tr>
-      <tr><td><code>early_stopping_patience</code></td><td>Stop training early if eval loss does not improve for this many evaluations. None = disabled. Default 2.</td></tr>
+      <tr><td><code>early_stopping_patience</code></td><td>Stop training early if eval_macro_f1 does not improve for this many evaluations. None = disabled. Default 4.</td></tr>
       <tr><td><code>resume_hpo</code></td><td>Resume an existing Optuna study if one exists at output_dir/hpo/ (load_if_exists). Default True.</td></tr>
       <tr><td><code>resume_training</code></td><td>Resume final training from the latest checkpoint in output_dir/final/ if one exists. Default True.</td></tr>
-      <tr><td><code>use_fast</code></td><td>Use the HuggingFace fast (Rust) tokenizer. Default False. Set False for models that lack a fast tokenizer (e.g. BlueBERT).</td></tr>
+      <tr><td><code>use_fast</code></td><td>Use the HuggingFace fast (Rust) tokenizer. Default True. Set False for models that lack a fast tokenizer (e.g. BlueBERT).</td></tr>
+      <tr><td><code>use_compile</code></td><td>Apply torch.compile() to the model before training (opt-in). Uses aot_eager backend on MPS, inductor on CUDA, mode="reduce-overhead". First call adds ~60 s compile time; not recommended for HPO. Default False.</td></tr>
     </table>
     <p><strong>Returns</strong> <code>results</code>: Dict with keys: - "predictions": PredictionResult(top1, full, topk, id2label) from predict() - "train_metadata": metadata dict from train() — includes log_history, hyperparams, label2id, id2label, output_dir - "best_hyperparams": hyperparams used for final training - "label2id": label encoding map - "id2label": reverse label encoding map - "output_dir": Path to the root output directory</p>
 
     <a class="anchor" id="text-dataset"></a>
     <h3>prepare_dataset()</h3>
     <div class="sig">
-      <span class="fn-name">prepare_dataset</span>(<span class="param">train_df</span>, <span class="param">test_df</span>, <span class="param">text_col</span>, <span class="param">label_col</span>, <span class="param">model_name</span>, <span class="param">max_length=512</span>, <span class="param">use_fast=False</span>) → <span class="returns">(train_dataset, test_dataset, label2id, id2label)</span>
+      <span class="fn-name">prepare_dataset</span>(<span class="param">train_df</span>, <span class="param">test_df</span>, <span class="param">text_col</span>, <span class="param">label_col</span>, <span class="param">model_name</span>, <span class="param">max_length=512</span>, <span class="param">use_fast=True</span>) → <span class="returns">(train_dataset, test_dataset, label2id, id2label)</span>
     </div>
     <p>Tokenize text and encode labels, returning ClassificationDataset objects.</p>
     <p>Rows with missing (NaN) or empty string values in text_col or label_col are dropped before tokenization, with a warning logged for each.</p>
@@ -598,7 +606,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
       <tr><td><code>label_col</code></td><td>Name of the label column.</td></tr>
       <tr><td><code>model_name</code></td><td>HuggingFace model name or local path for the tokenizer.</td></tr>
       <tr><td><code>max_length</code></td><td>Maximum number of tokens before truncation. - 512 (default) → truncate to 512 tokens (BERT's maximum). - None → use the model's built-in maximum (e.g. 4096 for Longformer). - int → truncate to exactly that many tokens.</td></tr>
-      <tr><td><code>use_fast</code></td><td>Use the HuggingFace fast (Rust) tokenizer. Default False. Set False for models that lack a fast tokenizer (e.g. BlueBERT, BioELECTRA) to avoid a falling-back warning.</td></tr>
+      <tr><td><code>use_fast</code></td><td>Use the HuggingFace fast (Rust) tokenizer. Default True. Set False for models that lack a fast tokenizer (e.g. BlueBERT, BioELECTRA) to avoid a falling-back warning.</td></tr>
     </table>
     <table>
       <tr><th>Returns</th><th>Description</th></tr>
@@ -611,7 +619,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
     <a class="anchor" id="text-train"></a>
     <h3>train()</h3>
     <div class="sig">
-      <span class="fn-name">train</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">hyperparams=None</span>, <span class="param">val_size=0.1</span>, <span class="param">use_lora=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=None</span>, <span class="param">resume=True</span>, <span class="param">cleanup_checkpoints=False</span>, <span class="param">use_fast=False</span>, <span class="param">eval_batch_size=4</span>) → <span class="returns">(trainer, tokenizer, metadata)</span>
+      <span class="fn-name">train</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">hyperparams=None</span>, <span class="param">val_size=0.1</span>, <span class="param">use_lora=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=None</span>, <span class="param">resume=True</span>, <span class="param">cleanup_checkpoints=False</span>, <span class="param">use_fast=True</span>, <span class="param">eval_batch_size=32</span>, <span class="param">use_compile=False</span>) → <span class="returns">(trainer, tokenizer, metadata)</span>
     </div>
     <p>Fine-tune a BERT-family model for multiclass classification.</p>
     <p>Saves the following to output_dir: - Fine-tuned model weights and config - Tokenizer - label2id.json / id2label.json - hyperparams.json - training_metadata.json  (full log history + eval metrics)</p>
@@ -630,8 +638,9 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
       <tr><td><code>early_stopping_patience</code></td><td>Stop training if eval_macro_f1 does not improve for this many epochs. Active whenever val_size &gt; 0. Default None (disabled).</td></tr>
       <tr><td><code>resume</code></td><td>Resume training from the latest checkpoint in output_dir. Default True.</td></tr>
       <tr><td><code>cleanup_checkpoints</code></td><td>Delete intermediate <code>checkpoint-*/</code> subdirectories from output_dir after training completes successfully. These checkpoints are only needed to resume an interrupted run; once training is done they consume significant disk space (equal to the full model size per checkpoint, up to <code>save_total_limit=2</code>).  The final model weights saved directly in output_dir are unaffected.  Default False.</td></tr>
-      <tr><td><code>use_fast</code></td><td>Use the HuggingFace fast (Rust) tokenizer. Default False. Set False for models that lack a fast tokenizer (e.g. BlueBERT) to avoid a falling-back warning.</td></tr>
-      <tr><td><code>eval_batch_size</code></td><td>Per-device batch size used exclusively for eval forward passes. Decoupled from training batch_size to prevent eval OOM when training uses large batches. Default 4. Only relevant when val_size &gt; 0.</td></tr>
+      <tr><td><code>use_fast</code></td><td>Use the HuggingFace fast (Rust) tokenizer. Default True. Set False for models that lack a fast tokenizer (e.g. BlueBERT) to avoid a falling-back warning.</td></tr>
+      <tr><td><code>eval_batch_size</code></td><td>Per-device batch size used exclusively for eval forward passes. Decoupled from training batch_size to prevent eval OOM when training uses large batches. Default 32. Increase to 64+ on ≥40 GB GPUs. Only relevant when val_size &gt; 0.</td></tr>
+      <tr><td><code>use_compile</code></td><td>Apply torch.compile() after model.to(device). Uses aot_eager backend on MPS and inductor on CUDA, mode="reduce-overhead". First call adds ~60 s compile time; not recommended for HPO trials. Default False.</td></tr>
     </table>
     <table>
       <tr><th>Returns</th><th>Description</th></tr>
@@ -671,7 +680,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
 
     <h4>optimize()</h4>
     <div class="sig">
-      <span class="fn-name">optimize</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=30</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">study_name='text_hpo'</span>, <span class="param">use_lora=True</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=2</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=True</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">use_fast=False</span>) → <span class="returns">(best_hyperparams, study)</span>
+      <span class="fn-name">optimize</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=30</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">study_name='text_hpo'</span>, <span class="param">use_lora=True</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=4</span>, <span class="param">use_cv=True</span>, <span class="param">n_cv_folds=3</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=True</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">use_fast=True</span>) → <span class="returns">(best_hyperparams, study)</span>
     </div>
     <p>Run Optuna hyperparameter search using train() and predict().</p>
     <p>Internally splits train_dataset into an (1 - val_size) / val_size opt-train / opt-eval split. Each trial trains on opt-train and is scored on opt-eval. The held-out test set from prepare_dataset() is never used here.</p>
@@ -692,10 +701,12 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
       <tr><td><code>use_lora</code></td><td>Apply LoRA adapters during each trial. Default False.</td></tr>
       <tr><td><code>use_focal</code></td><td>Use focal loss during each trial.  When True, merges FOCAL_SEARCH_SPACE (focal_gamma, class_weights) and fixes loss_type="focal" in every trial's hyperparams. Recommended for severe class imbalance; pair with metric="f1_macro" or "balanced_accuracy". Default False.</td></tr>
       <tr><td><code>gradient_checkpointing</code></td><td>Enable gradient checkpointing per trial. Default False.</td></tr>
-      <tr><td><code>early_stopping_patience</code></td><td>Early stopping patience passed to each trial's train(). Set to None to disable. Default 3.</td></tr>
+      <tr><td><code>early_stopping_patience</code></td><td>Early stopping patience passed to each trial's train(). Set to None to disable. Default 4.</td></tr>
+      <tr><td><code>use_cv</code></td><td>Score each trial with k-fold cross-validation on train_dataset instead of a fixed 80/20 split. Folds are built once before any trial runs — all trials see identical splits. Default True.</td></tr>
+      <tr><td><code>n_cv_folds</code></td><td>Number of CV folds. Recommended: 3 (CV + LoRA → 15–20 trials; CV + no-LoRA → 20–25). Default 3. Ignored when use_cv=False.</td></tr>
       <tr><td><code>storage_path</code></td><td>SQLite URL for persisting the study (enables resume across sessions). Defaults to output_dir/hpo_&lt;model_name&gt;.db.</td></tr>
       <tr><td><code>load_if_exists</code></td><td>Resume an existing study if storage_path already contains one. Default True.</td></tr>
-      <tr><td><code>enable_pruning</code></td><td>Use Optuna's MedianPruner to stop unpromising trials early. Default True.</td></tr>
+      <tr><td><code>enable_pruning</code></td><td>Use Optuna's MedianPruner to stop unpromising trials early. When use_cv=True, pruning fires after each fold. Default True.</td></tr>
       <tr><td><code>save_trials_csv</code></td><td>Save all trial results to output_dir/hpo_trials.csv after optimization completes. Includes hyperparameters, objective score, all user_attrs_* metrics, state, and duration. Default True.</td></tr>
       <tr><td><code>cleanup_trials</code></td><td>Delete all per-trial directories (<code>trial_*/</code>) after HPO completes.  The best trial is preserved at <code>best_trial/</code> before deletion.  Each trial directory contains a full model checkpoint (≈400 MB for BERT-base); 20 trials can accumulate 8+ GB.  The SQLite study DB, <code>best_hyperparams.json</code>, <code>best_trial/</code>, and the CSV are all kept.  Default True.</td></tr>
     </table>
@@ -707,7 +718,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
 
     <h4>optimize_ray()</h4>
     <div class="sig">
-      <span class="fn-name">optimize_ray</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=None</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">use_lora=True</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=2</span>, <span class="param">ray_address=None</span>, <span class="param">num_gpus_per_trial=0.0</span>, <span class="param">num_cpus_per_trial=4</span>, <span class="param">max_concurrent_trials=None</span>, <span class="param">resume=True</span>, <span class="param">experiment_name=None</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">use_asha=False</span>, <span class="param">use_fast=False</span>) → <span class="returns">(dict, Any)</span>
+      <span class="fn-name">optimize_ray</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=None</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">use_lora=True</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=4</span>, <span class="param">ray_address=None</span>, <span class="param">num_gpus_per_trial=0.0</span>, <span class="param">num_cpus_per_trial=4</span>, <span class="param">max_concurrent_trials=None</span>, <span class="param">resume=True</span>, <span class="param">experiment_name=None</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">use_asha=False</span>, <span class="param">use_fast=True</span>) → <span class="returns">(dict, Any)</span>
     </div>
     <p>Distributed HPO using Ray Tune.</p>
     <p>Extra args vs the original signature:</p>
@@ -766,6 +777,7 @@ results = clf.run(df, feature_cols=["age", "sex", ...], label_col="cause")</code
 results = clf.run(
     df, feature_cols=[...], label_col="cause",
     use_optimize=True, n_trials=50, optimize_metric="csmf_accuracy",
+    use_cv=True, n_cv_folds=3,
 )</code></pre>
     <table>
       <tr><th>Parameter</th><th>Description</th></tr>
@@ -775,7 +787,7 @@ results = clf.run(
 
     <h4>.run()</h4>
     <div class="sig">
-        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">feature_cols</span>, <span class="param">label_col</span>, <span class="param">test_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">stratify=True</span>, <span class="param">cat_cols=None</span>, <span class="param">num_cols=None</span>, <span class="param">drop_missing_label=True</span>, <span class="param">encode_categoricals='ordinal'</span>, <span class="param">scale_numeric=False</span>, <span class="param">hyperparams=None</span>, <span class="param">use_optimize=False</span>, <span class="param">n_trials=50</span>, <span class="param">optimize_metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">top_k=3</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">dict</span>
+        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">feature_cols</span>, <span class="param">label_col</span>, <span class="param">test_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">stratify=True</span>, <span class="param">cat_cols=None</span>, <span class="param">num_cols=None</span>, <span class="param">drop_missing_label=True</span>, <span class="param">encode_categoricals='ordinal'</span>, <span class="param">scale_numeric=False</span>, <span class="param">hyperparams=None</span>, <span class="param">use_optimize=False</span>, <span class="param">n_trials=50</span>, <span class="param">optimize_metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">use_cv=True</span>, <span class="param">n_cv_folds=3</span>, <span class="param">top_k=3</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">dict</span>
     </div>
     <p>Run the full tabular classification pipeline.</p>
     <p>Steps executed in order: 1. split()           — stratified train/test split 2. prepare_dataset() — imputation, encoding, scaling; label encoding 3. optimize()        — (optional) Optuna HPO on internal val split 4. train()           — fit model with best/given hyperparams 5. predict()         — generate labels and probabilities on test set</p>
@@ -795,6 +807,8 @@ results = clf.run(
       <tr><td><code>n_trials</code></td><td>Optuna trial count (use_optimize=True only). Default 50.</td></tr>
       <tr><td><code>optimize_metric</code></td><td>Metric to optimise during HPO. Default "accuracy". Options: "accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss".</td></tr>
       <tr><td><code>search_space</code></td><td>Custom Optuna search space dict (use_optimize=True only). Merged over the adaptive default space chosen from X_train.shape.</td></tr>
+      <tr><td><code>use_cv</code></td><td>Score HPO trials with k-fold cross-validation instead of a fixed val split. Folds are pre-built once — all trials see identical splits. Default True.</td></tr>
+      <tr><td><code>n_cv_folds</code></td><td>Number of CV folds when use_cv=True. Default 3. Ignored when use_cv=False.</td></tr>
       <tr><td><code>search_space_profile</code></td><td>One of "auto", "small", "balanced", "wide", "large". "auto" infers a profile from the prepared feature matrix shape before HPO.</td></tr>
       <tr><td><code>top_k</code></td><td>Number of top classes in the topk output. Default 3.</td></tr>
     </table>
@@ -896,7 +910,7 @@ results = clf.run(
 
     <h4>optimize()</h4>
     <div class="sig">
-      <span class="fn-name">optimize</span>(<span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=50</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">study_name='tabular_hpo'</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=False</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">(best_hyperparams, study)</span>
+      <span class="fn-name">optimize</span>(<span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=50</span>, <span class="param">metric='accuracy'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">study_name='tabular_hpo'</span>, <span class="param">use_cv=True</span>, <span class="param">n_cv_folds=3</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=False</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">(best_hyperparams, study)</span>
     </div>
     <p>Run Optuna hyperparameter search for a tabular model.</p>
     <p>Internally splits (X_train, y_train) into opt-train / opt-val using a stratified split. Each trial trains on opt-train and is scored on opt-val. The held-out test set from prepare_dataset() is never used here.</p>
@@ -913,9 +927,11 @@ results = clf.run(
       <tr><td><code>metric</code></td><td>Metric to optimise — "accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", or "log_loss". Default "accuracy". Use "balanced_accuracy", "csmf_accuracy", or "f1_macro" for imbalanced VA data.</td></tr>
       <tr><td><code>search_space</code></td><td>Custom search space dict. Merged over the adaptive default search space selected for this dataset.</td></tr>
       <tr><td><code>search_space_profile</code></td><td>One of "auto", "small", "balanced", "wide", "large". "auto" infers a profile from X_train.shape.</td></tr>
-      <tr><td><code>val_size</code></td><td>Fraction of X_train for trial evaluation. Default 0.2.</td></tr>
+      <tr><td><code>val_size</code></td><td>Fraction of X_train for trial evaluation (used when use_cv=False). Default 0.2.</td></tr>
       <tr><td><code>random_state</code></td><td>Seed for stratified split and Optuna sampler. Default 42.</td></tr>
       <tr><td><code>study_name</code></td><td>Optuna study name. Default "tabular_hpo".</td></tr>
+      <tr><td><code>use_cv</code></td><td>Score each trial with k-fold cross-validation. Folds are pre-built once — all trials see identical splits. Validated against minimum class count. Default True.</td></tr>
+      <tr><td><code>n_cv_folds</code></td><td>Number of CV folds when use_cv=True. Default 3.</td></tr>
       <tr><td><code>storage_path</code></td><td>SQLite URL for study persistence. Defaults to output_dir/hpo_&lt;model_name&gt;.db.</td></tr>
       <tr><td><code>load_if_exists</code></td><td>Resume an existing study. Default True.</td></tr>
       <tr><td><code>enable_pruning</code></td><td>MedianPruner for early trial termination. Default False (pruning is less useful for fast sklearn fits).</td></tr>
@@ -1198,11 +1214,13 @@ results = clf.run(
       <tr><td><code>n_trials</code></td><td>Optuna trial count (use_optimize=True only). Default 30.</td></tr>
       <tr><td><code>optimize_metric</code></td><td>Metric to maximise during HPO. Default "csmf_accuracy".</td></tr>
       <tr><td><code>search_space</code></td><td>Custom Optuna search space dict. None → DEFAULT_SEARCH_SPACE (long-context calibrated defaults).</td></tr>
+      <tr><td><code>use_cv</code></td><td>Score HPO trials with k-fold cross-validation. Default True.</td></tr>
+      <tr><td><code>n_cv_folds</code></td><td>Number of CV folds when use_cv=True. Default 3.</td></tr>
       <tr><td><code>hyperparams</code></td><td>Fixed hyperparameter dict. Used when use_optimize=False.</td></tr>
       <tr><td><code>use_lora</code></td><td>Apply LoRA adapters. Default True.</td></tr>
       <tr><td><code>use_focal</code></td><td>Use focal loss during HPO trials (use_optimize=True only). Merges FOCAL_SEARCH_SPACE (focal_gamma, class_weights) and injects loss_type="focal" into every trial. Default False. For non-HPO focal loss, pass hyperparams={"loss_type": "focal", "focal_gamma": 2.0, "class_weights": "effective_n"}.</td></tr>
       <tr><td><code>gradient_checkpointing</code></td><td>Enable gradient checkpointing. Default True (strongly recommended for long-context models).</td></tr>
-      <tr><td><code>early_stopping_patience</code></td><td>Early stopping patience. Default 2.</td></tr>
+      <tr><td><code>early_stopping_patience</code></td><td>Early stopping patience. Default 4.</td></tr>
       <tr><td><code>resume_hpo</code></td><td>Resume an existing Optuna study if present (load_if_exists). Default True.</td></tr>
       <tr><td><code>resume_training</code></td><td>Resume final training from the latest checkpoint in output_dir/final/ if one exists. Default True.</td></tr>
       <tr><td><code>batch_size</code></td><td>Inference batch size. Default 16.</td></tr>

@@ -169,21 +169,6 @@ DEFAULT_META_SEARCH_SPACES: dict[str, dict] = {
         "subsample":         ("float",      0.5,  1.0),
         "colsample_bytree":  ("float",      0.5,  1.0),
     },
-    "catboost": {
-        "iterations":        ("int",        50,  400),
-        "learning_rate":     ("log_float", 0.01, 0.3),
-        "depth":             ("int",         3,    8),
-    },
-    "gbdt": {
-        "n_estimators":      ("int",        50,  400),
-        "learning_rate":     ("log_float", 0.01, 0.3),
-        "max_depth":         ("int",         3,   10),
-    },
-    "mlp": {
-        "hidden_layer_sizes": ("categorical", [(64,), (128,), (256,), (128, 64), (256, 128)]),
-        "learning_rate_init": ("log_float",   1e-4, 1e-2),
-        "alpha":              ("log_float",   1e-5, 1e-2),
-    },
 }
 
 # Alias used to identify InSilicoVA specs throughout this module
@@ -401,73 +386,140 @@ def _learn_class_voter_weights(
     prob_matrices: list[np.ndarray],
     y_true: np.ndarray,
     id2label: dict,
-    metric: str = "recall",
-    alpha: float = 1.0,
-    shrinkage: float = 0.25,
+    metric: str = "brier",
+    shrinkage: float = 0.5,
+    min_support_for_trust: float = 20.0,
 ) -> np.ndarray:
     """Learn a per-model × per-class weight matrix from OOF probabilities.
 
-    Weighting rule:
-    1. Compute a per-class score for each model from OOF predictions
-       (recall, precision, or F1).
-    2. Add ``alpha`` to every model/class score before normalization.
-       This prevents exact zero weights and stabilizes rare classes.
-    3. Normalize within each class so model weights sum to 1.
-    4. Blend the learned weights toward uniform weights by ``shrinkage``.
-       This reduces overfitting on low-support classes.
+    Weighting rule
+    --------------
+    1. Compute a per-class score for each model from OOF *probabilities*
+       (not hard decisions).  Default metric is Brier score, which rewards
+       calibrated confidence and is reliable even when a class has very few
+       OOF examples.
+    2. Normalize within each class so model weights sum to 1 per class.
+       A column-zero guard ensures classes that no model ever predicted still
+       get uniform weights (1/n_models) rather than NaN.
+    3. Blend toward uniform with *support-adaptive shrinkage*: classes with
+       fewer OOF training examples are shrunk more aggressively toward equal
+       weights than well-represented classes.
 
-    Interpretation:
-    - Larger ``alpha`` -> flatter per-class weights; weaker preference for the
-      empirically best OOF model on that class.
-    - Larger ``shrinkage`` -> stronger pull toward equal-weight voting.
-      ``shrinkage=0`` keeps the learned class-specific weights untouched;
-      ``shrinkage=1`` becomes uniform voting for every class.
+    Why no alpha
+    ------------
+    The previous additive-smoothing (alpha) parameter compresses real score
+    differences before normalization and double-regularizes alongside
+    shrinkage.  Zero-score columns are now handled by the column-zero guard;
+    rare-class stability is handled by the support-adaptive shrinkage.
+    Both mechanisms are more targeted than a global alpha offset.
+
+    Args:
+        prob_matrices:         List of (n_samples, n_classes) OOF probability
+                               matrices, one per base model.
+        y_true:                Integer class labels aligned with OOF rows.
+        id2label:              Map from integer class ID to label string.
+        metric:                Per-class scoring metric.  ``"brier"`` (default)
+                               uses 1 − Brier score; operates on soft
+                               probabilities and degrades gracefully for rare
+                               classes.  ``"recall"``, ``"precision"``,
+                               ``"f1"`` use hard-argmax decisions and are
+                               provided for comparison only.
+        shrinkage:             Base blend factor toward uniform per-class
+                               weights.  This is the shrinkage applied to a
+                               well-supported class (support ≥ ~3×
+                               ``min_support_for_trust``).  Classes with fewer
+                               OOF examples receive additional shrinkage on
+                               top of this base.  ``0.0`` = trust learned OOF
+                               weights for all classes; ``1.0`` = uniform
+                               voting for all classes.  Default ``0.5``.
+        min_support_for_trust: OOF sample count at which per-class scores
+                               receive roughly ``(1 − shrinkage) × 63%`` of
+                               their full weight (exponential decay constant).
+                               Classes below this count are pulled strongly
+                               toward uniform; classes well above it use the
+                               base ``shrinkage``.  Default ``20``.
     """
     if not prob_matrices:
         raise ValueError("prob_matrices must contain at least one matrix.")
-    if metric not in {"recall", "precision", "f1"}:
-        raise ValueError("metric must be one of: 'recall', 'precision', 'f1'.")
-    if alpha < 0:
-        raise ValueError("alpha must be >= 0.")
+    if metric not in {"brier", "recall", "precision", "f1"}:
+        raise ValueError("metric must be one of: 'brier', 'recall', 'precision', 'f1'.")
     if not (0.0 <= shrinkage <= 1.0):
         raise ValueError("shrinkage must be in [0, 1].")
+    if min_support_for_trust <= 0:
+        raise ValueError("min_support_for_trust must be > 0.")
 
     sorted_ids = sorted(id2label.keys())
-    labels = [id2label[cid] for cid in sorted_ids]
-    true_labels = [id2label[int(y)] for y in y_true]
     n_models = len(prob_matrices)
     n_classes = len(sorted_ids)
+    y_int = np.asarray(y_true, dtype=int)
+
+    # Map integer label positions: id2label keys may not be 0..n_classes-1.
+    # Build a lookup from sorted position → integer class id.
+    cid_arr = np.array(sorted_ids)  # position j → class id cid_arr[j]
 
     scores = np.zeros((n_models, n_classes), dtype=float)
-    for i, probs in enumerate(prob_matrices):
-        pred_ids = np.argmax(probs, axis=1)
-        pred_labels = [id2label[sorted_ids[int(j)]] for j in pred_ids]
-        for j, label in enumerate(labels):
-            tp = sum((t == label) and (p == label) for t, p in zip(true_labels, pred_labels))
-            fp = sum((t != label) and (p == label) for t, p in zip(true_labels, pred_labels))
-            fn = sum((t == label) and (p != label) for t, p in zip(true_labels, pred_labels))
-            if metric == "recall":
-                denom = tp + fn
-                score = tp / denom if denom else 0.0
-            elif metric == "precision":
-                denom = tp + fp
-                score = tp / denom if denom else 0.0
-            else:
-                prec = tp / (tp + fp) if (tp + fp) else 0.0
-                rec = tp / (tp + fn) if (tp + fn) else 0.0
-                score = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
-            scores[i, j] = score
 
-    # Additive smoothing: prevents brittle zero-weight columns when a model has
-    # zero recall / precision / F1 for a rare class in OOF data.
-    scores = scores + alpha
+    if metric == "brier":
+        # Brier score per class: 1 − mean((p_c − 1{y==c})²).
+        # Range: worst uncalibrated = ~0.75 for balanced classes; perfect = 1.0.
+        # Degenerate edge cases (class entirely absent or present in OOF):
+        # if y_bin is all-zero, Brier score = 1 − mean(p²) which is ≥ 0.
+        # if y_bin is all-one, Brier score = 1 − mean((p−1)²) which is ≥ 0.
+        # Both degenerate cases yield a valid non-negative score; the support-
+        # adaptive shrinkage will force near-zero-support classes toward uniform
+        # anyway.
+        for i, probs in enumerate(prob_matrices):
+            for j, cid in enumerate(sorted_ids):
+                y_bin = (y_int == cid).astype(float)
+                p_col = probs[:, j]
+                scores[i, j] = 1.0 - float(np.mean((p_col - y_bin) ** 2))
+    else:
+        # Hard-argmax metrics kept for diagnostic / comparison use.
+        labels = [id2label[cid] for cid in sorted_ids]
+        true_labels = [id2label[int(y)] for y in y_true]
+        for i, probs in enumerate(prob_matrices):
+            pred_ids = np.argmax(probs, axis=1)
+            pred_labels = [id2label[cid_arr[int(j)]] for j in pred_ids]
+            for j, label in enumerate(labels):
+                tp = sum((t == label) and (p == label) for t, p in zip(true_labels, pred_labels))
+                fp = sum((t != label) and (p == label) for t, p in zip(true_labels, pred_labels))
+                fn = sum((t == label) and (p != label) for t, p in zip(true_labels, pred_labels))
+                if metric == "recall":
+                    denom = tp + fn
+                    scores[i, j] = tp / denom if denom else 0.0
+                elif metric == "precision":
+                    denom = tp + fp
+                    scores[i, j] = tp / denom if denom else 0.0
+                else:  # f1
+                    prec = tp / (tp + fp) if (tp + fp) else 0.0
+                    rec  = tp / (tp + fn) if (tp + fn) else 0.0
+                    scores[i, j] = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+
+    # Column-zero guard: if no model ever predicted a class in OOF data, every
+    # score in that column is 0.  Dividing by 0 would produce NaN; instead we
+    # replace the column sum with 1.0 so all scores stay 0, then shrinkage will
+    # pull them to uniform (1/n_models).  This is the correct behaviour: no
+    # signal → default to equal weight.
+    col_sums = scores.sum(axis=0, keepdims=True)
+    col_sums[col_sums == 0.0] = 1.0
+    scores = scores / col_sums  # each column sums to 1
+
+    # Support-adaptive shrinkage: rare classes (few OOF examples) are pulled
+    # harder toward uniform than well-represented ones.
+    # Effective shrinkage for class c:
+    #   s_c = shrinkage + (1 - shrinkage) × exp(-support_c / min_support_for_trust)
+    # When support_c >> min_support_for_trust: s_c ≈ shrinkage (base level).
+    # When support_c → 0:                      s_c → 1.0 (forced uniform).
+    support = np.array([float(np.sum(y_int == cid)) for cid in sorted_ids])
+    class_shrinkage = shrinkage + (1.0 - shrinkage) * np.exp(
+        -support / min_support_for_trust
+    )  # shape (n_classes,) — values in [shrinkage, 1.0]
+
+    uniform = np.full((n_models, n_classes), 1.0 / n_models)
+    # Broadcast class_shrinkage across models: shape (1, n_classes)
+    scores = class_shrinkage[None, :] * uniform + (1.0 - class_shrinkage[None, :]) * scores
+    # Re-normalize columns to exactly 1 after floating-point blend.
     scores = scores / scores.sum(axis=0, keepdims=True)
-    if shrinkage > 0:
-        # Shrink toward uniform class weights so tiny OOF classes do not create
-        # overly extreme model preferences.
-        uniform = np.full_like(scores, 1.0 / n_models)
-        scores = shrinkage * uniform + (1.0 - shrinkage) * scores
-        scores = scores / scores.sum(axis=0, keepdims=True)
     return scores
 
 
@@ -475,7 +527,37 @@ def _apply_class_voter(
     prob_matrices: list[np.ndarray],
     class_weights: np.ndarray,
 ) -> np.ndarray:
-    """Combine base-model probability matrices with class-aware weights."""
+    """Combine base-model probability matrices with class-aware soft-gating.
+
+    Gate design
+    -----------
+    For each sample i, model m's gate is the class weight for the class model m
+    predicts as most likely:
+
+        gate[m, i] = class_weights[m, argmax_c prob_m[i, c]]
+
+    This directly asks "is model m reliable for the class it is actually
+    predicting for sample i?" — a targeted per-sample trust score that is
+    informative even when the weight matrix has been shrunk close to uniform.
+
+    The previous design used the *expected* class weight
+    (Σ_c prob_m[i,c] × class_weights[m,c]), which is dominated by the all-class
+    average when weights are near-uniform, producing gates that are nearly
+    identical across models and samples and adding noise rather than signal.
+
+    Normalize gates across models per sample to get convex combination
+    coefficients:
+
+        w[m, i] = gate[m, i] / Σ_{m'} gate[m', i]
+
+    Then the combined output is a proper weighted average of valid probability
+    vectors, so rows sum to exactly 1 with no renormalization needed:
+
+        combined[i, :] = Σ_m  w[m, i] × prob_m[i, :]
+
+    When class_weights are uniform (1/n_models for all m, c), every gate equals
+    1/n_models and the output reduces to plain uniform soft voting.
+    """
     if not prob_matrices:
         raise ValueError("prob_matrices must contain at least one matrix.")
     n_models = len(prob_matrices)
@@ -484,11 +566,131 @@ def _apply_class_voter(
         raise ValueError(
             f"class_weights must have shape ({n_models}, {n_classes}), got {class_weights.shape}."
         )
-    stacked = np.stack(prob_matrices, axis=0)               # (n_models, n_samples, n_classes)
-    combined = (stacked * class_weights[:, None, :]).sum(axis=0)
-    row_sums = combined.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0.0] = 1.0
-    return combined / row_sums
+    stacked = np.stack(prob_matrices, axis=0)  # (n_models, n_samples, n_classes)
+
+    # gate[m, i] = class_weights[m, argmax_c prob_m[i, c]]
+    # pred_classes: (n_models, n_samples) — top-1 predicted class index per model per sample
+    pred_classes = np.argmax(stacked, axis=2)  # (n_models, n_samples)
+    # Gather the weight for the predicted class: class_weights[m, pred_classes[m, i]]
+    m_idx = np.arange(n_models)[:, None]       # (n_models, 1) — broadcast over samples
+    gate = class_weights[m_idx, pred_classes]  # (n_models, n_samples)
+
+    # Normalize across models per sample → convex combination coefficients.
+    gate_sum = gate.sum(axis=0, keepdims=True)                # (1, n_samples)
+    # If all models get zero gate on a sample, fall back to uniform voting for
+    # that sample instead of leaving the row as all zeros.
+    zero_cols = np.where(gate_sum[0] == 0.0)[0]
+    if len(zero_cols) > 0:
+        gate[:, zero_cols] = 1.0 / n_models
+        gate_sum = gate.sum(axis=0, keepdims=True)
+    gate = gate / gate_sum                                     # (n_models, n_samples)
+
+    # Weighted average of full probability vectors.
+    # gate[:, :, None] → (n_models, n_samples, 1)
+    combined = (stacked * gate[:, :, None]).sum(axis=0)       # (n_samples, n_classes)
+    # Rows sum to 1 exactly (convex combination of simplex elements).
+    return combined
+
+
+def _uniform_soft_vote(prob_matrices: list[np.ndarray]) -> np.ndarray:
+    """Uniform soft voting over probability matrices."""
+    if not prob_matrices:
+        raise ValueError("prob_matrices must contain at least one matrix.")
+    ref_shape = prob_matrices[0].shape
+    for i, m in enumerate(prob_matrices[1:], start=1):
+        if m.shape != ref_shape:
+            raise ValueError(
+                f"Shape mismatch: prob_matrices[0] has shape {ref_shape}, "
+                f"but prob_matrices[{i}] has shape {m.shape}."
+            )
+    return np.stack(prob_matrices, axis=0).mean(axis=0)
+
+
+def _score_prob_matrix(
+    probs: np.ndarray,
+    y_true: np.ndarray,
+    id2label: dict,
+    metric: str,
+) -> float:
+    """Score a probability matrix via top-1 labels and score_predictions()."""
+    from ..utils.metrics import score_predictions
+
+    true_labels = [id2label[int(y)] for y in y_true]
+    result = _assemble_prediction_result(probs, true_labels, id2label, top_k=1)
+    return float(score_predictions(result.top1, metric=metric))
+
+
+def _compare_class_voter_vs_soft_cv(
+    prob_matrices: list[np.ndarray],
+    y_true: np.ndarray,
+    id2label: dict,
+    voter_metric: str,
+    shrinkage: float,
+    min_support_for_trust: float,
+    selection_metric: str,
+    cv_folds: int,
+    random_state: int,
+) -> dict:
+    """CV comparison of learned class voter vs uniform soft vote on OOF data.
+
+    Returns a report dict. If stratified CV is not feasible (too few samples in
+    at least one class), ``enabled`` is False and no fallback decision should
+    be made from this report.
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    y_arr = np.asarray(y_true, dtype=int)
+    sorted_ids = sorted(id2label.keys())
+    supports = [int(np.sum(y_arr == cid)) for cid in sorted_ids]
+    max_folds = min(supports) if supports else 0
+    folds = min(int(cv_folds), int(max_folds))
+    if folds < 2:
+        return {
+            "enabled": False,
+            "reason": (
+                "Insufficient per-class support for stratified fallback CV "
+                f"(requested={cv_folds}, max_possible={max_folds})."
+            ),
+            "cv_folds_used": int(folds),
+        }
+
+    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
+    voter_scores: list[float] = []
+    soft_scores: list[float] = []
+
+    idx = np.arange(len(y_arr))
+    for tr_idx, va_idx in cv.split(idx, y_arr):
+        tr_probs = [p[tr_idx] for p in prob_matrices]
+        va_probs = [p[va_idx] for p in prob_matrices]
+        tr_y = y_arr[tr_idx]
+        va_y = y_arr[va_idx]
+
+        w = _learn_class_voter_weights(
+            prob_matrices=tr_probs,
+            y_true=tr_y,
+            id2label=id2label,
+            metric=voter_metric,
+            shrinkage=shrinkage,
+            min_support_for_trust=min_support_for_trust,
+        )
+        voter_pred = _apply_class_voter(va_probs, w)
+        soft_pred = _uniform_soft_vote(va_probs)
+
+        voter_scores.append(_score_prob_matrix(voter_pred, va_y, id2label, selection_metric))
+        soft_scores.append(_score_prob_matrix(soft_pred, va_y, id2label, selection_metric))
+
+    voter_mean = float(np.mean(voter_scores))
+    soft_mean = float(np.mean(soft_scores))
+    return {
+        "enabled": True,
+        "selection_metric": selection_metric,
+        "cv_folds_used": int(folds),
+        "class_voter_scores": voter_scores,
+        "soft_vote_scores": soft_scores,
+        "class_voter_mean": voter_mean,
+        "soft_vote_mean": soft_mean,
+        "delta_class_minus_soft": voter_mean - soft_mean,
+    }
 
 
 def _meta_optuna_objective(
@@ -732,10 +934,10 @@ def generate_oof_predictions(
     n_folds: int = 5,
     random_state: int = 42,
     output_dir: str | Path = "runs/ensemble/stacking/oof",
-    # text training
-    val_size: float = 0.1,
+    # text training — val_size and early_stopping_patience are intentionally absent:
+    # fold models train on the full fold training split with fixed hyperparams.
+    # The fold boundary already defines train vs. held-out; no inner split needed.
     gradient_checkpointing: bool = False,
-    early_stopping_patience: int | None = 3,
     batch_size: int = 32,
     # tabular training
     n_jobs: int = -1,
@@ -776,10 +978,7 @@ def generate_oof_predictions(
         random_state:         Seed. Default 42.
         output_dir:           Root OOF directory.  Fold artifacts saved under
                               ``output_dir/fold_k/text_i/`` etc.
-        val_size:             Internal val fraction for text fold training
-                              (early stopping). Default 0.1.
         gradient_checkpointing: Enable gradient checkpointing for text folds.
-        early_stopping_patience: Early stopping patience for text fold models.
         batch_size:           Text inference batch size.
         n_jobs:               CPU parallelism for tabular models.
         use_gpu:              GPU flag for tabular models. None = auto-detect.
@@ -854,7 +1053,6 @@ def generate_oof_predictions(
                 model_name = spec["model_name"]
                 max_length = spec.get("max_length", 512)
                 use_lora   = spec.get("use_lora", False)
-                esp        = spec.get("early_stopping_patience", early_stopping_patience)
                 gc         = spec.get("gradient_checkpointing", gradient_checkpointing)
                 hp         = (text_best_hp[i] if text_best_hp else None) or spec.get("hyperparams") or {}
 
@@ -868,11 +1066,11 @@ def generate_oof_predictions(
                     model_name=model_name,
                     output_dir=model_dir / "weights",
                     hyperparams=hp,
-                    val_size=val_size,
-                    use_lora=use_lora,
+                    val_size=None,                # fold boundary IS the val boundary;
+                    use_lora=use_lora,            # no inner split — epochs fixed by HPO
                     gradient_checkpointing=gc,
-                    early_stopping_patience=esp,
-                    resume=False,          # never cross-contaminate fold checkpoints
+                    early_stopping_patience=None, # no early stopping in fold training
+                    resume=False,                 # never cross-contaminate fold checkpoints
                 )
 
                 result     = text_predict(
@@ -1404,6 +1602,8 @@ class StackingClassifier:
                         n_trials=spec.get("n_trials", 20),
                         metric=spec.get("optimize_metric", "f1_macro"),
                         search_space=spec.get("search_space"),
+                        use_cv=spec.get("use_cv", True),
+                        n_cv_folds=spec.get("n_cv_folds", 3),
                         random_state=random_state,
                         n_jobs=n_jobs, use_gpu=use_gpu,
                     )
@@ -1443,9 +1643,7 @@ class StackingClassifier:
                 n_folds=self.n_folds,
                 random_state=random_state,
                 output_dir=oof_dir,
-                val_size=val_size,
                 gradient_checkpointing=gradient_checkpointing,
-                early_stopping_patience=early_stopping_patience,
                 batch_size=batch_size,
                 n_jobs=n_jobs,
                 use_gpu=use_gpu,
@@ -1834,9 +2032,14 @@ class StackingClassifier:
 
     def train_class_voter_stage(
         self,
-        metric: str = "recall",
-        alpha: float = 1.0,
-        shrinkage: float = 0.25,
+        metric: str = "brier",
+        shrinkage: float = 0.5,
+        min_support_for_trust: float = 20.0,
+        fallback_to_soft: bool = True,
+        fallback_metric: str = "f1_macro",
+        fallback_cv_folds: int = 3,
+        fallback_random_state: int = 42,
+        fallback_tolerance: float = 0.0,
     ) -> dict:
         """Stage 2 alternative: learn class-aware voting weights from OOF data.
 
@@ -1845,19 +2048,57 @@ class StackingClassifier:
         each class, without fitting a meta-learner over the concatenated OOF
         features.
 
+        The learned weights are applied via predicted-class soft-gating
+        (implemented in :func:`_apply_class_voter`): for each sample, each
+        model gets the weight associated with the class that model predicts as
+        most likely, then gates are normalized across models.
+
         Args:
-            metric: Per-class OOF score used to compare models within each
-                    class. One of ``"recall"``, ``"precision"``, ``"f1"``.
-            alpha:  Additive smoothing constant applied to every model/class
-                    score before normalizing. Higher values flatten the learned
-                    class-specific weights and make the voter less aggressive.
+            metric: Per-class OOF scoring metric used to rank models within
+                    each class.  ``"brier"`` (default) computes
+                    1 − mean((p − y_bin)²) from soft probabilities — reliable
+                    on small class samples and degrades gracefully when a class
+                    is rare or absent in OOF data.  ``"recall"``,
+                    ``"precision"``, ``"f1"`` use hard argmax decisions and are
+                    provided for diagnostic comparison.
             shrinkage:
-                    Blend factor toward uniform per-class weights.
-                    ``0.0`` = trust the learned OOF class weights directly.
-                    ``1.0`` = ignore OOF differences and use equal weights for
-                    every class.
+                    Base blend factor toward uniform per-class weights for
+                    well-supported classes.  Classes with fewer OOF examples
+                    than ``min_support_for_trust`` receive additional shrinkage
+                    on top of this base (support-adaptive).
+                    ``0.0`` = trust learned OOF weights for all classes.
+                    ``1.0`` = uniform voting for all classes.  Default ``0.5``.
+            min_support_for_trust:
+                    OOF training-set count below which a class is considered
+                    insufficiently supported and its weights are pulled
+                    more strongly toward uniform.  Default ``20``.
+            fallback_to_soft:
+                    If True (default), run a stratified CV safeguard on OOF
+                    data comparing learned class-voter vs uniform soft voting.
+                    If class-voter underperforms by more than
+                    ``fallback_tolerance``, final saved weights are replaced by
+                    exact uniform weights (safe fallback).
+            fallback_metric:
+                    Metric for the fallback comparison CV.  Uses
+                    ``score_predictions`` supported metrics. Default
+                    ``"f1_macro"``.
+            fallback_cv_folds:
+                    Requested stratified folds for fallback CV. Default ``3``.
+                    If class support is too low, folds are reduced
+                    automatically; if fewer than 2 folds are possible, fallback
+                    CV is skipped.
+            fallback_random_state:
+                    Random seed for fallback CV split. Default ``42``.
+            fallback_tolerance:
+                    Non-negative margin (in score units) that class-voter must
+                    beat soft-vote by on fallback CV in order to be kept.
+                    Final fallback decision keeps class-voter only when:
+                    ``class_cv > soft_cv + fallback_tolerance``.
+                    Default ``0.0`` (ties prefer uniform soft vote).
         """
         self._ensure_oof_loaded()
+        if fallback_tolerance < 0:
+            raise ValueError("fallback_tolerance must be >= 0.")
 
         oof_meta_path = self.output_dir / "oof" / "oof_metadata.json"
         if not oof_meta_path.exists():
@@ -1880,17 +2121,71 @@ class StackingClassifier:
             y_true=self.oof_y,
             id2label=self.id2label,
             metric=metric,
-            alpha=alpha,
             shrinkage=shrinkage,
+            min_support_for_trust=min_support_for_trust,
         )
         combined_oof = _apply_class_voter(prob_matrices, class_weights)
-        true_labels = [self.id2label[int(y)] for y in self.oof_y]
-        oof_result = _assemble_prediction_result(combined_oof, true_labels, self.id2label, top_k=3)
+        soft_oof = _uniform_soft_vote(prob_matrices)
 
         from ..utils.metrics import score_predictions
 
         metric_names = ["accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"]
-        scores = {name: float(score_predictions(oof_result.top1, metric=name)) for name in metric_names}
+        true_labels = [self.id2label[int(y)] for y in self.oof_y]
+        learned_result = _assemble_prediction_result(combined_oof, true_labels, self.id2label, top_k=3)
+        soft_result = _assemble_prediction_result(soft_oof, true_labels, self.id2label, top_k=3)
+        learned_scores = {
+            name: float(score_predictions(learned_result.top1, metric=name))
+            for name in metric_names
+        }
+        soft_scores = {
+            name: float(score_predictions(soft_result.top1, metric=name))
+            for name in metric_names
+        }
+
+        fallback_report = None
+        use_uniform_fallback = False
+        if fallback_to_soft:
+            fallback_report = _compare_class_voter_vs_soft_cv(
+                prob_matrices=prob_matrices,
+                y_true=self.oof_y,
+                id2label=self.id2label,
+                voter_metric=metric,
+                shrinkage=shrinkage,
+                min_support_for_trust=min_support_for_trust,
+                selection_metric=fallback_metric,
+                cv_folds=fallback_cv_folds,
+                random_state=fallback_random_state,
+            )
+            if fallback_report.get("enabled"):
+                voter_cv = float(fallback_report["class_voter_mean"])
+                soft_cv = float(fallback_report["soft_vote_mean"])
+                # Conservative safeguard: keep class-voter only when it
+                # demonstrably beats soft-vote on CV by the configured margin.
+                use_uniform_fallback = voter_cv <= (soft_cv + fallback_tolerance)
+            else:
+                logger.warning(
+                    "Class-voter fallback CV skipped: %s",
+                    fallback_report.get("reason", "unknown reason"),
+                )
+
+        if use_uniform_fallback:
+            logger.info(
+                "Class-voter fallback activated: learned weights underperform "
+                "soft vote on CV (%s %.4f vs %.4f). Saving uniform weights.",
+                fallback_metric,
+                float(fallback_report["class_voter_mean"]),
+                float(fallback_report["soft_vote_mean"]),
+            )
+            n_models = len(model_sources)
+            n_classes = len(sorted_ids)
+            class_weights = np.full((n_models, n_classes), 1.0 / n_models)
+
+        final_oof = _apply_class_voter(prob_matrices, class_weights)
+        final_result = _assemble_prediction_result(final_oof, true_labels, self.id2label, top_k=3)
+        scores = {
+            name: float(score_predictions(final_result.top1, metric=name))
+            for name in metric_names
+        }
 
         class_voter_dir = self.output_dir / "class_voter"
         class_voter_dir.mkdir(parents=True, exist_ok=True)
@@ -1907,12 +2202,21 @@ class StackingClassifier:
 
         metadata = {
             "metric": metric,
-            "alpha": alpha,
             "shrinkage": shrinkage,
+            "min_support_for_trust": min_support_for_trust,
+            "fallback_to_soft": fallback_to_soft,
+            "fallback_metric": fallback_metric,
+            "fallback_cv_folds": fallback_cv_folds,
+            "fallback_random_state": fallback_random_state,
+            "fallback_tolerance": fallback_tolerance,
+            "used_uniform_fallback": use_uniform_fallback,
             "oof_meta_X_shape": list(self.oof_meta_X.shape),
             "n_models": len(model_sources),
             "n_classes": len(sorted_ids),
             "model_names": [src["spec"]["model_name"] for src in model_sources],
+            "learned_scores": learned_scores,
+            "soft_vote_scores": soft_scores,
+            "fallback_cv_report": fallback_report,
             "scores": scores,
         }
         with open(class_voter_dir / "class_voter_metadata.json", "w") as fh:
@@ -1925,6 +2229,10 @@ class StackingClassifier:
         return {
             "class_weights": class_weights,
             "scores": scores,
+            "learned_scores": learned_scores,
+            "soft_vote_scores": soft_scores,
+            "used_uniform_fallback": use_uniform_fallback,
+            "fallback_cv_report": fallback_report,
             "output_dir": self.output_dir,
         }
 

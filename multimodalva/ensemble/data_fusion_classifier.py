@@ -8,9 +8,17 @@ and runs the standard text classification pipeline:
 Long-context models are required because the combined tabular description and
 free-text narrative routinely exceeds 512 tokens:
 
-    "allenai/longformer-base-4096"   — general-purpose; up to 4 096 tokens
-    "yikuan8/Clinical-Longformer"    — domain-adapted on clinical notes
-    "google/bigbird-roberta-base"    — block-sparse attention; up to 4 096 tokens
+    "allenai/longformer-base-4096"   — general-purpose; up to 4 096 tokens (OSC/CUDA)
+    "yikuan8/Clinical-Longformer"    — domain-adapted on clinical notes (OSC/CUDA)
+    "google/bigbird-roberta-base"    — MPS-native on Apple Silicon (recommended for local runs)
+    "yikuan8/Clinical-BigBird"       — domain-adapted BigBird; MPS-native on Apple Silicon
+
+MPS (Apple Silicon) note:
+    BigBird is preferred for local M-chip runs.  train() auto-detects MPS and injects
+    attention_type="original_full", switching BigBird from block-sparse to standard
+    dense attention — same model weights, no CUDA ops, no CPU fallback required.
+    Longformer on MPS requires PYTORCH_ENABLE_MPS_FALLBACK=1 and is typically slower
+    than CPU due to continuous MPS↔CPU tensor copies for the scatter/gather ops.
 
 Public API:
     DataFusionClassifier
@@ -20,13 +28,43 @@ Public API:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
 
+from multimodalva.utils.runtime import RuntimeTracker
+
 from .data_fusion import build_fused_text, DEFAULT_SEPARATOR
 
 logger = logging.getLogger(__name__)
+
+
+def _distributed_state() -> tuple[int, int]:
+    """Return (rank, world_size) from env vars used by torchrun."""
+    try:
+        rank = int(os.environ.get("RANK", "0"))
+    except ValueError:
+        rank = 0
+    try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError:
+        world_size = 1
+    return rank, max(1, world_size)
+
+
+def _resolve_seed(random_state: int, set_seed: int | None) -> int:
+    """Resolve an effective seed value, with `set_seed` taking precedence."""
+    if set_seed is None:
+        return int(random_state)
+    resolved = int(set_seed)
+    if resolved != int(random_state):
+        logger.info(
+            "set_seed=%d provided; overriding random_state=%d.",
+            resolved,
+            random_state,
+        )
+    return resolved
 
 # ---------------------------------------------------------------------------
 # Default HPO search space for long-context models
@@ -85,9 +123,21 @@ class DataFusionClassifier:
     pipeline (split → prepare_dataset → [optimize →] train → predict).
 
     Recommended models:
-        "allenai/longformer-base-4096"   — general-purpose long-context
-        "yikuan8/Clinical-Longformer"    — domain-adapted on clinical notes
-        "google/bigbird-roberta-base"    — block-sparse attention
+        "allenai/longformer-base-4096"   — general-purpose long-context (OSC/CUDA)
+        "yikuan8/Clinical-Longformer"    — domain-adapted on clinical notes (OSC/CUDA)
+        "google/bigbird-roberta-base"    — MPS-native on Apple Silicon (recommended for local runs)
+        "yikuan8/Clinical-BigBird"       — domain-adapted BigBird (MPS-native on Apple Silicon)
+
+    MPS (Apple Silicon M-chip) guidance:
+        BigBird is the recommended model family for local development on M-chip Macs.
+        train() auto-detects MPS and sets attention_type="original_full" for BigBird,
+        switching from block-sparse to standard dense attention which runs natively on
+        Metal without any CPU fallback.
+
+        Longformer on MPS requires PYTORCH_ENABLE_MPS_FALLBACK=1 because
+        LongformerSelfAttention scatter/gather ops are not in Metal.  The CPU fallback
+        causes continuous MPS↔CPU tensor copies that are often slower than pure CPU.
+        Use Longformer on OSC (CUDA) and BigBird for local MPS verification runs.
 
     Typical usage::
 
@@ -146,12 +196,14 @@ class DataFusionClassifier:
         prefix_cols: dict[str, str] | None = None,
         yes_no_map: dict[str, str] | None = None,
         separator: str = DEFAULT_SEPARATOR,
-        group_symptoms: bool = False,
+        group_symptoms: bool = True,
         fused_col: str = "fused_text",
-        save_fused_csv: bool = True,
+        save_fused_csv: bool = False,
+        fusion_n_jobs: int | None = None,
         # --- split ---
         test_size: float = 0.2,
         random_state: int = 42,
+        set_seed: int | None = None,
         stratify: bool = True,
         # --- tokenisation ---
         max_length: int = 1024,
@@ -164,13 +216,15 @@ class DataFusionClassifier:
         use_lora: bool = True,
         use_focal: bool = False,
         gradient_checkpointing: bool = True,
-        early_stopping_patience: int | None = 2,
+        early_stopping_patience: int | None = 4,
+        use_cv: bool = True,
+        n_cv_folds: int = 3,
         resume_hpo: bool = True,
         resume_training: bool = True,
         # --- inference ---
         batch_size: int = 16,
         top_k: int = 3,
-        use_fast: bool = False,
+        use_fast: bool = True,
     ) -> dict:
         """Run the full data-level fusion pipeline.
 
@@ -201,8 +255,14 @@ class DataFusionClassifier:
             group_symptoms: Group symptoms sharing the same verb into one sentence.
                            Default True (~40–50% fewer tokens).
             fused_col:     Name of the temporary fused text column. Default "fused_text".
+            save_fused_csv: Save fused text CSV under output_dir. Default False
+                           for faster cluster runs and lower shared-filesystem I/O.
+            fusion_n_jobs: CPU workers for build_fused_text(). None = auto.
             test_size:     Fraction held out for testing. Default 0.2.
             random_state:  Random seed. Default 42.
+            set_seed:      Optional alias for a single run-level seed. When
+                           provided, overrides ``random_state`` so one value
+                           controls split, HPO, and training seeds end-to-end.
             stratify:      Stratified split. Default True.
             max_length:    Tokeniser max length. Default 1 024 (Longformer/BigBird).
                            Use 4 096 for very long documents.
@@ -220,13 +280,18 @@ class DataFusionClassifier:
                            "focal_gamma": 2.0, "class_weights": "effective_n"}.
             gradient_checkpointing: Enable gradient checkpointing. Default True
                            (strongly recommended for long-context models).
-            early_stopping_patience: Early stopping patience. Default 2.
+            early_stopping_patience: Early stopping patience. Default 4.
+            use_cv:        Use stratified k-fold CV in HPO to reduce metric variance
+                           on rare classes. Default True.
+            n_cv_folds:    Number of CV folds when use_cv=True. Default 3.
             resume_hpo:    Resume an existing Optuna study if present (load_if_exists).
                            Default True.
             resume_training: Resume final training from the latest checkpoint in
                            output_dir/final/ if one exists. Default True.
             batch_size:    Inference batch size. Default 16.
             top_k:         Number of top classes in topk output. Default 3.
+            use_fast:      Use fast tokenizer implementations when available.
+                           Default True.
 
         Returns:
             dict with keys:
@@ -241,49 +306,89 @@ class DataFusionClassifier:
         # Step 1 — Build fused text (skipped if df already contains fused_col)
         # ------------------------------------------------------------------
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        if fused_col in df.columns:
-            logger.info(
-                "DataFusionClassifier: column '%s' already present in df — "
-                "skipping build_fused_text().",
-                fused_col,
-            )
-            fused_df = df[[label_col, fused_col]].copy()
-        else:
-            logger.info(
-                "DataFusionClassifier: fusing %d tabular columns into narrative text.",
-                len(feature_cols),
-            )
-            fused_series = build_fused_text(
-                df,
-                text_col=text_col,
-                feature_cols=feature_cols,
-                qdesc=qdesc,
-                templates=templates,
-                binary_map=binary_map,
-                with_neg=with_neg,
-                prefix_cols=prefix_cols,
-                yes_no_map=yes_no_map,
-                separator=separator,
-                group_symptoms=group_symptoms,
-                save_csv=self.output_dir / "fused_text.csv" if save_fused_csv else None,
-            )
-            # Build a minimal DataFrame: fused text + label only.
-            fused_df = df[[label_col]].copy()
-            fused_df[fused_col] = fused_series.values
+        runtime_tracker = RuntimeTracker(
+            self.output_dir,
+            report_name="pipeline_runtime.json",
+            metadata={
+                "pipeline": "data_fusion_classifier",
+                "model_name": self.model_name,
+                "text_col": text_col,
+                "label_col": label_col,
+                "fused_col": fused_col,
+                "use_optimize": use_optimize,
+            },
+            logger_=logger,
+        )
+        effective_seed = _resolve_seed(random_state=random_state, set_seed=set_seed)
+        rank, world_size = _distributed_state()
+        save_fused_path = (
+            self.output_dir / "fused_text.csv"
+            if (save_fused_csv and (world_size == 1 or rank == 0))
+            else None
+        )
+        with runtime_tracker.stage(
+            "build_fused_text",
+            details={
+                "rows": len(df),
+                "feature_cols": len(feature_cols),
+                "fusion_n_jobs": fusion_n_jobs,
+                "group_symptoms": group_symptoms,
+                "save_fused_csv": save_fused_csv,
+            },
+        ):
+            if fused_col in df.columns:
+                logger.info(
+                    "DataFusionClassifier: column '%s' already present in df — "
+                    "skipping build_fused_text().",
+                    fused_col,
+                )
+                fused_df = df[[label_col, fused_col]].copy()
+            else:
+                logger.info(
+                    "DataFusionClassifier: fusing %d tabular columns into narrative text.",
+                    len(feature_cols),
+                )
+                fused_series = build_fused_text(
+                    df,
+                    text_col=text_col,
+                    feature_cols=feature_cols,
+                    qdesc=qdesc,
+                    templates=templates,
+                    binary_map=binary_map,
+                    with_neg=with_neg,
+                    prefix_cols=prefix_cols,
+                    yes_no_map=yes_no_map,
+                    separator=separator,
+                    group_symptoms=group_symptoms,
+                    save_csv=save_fused_path,
+                    n_jobs=fusion_n_jobs,
+                )
+                # Build a minimal DataFrame: fused text + label only.
+                fused_df = df[[label_col]].copy()
+                fused_df[fused_col] = fused_series.values
 
         # ------------------------------------------------------------------
         # Step 2 — Split
         # ------------------------------------------------------------------
         from ..utils.split import split as _split
 
-        train_df, test_df = _split(
-            fused_df,
-            label_col=label_col,
-            text_col=fused_col,
-            test_size=test_size,
-            random_state=random_state,
-            stratify=stratify,
-        )
+        with runtime_tracker.stage(
+            "split",
+            details={
+                "rows": len(fused_df),
+                "test_size": test_size,
+                "random_state": effective_seed,
+                "stratify": stratify,
+            },
+        ):
+            train_df, test_df = _split(
+                fused_df,
+                label_col=label_col,
+                text_col=fused_col,
+                test_size=test_size,
+                random_state=effective_seed,
+                stratify=stratify,
+            )
         self.train_df = train_df
         self.test_df  = test_df
         logger.info("Split: %d train / %d test rows.", len(train_df), len(test_df))
@@ -293,15 +398,19 @@ class DataFusionClassifier:
         # ------------------------------------------------------------------
         from ..text.dataset import prepare_dataset
 
-        train_ds, test_ds, label2id, id2label = prepare_dataset(
-            train_df,
-            test_df,
-            text_col=fused_col,
-            label_col=label_col,
-            model_name=self.model_name,
-            max_length=max_length,
-            use_fast=use_fast,
-        )
+        with runtime_tracker.stage(
+            "prepare_dataset",
+            details={"max_length": max_length, "use_fast": use_fast},
+        ):
+            train_ds, test_ds, label2id, id2label = prepare_dataset(
+                train_df,
+                test_df,
+                text_col=fused_col,
+                label_col=label_col,
+                model_name=self.model_name,
+                max_length=max_length,
+                use_fast=use_fast,
+            )
         self.label2id = label2id
         self.id2label = id2label
 
@@ -349,10 +458,13 @@ class DataFusionClassifier:
             use_focal=use_focal,
             gradient_checkpointing=gradient_checkpointing,
             early_stopping_patience=early_stopping_patience,
+            use_cv=use_cv,
+            n_cv_folds=n_cv_folds,
             resume_hpo=resume_hpo,
             resume_training=resume_training,
-            random_state=random_state,
+            random_state=effective_seed,
             use_fast=use_fast,
+            _runtime_tracker=runtime_tracker,
         )
 
         # Mirror TextClassifier state onto self for API consistency.

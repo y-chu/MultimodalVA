@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     import ray
 
 import numpy as np
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 
 # -----------------------
 # Package root resolution (mirrors text/hpo.py)
@@ -70,6 +70,42 @@ from .search_spaces import (  # noqa: E402
     get_default_search_space,
 )
 
+
+def _get_ray_trial_dir() -> Path:
+    """Return the current Ray Tune trial directory across Ray 2.x variants."""
+    try:
+        from ray import tune as _ray_tune
+
+        if hasattr(_ray_tune, "get_context"):
+            ctx = _ray_tune.get_context()
+            if ctx is not None:
+                return Path(ctx.get_trial_dir())
+    except Exception:
+        logger.debug("ray.tune.get_context() unavailable; trying legacy APIs.", exc_info=True)
+
+    try:
+        from ray.air import session as _air_session
+
+        trial_dir = _air_session.get_trial_dir()
+        if trial_dir:
+            return Path(trial_dir)
+    except Exception:
+        logger.debug("ray.air.session.get_trial_dir() unavailable.", exc_info=True)
+
+    cwd = Path.cwd()
+    if cwd.exists():
+        logger.warning(
+            "Falling back to current working directory for Ray trial artifacts: %s",
+            cwd,
+        )
+        return cwd
+
+    raise RuntimeError(
+        "Unable to resolve the Ray Tune trial directory. "
+        "Install a supported Ray Tune version or update the compatibility shim."
+    )
+
+
 def optimize(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -81,6 +117,8 @@ def optimize(
     metric: str = "accuracy",
     search_space: dict | None = None,
     val_size: float = 0.2,
+    use_cv: bool = True,
+    n_cv_folds: int = 3,
     random_state: int = 42,
     study_name: str = "tabular_hpo",
     storage_path: str | None = None,
@@ -94,8 +132,10 @@ def optimize(
 ) -> tuple[dict, optuna.Study]:
     """Run Optuna hyperparameter search for a tabular model.
 
-    Internally splits (X_train, y_train) into opt-train / opt-val using a
-    stratified split. Each trial trains on opt-train and is scored on opt-val.
+    Uses one of two internal evaluation strategies:
+      - use_cv=True: stratified k-fold CV over X_train/y_train; each trial score
+        is the mean across folds.
+      - use_cv=False: single stratified opt-train / opt-val split.
     The held-out test set from prepare_dataset() is never used here.
 
     After all trials complete, the best trial's artifacts are copied to
@@ -119,6 +159,9 @@ def optimize(
                         One of "auto", "small", "balanced", "wide", "large".
                         "auto" infers a profile from X_train.shape.
         val_size:       Fraction of X_train for trial evaluation. Default 0.2.
+                        Ignored when use_cv=True.
+        use_cv:         Use stratified k-fold CV for trial scoring. Default True.
+        n_cv_folds:     Number of CV folds when use_cv=True. Default 3.
         random_state:   Seed for stratified split and Optuna sampler. Default 42.
         study_name:     Optuna study name. Default "tabular_hpo".
         storage_path:   SQLite URL for study persistence.
@@ -154,6 +197,8 @@ def optimize(
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
         )
+    if use_cv and n_cv_folds < 2:
+        raise ValueError("n_cv_folds must be >= 2 when use_cv=True.")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -189,38 +234,104 @@ def optimize(
         storage_path = f"sqlite:///{Path(storage_path).resolve()}"
         logger.info("storage_path converted to SQLite URL: %s", storage_path)
 
-    # Stratified internal split — never uses the held-out test set
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)
-    opt_train_idx, opt_val_idx = next(sss.split(X_train, y_train))
-    X_opt_train = X_train[opt_train_idx]
-    y_opt_train = y_train[opt_train_idx]
-    X_opt_val = X_train[opt_val_idx]
-    y_opt_val = y_train[opt_val_idx]
+    # Trial evaluation setup — never uses the held-out test set
+    cv_splits: list[tuple[list[int], list[int]]] | None = None
+    X_opt_train = y_opt_train = X_opt_val = y_opt_val = None
+    if use_cv:
+        _, class_counts = np.unique(y_train, return_counts=True)
+        min_class_count = int(class_counts.min())
+        if n_cv_folds > min_class_count:
+            raise ValueError(
+                f"n_cv_folds={n_cv_folds} is greater than the minimum class count "
+                f"({min_class_count}) in y_train. Reduce n_cv_folds or rebalance data."
+            )
+        indices = np.arange(len(y_train))
+        skf = StratifiedKFold(
+            n_splits=n_cv_folds,
+            shuffle=True,
+            random_state=random_state,
+        )
+        cv_splits = [
+            (train_idx.tolist(), val_idx.tolist())
+            for train_idx, val_idx in skf.split(indices, y_train)
+        ]
+        logger.info(
+            "Tabular CV HPO: %d-fold stratified splits pre-built "
+            "(n_samples=%d, n_classes=%d). Each trial runs %d fits.",
+            n_cv_folds, len(y_train), len(id2label), n_cv_folds,
+        )
+    else:
+        sss = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=val_size,
+            random_state=random_state,
+        )
+        opt_train_idx, opt_val_idx = next(sss.split(X_train, y_train))
+        X_opt_train = X_train[opt_train_idx]
+        y_opt_train = y_train[opt_train_idx]
+        X_opt_val = X_train[opt_val_idx]
+        y_opt_val = y_train[opt_val_idx]
 
     def objective(trial: optuna.Trial) -> float:
         hp = sample_hyperparams(trial, active_space)
         trial_dir = output_dir / f"trial_{trial.number}"
+        if use_cv:
+            if not cv_splits:
+                raise RuntimeError("use_cv=True but no CV splits were prepared.")
 
-        train(
-            X_opt_train, y_opt_train,
-            label2id=label2id,
-            id2label=id2label,
-            model_name=model_name,
-            output_dir=trial_dir,
-            hyperparams=hp,
-            random_state=random_state,
-            n_jobs=n_jobs,
-            use_gpu=use_gpu,
-        )
-        result = predict(trial_dir, X_opt_val, y_opt_val)
+            fold_scores: dict[str, list[float]] = {
+                m: [] for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+            }
+            fold_log_losses: list[float] = []
+            for fold_idx, (cv_train_idx, cv_val_idx) in enumerate(cv_splits):
+                fold_dir = trial_dir / f"fold_{fold_idx}"
+                X_fold_train = X_train[cv_train_idx]
+                y_fold_train = y_train[cv_train_idx]
+                X_fold_val = X_train[cv_val_idx]
+                y_fold_val = y_train[cv_val_idx]
 
-        # Compute all metrics; store as user attributes for traceability.
-        # Only `metric` drives Optuna's optimisation.
-        all_scores = {
-            m: score_predictions(result.top1, m)
-            for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
-        }
-        all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
+                train(
+                    X_fold_train, y_fold_train,
+                    label2id=label2id,
+                    id2label=id2label,
+                    model_name=model_name,
+                    output_dir=fold_dir,
+                    hyperparams=hp,
+                    random_state=random_state,
+                    n_jobs=n_jobs,
+                    use_gpu=use_gpu,
+                )
+                fold_result = predict(fold_dir, X_fold_val, y_fold_val)
+                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"):
+                    fold_scores[m].append(score_predictions(fold_result.top1, m))
+                fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
+                trial.set_user_attr(f"fold_{fold_idx}_{metric}", fold_scores[metric][-1])
+
+            all_scores = {m: float(np.mean(fold_scores[m])) for m in fold_scores}
+            all_scores["log_loss"] = float(np.mean(fold_log_losses))
+            trial.set_user_attr(f"cv_std_{metric}", float(np.std(fold_scores[metric])))
+        else:
+            if X_opt_train is None or y_opt_train is None or X_opt_val is None or y_opt_val is None:
+                raise RuntimeError("Holdout split was not prepared for use_cv=False.")
+
+            train(
+                X_opt_train, y_opt_train,
+                label2id=label2id,
+                id2label=id2label,
+                model_name=model_name,
+                output_dir=trial_dir,
+                hyperparams=hp,
+                random_state=random_state,
+                n_jobs=n_jobs,
+                use_gpu=use_gpu,
+            )
+            result = predict(trial_dir, X_opt_val, y_opt_val)
+            all_scores = {
+                m: score_predictions(result.top1, m)
+                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+            }
+            all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
+
         for name, val in all_scores.items():
             trial.set_user_attr(name, val)
 
@@ -395,16 +506,19 @@ def _to_ray_space(search_space: dict) -> dict:
 def _tabular_ray_trial_fn(
     config: dict,
     *,
-    X_opt_train: np.ndarray,
-    y_opt_train: np.ndarray,
-    X_opt_val: np.ndarray,
-    y_opt_val: np.ndarray,
     label2id: dict,
     id2label: dict,
     model_name: str,
     random_state: int,
     n_jobs: int,
     use_gpu: bool | None,
+    X_opt_train: np.ndarray | None = None,
+    y_opt_train: np.ndarray | None = None,
+    X_opt_val: np.ndarray | None = None,
+    y_opt_val: np.ndarray | None = None,
+    X_train: np.ndarray | None = None,
+    y_train: np.ndarray | None = None,
+    cv_splits: list[tuple[list[int], list[int]]] | None = None,
 ) -> dict:
     """Single-trial trainable for Ray Tune (tabular pipeline).
 
@@ -414,15 +528,15 @@ def _tabular_ray_trial_fn(
     Ray Train session (``ray.train.report()`` is the Train API and raises /
     hangs when called outside a proper Train context such as TorchTrainer).
 
-    Numpy arrays (``X_opt_train``, ``y_opt_train``, ``X_opt_val``,
-    ``y_opt_val``) are passed via ``tune.with_parameters()`` — stored once in
-    the Ray object store and referenced by all workers without re-serialisation.
+    Input arrays are passed via ``tune.with_parameters()`` and stored once in the
+    Ray object store. Two modes are supported:
+      - fixed holdout split (``X_opt_train``, ``X_opt_val``)
+      - pre-built CV splits (``X_train``, ``y_train``, ``cv_splits``)
 
     This function must be defined at module level (not nested) so that Ray can
     serialise it by reference when dispatching to remote workers.
     """
     import logging as _logging
-    from ray import tune as _ray_tune
 
     _trial_logger = _logging.getLogger(__name__)
 
@@ -436,9 +550,9 @@ def _tabular_ray_trial_fn(
     from multimodalva.tabular.predict import predict as _predict
     from multimodalva.utils.metrics import score_predictions, log_loss_from_full
 
-    # ----- Trial artifact directory (Ray Tune API) -----
-    ctx = _ray_tune.get_context()
-    trial_dir = Path(ctx.get_trial_dir())
+    # ----- Trial artifact directory (Ray Tune API compatibility shim) -----
+    trial_dir = _get_ray_trial_dir()
+    _trial_logger.info("Resolved Ray trial artifact directory: %s", trial_dir)
     trial_dir.mkdir(parents=True, exist_ok=True)
 
     all_scores: dict = {
@@ -450,23 +564,61 @@ def _tabular_ray_trial_fn(
         "log_loss": float("inf"),  # minimised — inf signals trial failure
     }
     try:
-        _train(
-            X_opt_train, y_opt_train,
-            label2id=label2id,
-            id2label=id2label,
-            model_name=model_name,
-            output_dir=trial_dir,
-            hyperparams=config,
-            random_state=random_state,
-            n_jobs=n_jobs,
-            use_gpu=use_gpu,
-        )
-        result = _predict(trial_dir, X_opt_val, y_opt_val)
-        all_scores = {
-            m: score_predictions(result.top1, m)
-            for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
-        }
-        all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
+        if cv_splits:
+            if X_train is None or y_train is None:
+                raise ValueError("cv_splits mode requires X_train and y_train.")
+
+            fold_scores: dict[str, list[float]] = {
+                m: [] for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+            }
+            fold_log_losses: list[float] = []
+            for fold_idx, (cv_train_idx, cv_val_idx) in enumerate(cv_splits):
+                fold_dir = trial_dir / f"fold_{fold_idx}"
+                X_fold_train = X_train[cv_train_idx]
+                y_fold_train = y_train[cv_train_idx]
+                X_fold_val = X_train[cv_val_idx]
+                y_fold_val = y_train[cv_val_idx]
+
+                _train(
+                    X_fold_train, y_fold_train,
+                    label2id=label2id,
+                    id2label=id2label,
+                    model_name=model_name,
+                    output_dir=fold_dir,
+                    hyperparams=config,
+                    random_state=random_state,
+                    n_jobs=n_jobs,
+                    use_gpu=use_gpu,
+                )
+                fold_result = _predict(fold_dir, X_fold_val, y_fold_val)
+                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"):
+                    fold_scores[m].append(score_predictions(fold_result.top1, m))
+                fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
+
+            all_scores = {m: float(np.mean(fold_scores[m])) for m in fold_scores}
+            all_scores["log_loss"] = float(np.mean(fold_log_losses))
+        else:
+            if X_opt_train is None or y_opt_train is None or X_opt_val is None or y_opt_val is None:
+                raise ValueError(
+                    "Holdout mode requires X_opt_train, y_opt_train, X_opt_val, and y_opt_val."
+                )
+            _train(
+                X_opt_train, y_opt_train,
+                label2id=label2id,
+                id2label=id2label,
+                model_name=model_name,
+                output_dir=trial_dir,
+                hyperparams=config,
+                random_state=random_state,
+                n_jobs=n_jobs,
+                use_gpu=use_gpu,
+            )
+            result = _predict(trial_dir, X_opt_val, y_opt_val)
+            all_scores = {
+                m: score_predictions(result.top1, m)
+                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+            }
+            all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
     except Exception:
         _trial_logger.exception(
             "Ray trial failed (config=%s); reporting zero/inf scores.", config
@@ -490,6 +642,8 @@ def optimize_ray(
     metric: str = "accuracy",
     search_space: dict | None = None,
     val_size: float = 0.2,
+    use_cv: bool = True,
+    n_cv_folds: int = 3,
     random_state: int = 42,
     n_jobs: int = -1,
     use_gpu: bool | None = None,
@@ -584,6 +738,9 @@ def optimize_ray(
                         "auto" infers a profile from X_train.shape.
         val_size:       Fraction of X_train held out for trial evaluation.
                         Default 0.2.
+                        Ignored when use_cv=True.
+        use_cv:         Use stratified k-fold CV for trial scoring. Default True.
+        n_cv_folds:     Number of CV folds when use_cv=True. Default 3.
         random_state:   Seed for stratified split and OptunaSearch sampler.
                         Default 42.
         n_jobs:         CPU parallelism *within* each trial.  Default -1
@@ -625,6 +782,8 @@ def optimize_ray(
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
         )
+    if use_cv and n_cv_folds < 2:
+        raise ValueError("n_cv_folds must be >= 2 when use_cv=True.")
 
     try:
         import ray
@@ -677,6 +836,8 @@ def optimize_ray(
             search_space=search_space,
             search_space_profile=search_space_profile,
             val_size=val_size,
+            use_cv=use_cv,
+            n_cv_folds=n_cv_folds,
             random_state=random_state,
             storage_path=str(output_dir / f"hpo_{_safe}.db"),
             load_if_exists=resume,
@@ -711,15 +872,41 @@ def optimize_ray(
         X_train.shape[0], X_train.shape[1], n_classes,
     )
 
-    # --- Stratified internal split (mirrors optimize()) ---
-    sss = StratifiedShuffleSplit(
-        n_splits=1, test_size=val_size, random_state=random_state
-    )
-    opt_train_idx, opt_val_idx = next(sss.split(X_train, y_train))
-    X_opt_train = X_train[opt_train_idx]
-    y_opt_train = y_train[opt_train_idx]
-    X_opt_val   = X_train[opt_val_idx]
-    y_opt_val   = y_train[opt_val_idx]
+    # --- Trial evaluation setup (mirrors optimize()) ---
+    cv_splits: list[tuple[list[int], list[int]]] | None = None
+    X_opt_train = y_opt_train = X_opt_val = y_opt_val = None
+    if use_cv:
+        _, class_counts = np.unique(y_train, return_counts=True)
+        min_class_count = int(class_counts.min())
+        if n_cv_folds > min_class_count:
+            raise ValueError(
+                f"n_cv_folds={n_cv_folds} is greater than the minimum class count "
+                f"({min_class_count}) in y_train. Reduce n_cv_folds or rebalance data."
+            )
+        indices = np.arange(len(y_train))
+        skf = StratifiedKFold(
+            n_splits=n_cv_folds,
+            shuffle=True,
+            random_state=random_state,
+        )
+        cv_splits = [
+            (train_idx.tolist(), val_idx.tolist())
+            for train_idx, val_idx in skf.split(indices, y_train)
+        ]
+        logger.info(
+            "Tabular Ray CV HPO: %d-fold stratified splits pre-built "
+            "(n_samples=%d, n_classes=%d). Each trial runs %d fits.",
+            n_cv_folds, len(y_train), len(id2label), n_cv_folds,
+        )
+    else:
+        sss = StratifiedShuffleSplit(
+            n_splits=1, test_size=val_size, random_state=random_state
+        )
+        opt_train_idx, opt_val_idx = next(sss.split(X_train, y_train))
+        X_opt_train = X_train[opt_train_idx]
+        y_opt_train = y_train[opt_train_idx]
+        X_opt_val = X_train[opt_val_idx]
+        y_opt_val = y_train[opt_val_idx]
 
     # --- Auto-cap n_jobs to prevent CPU contention between parallel trials ---
     # When n_jobs=-1, each sklearn model would claim all available cores.
@@ -795,19 +982,33 @@ def optimize_ray(
     # --- Trainable: bind fixed arguments via the Ray object store ---
     # Numpy arrays are stored in the object store using Apache Arrow shared
     # memory — zero-copy reads by workers on the same node.
-    trainable = tune.with_parameters(
-        _tabular_ray_trial_fn,
-        X_opt_train=X_opt_train,
-        y_opt_train=y_opt_train,
-        X_opt_val=X_opt_val,
-        y_opt_val=y_opt_val,
-        label2id=label2id,
-        id2label=id2label,
-        model_name=model_name,
-        random_state=random_state,
-        n_jobs=effective_n_jobs,
-        use_gpu=use_gpu,
-    )
+    if use_cv:
+        trainable = tune.with_parameters(
+            _tabular_ray_trial_fn,
+            X_train=X_train,
+            y_train=y_train,
+            cv_splits=cv_splits,
+            label2id=label2id,
+            id2label=id2label,
+            model_name=model_name,
+            random_state=random_state,
+            n_jobs=effective_n_jobs,
+            use_gpu=use_gpu,
+        )
+    else:
+        trainable = tune.with_parameters(
+            _tabular_ray_trial_fn,
+            X_opt_train=X_opt_train,
+            y_opt_train=y_opt_train,
+            X_opt_val=X_opt_val,
+            y_opt_val=y_opt_val,
+            label2id=label2id,
+            id2label=id2label,
+            model_name=model_name,
+            random_state=random_state,
+            n_jobs=effective_n_jobs,
+            use_gpu=use_gpu,
+        )
     trainable = tune.with_resources(
         trainable,
         resources={"cpu": num_cpus_per_trial, "gpu": num_gpus_per_trial},
@@ -954,6 +1155,28 @@ def optimize_ray(
                 trainable, param_space=ray_space, tune_config=_tune_config,
             )
             results = tuner_no_rc.fit()
+        else:
+            raise
+    except Exception as _fit_err:
+        _fit_err_text = str(_fit_err)
+        _is_optuna_restore_mismatch = (
+            resume
+            and exp_path.exists()
+            and "optuna_search.py" in _fit_err_text
+            and "KeyError" in _fit_err_text
+            and "_ot_trials" in _fit_err_text
+        )
+        if _is_optuna_restore_mismatch:
+            logger.warning(
+                "Detected incompatible/corrupted Ray Tune restore state for "
+                "OptunaSearch (%s). Removing stale experiment dir %s and "
+                "restarting this Ray HPO run fresh. Prior in-progress Ray "
+                "resume state cannot be recovered on this run.",
+                _fit_err, exp_path,
+            )
+            shutil.rmtree(exp_path, ignore_errors=True)
+            os.environ["RAY_AIR_NEW_OUTPUT"] = "0"
+            results = _fresh_tuner().fit()
         else:
             raise
     finally:

@@ -29,6 +29,7 @@ Key flags:
                     (default: emilyalsentzer/Bio_ClinicalBERT)
     --hpo           Enable Optuna hyperparameter search
     --n-trials      HPO trials (default: 2 for demo / recommend 20+ for real data)
+    --n-cv-folds    CV folds for HPO scoring (default: 3; use 0 to disable CV)
     --metric        Optimisation metric: accuracy, f1_macro, f1_weighted,
                     balanced_accuracy, csmf_accuracy, log_loss (default: f1_macro)
     --resume        Resume HPO from existing SQLite study and/or resume training
@@ -86,6 +87,7 @@ def run_classifier(args: argparse.Namespace) -> None:
         text_col=args.text_col,
         label_col=args.label,
         max_length=args.max_length,
+        use_fast=True,
         use_optimize=use_hpo,
         batch_size=8,
         top_k=args.top_k,
@@ -97,6 +99,8 @@ def run_classifier(args: argparse.Namespace) -> None:
             n_trials=args.n_trials,
             optimize_metric=args.metric,
             resume_hpo=args.resume,
+            use_cv=args.n_cv_folds > 0,
+            n_cv_folds=args.n_cv_folds,
         )
     else:
         run_kwargs["hyperparams"] = {"epochs": 1, "batch_size": 4, "learning_rate": 2e-5}
@@ -137,6 +141,7 @@ def run_pipeline_steps(args: argparse.Namespace) -> None:
         output_dir=ensure_dir(f"{args.output_dir}/hpo"),
         n_trials=args.n_trials, metric=args.metric,
         use_lora=True, resume=args.resume,
+        use_cv=args.n_cv_folds > 0, n_cv_folds=args.n_cv_folds,
     )
     _, _, metadata = train(
         train_dataset=train_ds,
@@ -198,6 +203,8 @@ def main() -> None:
                         help="Enable Optuna HPO (also activated by mode=hpo).")
     parser.add_argument("--n-trials", type=int, default=2, dest="n_trials",
                         help="HPO trials (default: 2; use 20+ for real data).")
+    parser.add_argument("--n-cv-folds", type=int, default=3, dest="n_cv_folds",
+                        help="CV folds for HPO scoring (default: 3; use 0 to disable CV).")
     parser.add_argument("--metric", default="f1_macro",
                         help="HPO optimisation metric (default: f1_macro).")
     parser.add_argument("--resume", action="store_true",

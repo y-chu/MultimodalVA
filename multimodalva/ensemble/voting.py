@@ -607,6 +607,8 @@ class SoftVotingClassifier:
                     n_trials=spec.get("n_trials", 20),
                     metric=spec.get("optimize_metric", "f1_macro"),
                     search_space=spec.get("search_space"),
+                    use_cv=spec.get("use_cv", True),
+                    n_cv_folds=spec.get("n_cv_folds", 3),
                     random_state=random_state,
                     n_jobs=n_jobs, use_gpu=use_gpu,
                 )

@@ -7,6 +7,7 @@ Output: train_dataset, test_dataset, label2id, id2label
 """
 
 import logging
+import time
 
 import pandas as pd
 import torch
@@ -54,14 +55,28 @@ class ClassificationDataset(Dataset):
         if max_length is not None:
             tokenizer_kwargs["max_length"] = max_length
 
-        self.encodings = tokenizer(texts, **tokenizer_kwargs)
+        # Tokenize all texts in one vectorized call (fast Rust tokenizer uses
+        # internal parallelism when TOKENIZERS_PARALLELISM=true).
+        _raw = tokenizer(texts, **tokenizer_kwargs)
+
+        # Pre-convert each sequence's token IDs to a tensor once here so that
+        # __getitem__ is a pure list lookup with no tensor-construction overhead.
+        # This is especially beneficial for MPS and CPU where __getitem__ is called
+        # in the main process (num_workers=0) and the hot path must be cheap.
+        self.encodings = {
+            k: [torch.as_tensor(seq, dtype=torch.long) for seq in seqs]
+            for k, seqs in _raw.items()
+        }
+        # Pre-build the labels tensor once to avoid torch.tensor() calls per item.
+        self._labels_tensor = torch.tensor(self.labels, dtype=torch.long)
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, idx: int) -> dict:
-        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
-        item["labels"] = torch.tensor(self.labels[idx])
+        # All values are already tensors — pure list lookup, no tensor construction.
+        item = {key: val[idx] for key, val in self.encodings.items()}
+        item["labels"] = self._labels_tensor[idx]
         return item
 
 
@@ -118,7 +133,7 @@ def prepare_dataset(
     label_col: str,
     model_name: str,
     max_length: int | None = 512,
-    use_fast: bool = False,
+    use_fast: bool = True,
 ) -> tuple[ClassificationDataset, ClassificationDataset, dict, dict]:
     """Tokenize text and encode labels, returning ClassificationDataset objects.
 
@@ -138,7 +153,7 @@ def prepare_dataset(
             - 512 (default) → truncate to 512 tokens (BERT's maximum).
             - None → use the model's built-in maximum (e.g. 4096 for Longformer).
             - int → truncate to exactly that many tokens.
-        use_fast: Use the HuggingFace fast (Rust) tokenizer. Default False.
+        use_fast: Use the HuggingFace fast (Rust) tokenizer. Default True.
                   Set False for models that lack a fast tokenizer
                   (e.g. BlueBERT, BioELECTRA) to avoid a falling-back warning.
 
@@ -148,6 +163,7 @@ def prepare_dataset(
         label2id:      Dict mapping class label strings to integer IDs.
         id2label:      Dict mapping integer IDs to class label strings.
     """
+    started = time.perf_counter()
     # Drop rows with missing or empty values before any further processing
     train_df = _drop_invalid_rows(train_df, text_col, label_col, split="train")
     test_df = _drop_invalid_rows(test_df, text_col, label_col, split="test")
@@ -167,6 +183,18 @@ def prepare_dataset(
     )
     test_dataset = ClassificationDataset(
         test_df[text_col].tolist(), test_labels, tokenizer, max_length
+    )
+
+    logger.info(
+        "prepare_dataset(): completed in %.2fs — model=%s, use_fast=%s, max_length=%s, "
+        "%d train / %d test rows, %d classes.",
+        time.perf_counter() - started,
+        model_name,
+        use_fast,
+        max_length,
+        len(train_df),
+        len(test_df),
+        len(label2id),
     )
 
     return train_dataset, test_dataset, label2id, id2label

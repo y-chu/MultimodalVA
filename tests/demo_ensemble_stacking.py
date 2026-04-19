@@ -98,7 +98,7 @@ def run_class_voter(args: argparse.Namespace) -> None:
         save_fold_models=False, cleanup_fold_files=True,
         n_jobs=args.n_jobs, use_gpu=False,
     )
-    info = clf.train_class_voter_stage(metric="recall", alpha=1.0, shrinkage=0.25)
+    info = clf.train_class_voter_stage(metric="brier", shrinkage=0.5)
     print("Class-voter OOF scores:", info["scores"])
     result = clf.predict_test_class_voter(top_k=args.top_k)
     print_prediction_summary(result, "StackingClassifier class-aware voter")
@@ -128,7 +128,7 @@ def run_wrapper(args: argparse.Namespace) -> None:
         save_fold_models=False, cleanup_fold_files=True,
         n_jobs=args.n_jobs, use_gpu=False,
     )
-    clf.train_class_voter_stage(metric="recall", alpha=1.0, shrinkage=0.25)
+    clf.train_class_voter_stage(metric="brier", shrinkage=0.5)
     result = clf.predict_test_class_voter(top_k=args.top_k)
     print_prediction_summary(result, "EnsembleClassifier(method='stacking') class-aware voter")
 

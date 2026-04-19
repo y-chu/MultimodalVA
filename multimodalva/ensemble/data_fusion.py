@@ -46,6 +46,8 @@ Public API:
 from __future__ import annotations
 
 import logging
+import os
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -443,6 +445,22 @@ def _resolve_no_verb(
     return yes_no_map.get(yes_verb, DEFAULT_NO_VERB)
 
 
+def _prepare_qdesc_context(
+    qdesc: pd.DataFrame | None,
+) -> tuple[pd.DataFrame | None, set[str], set[str]]:
+    """Precompute qdesc index and indicator groups for row-wise rendering."""
+    if qdesc is None or qdesc.empty:
+        return None, set(), set()
+    qdesc_idx = qdesc.set_index("indic")
+    if "type" in qdesc_idx.columns:
+        demo_mask = qdesc_idx["type"] == "demographics"
+        demo_indics = set(qdesc_idx[demo_mask].index)
+    else:
+        demo_indics = set()
+    non_demo_indics = set(qdesc_idx.index) - demo_indics
+    return qdesc_idx, demo_indics, non_demo_indics
+
+
 # ---------------------------------------------------------------------------
 # Core conversion functions
 # ---------------------------------------------------------------------------
@@ -456,7 +474,10 @@ def tabular_to_text(
     with_neg: bool = True,
     prefix_cols: dict[str, str] | None = None,
     yes_no_map: dict[str, str] | None = None,
-    group_symptoms: bool = False,
+    group_symptoms: bool = True,
+    _qdesc_idx: pd.DataFrame | None = None,
+    _demo_indics: set[str] | None = None,
+    _non_demo_indics: set[str] | None = None,
 ) -> str:
     """Convert one DataFrame row's tabular features to a natural-language sentence.
 
@@ -534,8 +555,13 @@ def tabular_to_text(
     # ------------------------------------------------------------------
     # qdesc-aware rendering
     # ------------------------------------------------------------------
-    if qdesc is not None and not qdesc.empty:
-        qdesc_idx = qdesc.set_index("indic")   # index by indicator name
+    qdesc_idx = _qdesc_idx
+    demo_indics = _demo_indics if _demo_indics is not None else set()
+    non_demo_indics = _non_demo_indics if _non_demo_indics is not None else set()
+    if qdesc is not None and not qdesc.empty and qdesc_idx is None:
+        qdesc_idx, demo_indics, non_demo_indics = _prepare_qdesc_context(qdesc)
+
+    if qdesc_idx is not None and not qdesc_idx.empty:
 
         qdesc_cols = [c for c in present_cols if c in qdesc_idx.index]
         other_cols = [c for c in present_cols if c not in qdesc_idx.index]
@@ -544,8 +570,6 @@ def tabular_to_text(
         prefix = _get_prefix(row, prefix_cols, DEFAULT_PREFIX_FALLBACK)
 
         # ---- Demographics variables (age, sex) → opening sentence ---------------
-        demo_mask  = qdesc_idx["type"] == "demographics"
-        demo_indics = set(qdesc_idx[demo_mask].index)
         demo_positive = [
             c for c in qdesc_cols
             if c in demo_indics and _is_positive(row[c])
@@ -559,7 +583,6 @@ def tabular_to_text(
             parts.append(f"{DEFAULT_PREFIX_FALLBACK} was {', '.join(descs)}.")
 
         # ---- Symptom / environment / diagnosis / … variables -----------
-        non_demo_indics = set(qdesc_idx[~demo_mask].index)
         symp_cols = [c for c in qdesc_cols if c in non_demo_indics]
 
         if group_symptoms:
@@ -653,8 +676,9 @@ def build_fused_text(
     prefix_cols: dict[str, str] | None = None,
     yes_no_map: dict[str, str] | None = None,
     separator: str = DEFAULT_SEPARATOR,
-    group_symptoms: bool = False,
+    group_symptoms: bool = True,
     save_csv: str | None = None,
+    n_jobs: int | None = None,
 ) -> pd.Series:
     """Apply tabular_to_text() to every row and concatenate with the narrative.
 
@@ -688,7 +712,10 @@ def build_fused_text(
         save_csv:       File path to save the fused text as a CSV for review.
                         The CSV contains all original DataFrame columns plus a
                         ``"fused_text"`` column.  Set to None to skip saving.
-                        Default ``"fused_text.csv"`` (saved in the current directory).
+                        Default None (no write).
+        n_jobs:         Number of parallel workers for row-wise tabular-to-text
+                        conversion.  ``None`` auto-detects from SLURM/local CPU
+                        allocation.  Set to 1 to force single-process mode.
 
     Returns:
         pd.Series of fused text strings, one per row, same index as df.
@@ -696,6 +723,7 @@ def build_fused_text(
     Raises:
         ValueError: If text_col or any feature_col is missing from df.
     """
+    started = time.perf_counter()
     # Auto-load qdesc from utils/ if not supplied (cached after first load).
     if qdesc is None:
         qdesc = _get_default_qdesc()
@@ -712,6 +740,25 @@ def build_fused_text(
             f"Available columns: {list(df.columns)}"
         )
 
+    qdesc_idx, demo_indics, non_demo_indics = _prepare_qdesc_context(qdesc)
+
+    if n_jobs is None:
+        try:
+            base_cpus = int(
+                os.environ.get(
+                    "MULTIMODALVA_FUSION_N_JOBS",
+                    os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1),
+                )
+            )
+        except ValueError:
+            base_cpus = os.cpu_count() or 1
+        try:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        except ValueError:
+            world_size = 1
+        n_jobs = max(1, base_cpus // max(1, world_size))
+    n_jobs = max(1, int(n_jobs))
+
     def _fuse_row(row: pd.Series) -> str:
         tab_text  = tabular_to_text(
             row,
@@ -723,13 +770,32 @@ def build_fused_text(
             prefix_cols=prefix_cols,
             yes_no_map=yes_no_map,
             group_symptoms=group_symptoms,
+            _qdesc_idx=qdesc_idx,
+            _demo_indics=demo_indics,
+            _non_demo_indics=non_demo_indics,
         )
         narrative = str(row[text_col]) if pd.notna(row[text_col]) else ""
         if tab_text and narrative:
             return f"{narrative}{separator}{tab_text}"
         return narrative or tab_text
 
-    fused = df.apply(_fuse_row, axis=1)
+    if n_jobs > 1 and len(df) > 0:
+        try:
+            from joblib import Parallel, delayed  # noqa: PLC0415
+            fused_values = Parallel(n_jobs=n_jobs, prefer="processes")(
+                delayed(_fuse_row)(row) for _, row in df.iterrows()
+            )
+            fused = pd.Series(fused_values, index=df.index)
+        except Exception as exc:
+            logger.warning(
+                "Parallel fused-text generation failed (n_jobs=%d). "
+                "Falling back to single-process mode. Error: %s",
+                n_jobs,
+                exc,
+            )
+            fused = df.apply(_fuse_row, axis=1)
+    else:
+        fused = df.apply(_fuse_row, axis=1)
 
     if save_csv is not None:
         import logging as _logging
@@ -739,5 +805,16 @@ def build_fused_text(
         out.parent.mkdir(parents=True, exist_ok=True)
         df.assign(fused_text=fused).to_csv(out, index=False)
         _log.info("Fused text saved to %s", out)
+
+    logger.info(
+        "build_fused_text(): completed in %.2fs — %d rows, %d feature cols, "
+        "n_jobs=%d, group_symptoms=%s, with_neg=%s.",
+        time.perf_counter() - started,
+        len(df),
+        len(feature_cols),
+        n_jobs,
+        group_symptoms,
+        with_neg,
+    )
 
     return fused

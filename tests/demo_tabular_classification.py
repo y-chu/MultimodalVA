@@ -31,6 +31,7 @@ Key flags:
                     catboost, gbdt, mlp, naive_bayes, knn, svm (default: random_forest)
     --hpo           Enable Optuna hyperparameter search
     --n-trials      HPO trials (default: 4 for demo / recommend 50+ for real data)
+    --n-cv-folds    CV folds for HPO scoring (default: 3; use 0 to disable CV)
     --metric        Optimisation metric: accuracy, f1_macro, f1_weighted,
                     balanced_accuracy, csmf_accuracy, log_loss (default: f1_macro)
     --resume        Resume HPO from existing SQLite study and/or resume training
@@ -105,6 +106,8 @@ def run_classifier(args: argparse.Namespace) -> None:
             optimize_metric=args.metric,
             search_space_profile="auto",
             resume_hpo=args.resume,
+            use_cv=args.n_cv_folds > 0,
+            n_cv_folds=args.n_cv_folds,
         )
     else:
         run_kwargs["hyperparams"] = {}
@@ -152,6 +155,7 @@ def run_pipeline_steps(args: argparse.Namespace) -> None:
         n_trials=args.n_trials,
         metric=args.metric,
         search_space_profile="auto",
+        use_cv=args.n_cv_folds > 0, n_cv_folds=args.n_cv_folds,
     )
     _, metadata = train(
         X_train=X_train,
@@ -208,6 +212,8 @@ def main() -> None:
                         help="Enable Optuna HPO (also activated by mode=hpo).")
     parser.add_argument("--n-trials", type=int, default=4, dest="n_trials",
                         help="HPO trials (default: 4; use 50+ for real data).")
+    parser.add_argument("--n-cv-folds", type=int, default=3, dest="n_cv_folds",
+                        help="CV folds for HPO scoring (default: 3; use 0 to disable CV).")
     parser.add_argument("--metric", default="f1_macro",
                         help="HPO optimisation metric (default: f1_macro).")
     parser.add_argument("--resume", action="store_true",

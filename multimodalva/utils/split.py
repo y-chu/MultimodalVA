@@ -5,8 +5,13 @@ Output:
     train_df, test_df  — DataFrames passed into each pipeline's prepare_dataset()
 """
 
+import logging
+import time
+
 import pandas as pd
 from sklearn.model_selection import train_test_split as _sklearn_split
+
+logger = logging.getLogger(__name__)
 
 
 def split(
@@ -38,6 +43,7 @@ def split(
     Raises:
         ValueError: If label_col or text_col (when provided) are not in df.
     """
+    started = time.perf_counter()
     cols_to_check = [label_col]
     if text_col is not None:
         cols_to_check.append(text_col)
@@ -56,4 +62,14 @@ def split(
         random_state=random_state,
         stratify=stratify_col,
     )
-    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
+    train_df = train_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+    logger.info(
+        "split(): completed in %.2fs — %d train / %d test rows (test_size=%.2f, stratify=%s).",
+        time.perf_counter() - started,
+        len(train_df),
+        len(test_df),
+        test_size,
+        stratify,
+    )
+    return train_df, test_df

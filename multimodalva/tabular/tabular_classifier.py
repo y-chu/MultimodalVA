@@ -90,6 +90,8 @@ class TabularClassifier:
         n_trials: int = 50,
         optimize_metric: str = "accuracy",
         search_space: dict | None = None,
+        use_cv: bool = True,
+        n_cv_folds: int = 3,
         top_k: int = 3,
         n_jobs: int = -1,
         use_gpu: bool | None = None,
@@ -124,6 +126,9 @@ class TabularClassifier:
             search_space:     Custom Optuna search space dict (use_optimize=True only).
                               Merged over the adaptive default space chosen from
                               X_train.shape.
+            use_cv:           Use stratified k-fold CV for tabular HPO scoring
+                              (use_optimize=True only). Default True.
+            n_cv_folds:       Number of CV folds when use_cv=True. Default 3.
             search_space_profile:
                               One of "auto", "small", "balanced", "wide", "large".
                               "auto" infers a profile from the prepared feature
@@ -183,6 +188,8 @@ class TabularClassifier:
                 metric=optimize_metric,
                 search_space=search_space,
                 search_space_profile=search_space_profile,
+                use_cv=use_cv,
+                n_cv_folds=n_cv_folds,
                 random_state=random_state,
                 n_jobs=n_jobs,
                 use_gpu=use_gpu,

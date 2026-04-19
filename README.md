@@ -31,10 +31,14 @@ Optional extras:
 ```bash
 pip install "multimodalva[tabular]"         # LightGBM / XGBoost / CatBoost
 pip install "multimodalva[lora]"            # PEFT / LoRA
-pip install "multimodalva[feature_fusion]"  # AutoGluon AutoMM
-pip install "multimodalva[insilicova]"      # PyInSilicoVA support
+pip install "multimodalva[feature_fusion]"  # AutoGluon AutoMM (tested on autogluon.multimodal 1.5.x)
 pip install "multimodalva[all]"             # all Python-3.12-compatible extras
 ```
+
+Compatibility notes:
+
+- `feature_fusion` is pinned to the AutoGluon MultiModal 1.5.x stack, which in turn expects `torch>=2.6,<2.10`, `transformers>=4.51,<4.58`, and `accelerate>=0.34,<2.0`.
+- Python InSilicoVA support is not currently installable under this package's supported Python range (`>=3.12,<3.14`). Use the R-based InSilicoVA workflow in `Analysis/*/unimodal_tabular/InSilicoVA.R`, or a separate legacy environment if `pyinsilicova` is required.
 
 ## Quick Start
 
@@ -48,6 +52,7 @@ results = clf.run(
     df=df,
     text_col="narrative",
     label_col="cause",
+    set_seed=484,
     hyperparams={"epochs": 3, "batch_size": 16, "learning_rate": 2e-5},
 )
 
@@ -65,6 +70,8 @@ results = clf.run(
     feature_cols=["age", "sex", "fever", "cough"],
     label_col="cause",
     use_optimize=True,
+    use_cv=True,
+    n_cv_folds=3,
     n_trials=50,
     optimize_metric="f1_macro",
 )
@@ -119,7 +126,7 @@ clf.train_meta_learner_stage(meta_cv_folds=3)
 meta_pred = clf.predict_test()
 
 # Stage 2B: class-aware voting (alternative to meta-learner)
-clf.train_class_voter_stage(metric="recall", alpha=1.0, shrinkage=0.25)
+clf.train_class_voter_stage(metric="brier", shrinkage=0.5)
 vote_pred = clf.predict_test_class_voter()
 ```
 
@@ -168,15 +175,85 @@ Use either a package alias, a HuggingFace checkpoint, or a local model path.
 | `soft_voting` | Probability averaging over independently trained base models |
 | `stacking` | Stage 1 OOF base models, then either a Stage 2 meta-learner or Stage 2 class-aware voting |
 
+## Reproducibility And Runtime Logs
+
+### One Seed For The Whole Run
+
+For wrapper pipelines, one seed now controls split + HPO + training:
+
+```python
+from multimodalva.text import TextClassifier
+from multimodalva.ensemble import DataFusionClassifier
+
+# Text pipeline
+text_clf = TextClassifier(model_name="bioclinicalbert", output_dir="runs/text")
+text_clf.run(
+    df=df,
+    text_col="narrative",
+    label_col="cause",
+    set_seed=484,  # single run-level seed
+    use_optimize=True,
+    n_trials=20,
+    use_cv=True,
+    n_cv_folds=3,
+)
+
+# Data-fusion pipeline
+fusion_clf = DataFusionClassifier(
+    model_name="allenai/longformer-base-4096",
+    output_dir="runs/fusion",
+)
+fusion_clf.run(
+    df=df,
+    text_col="narrative",
+    feature_cols=["age", "sex", "fever", "cough"],
+    label_col="cause",
+    set_seed=484,  # single run-level seed
+    use_optimize=True,
+    n_trials=20,
+    use_cv=True,
+    n_cv_folds=3,
+)
+```
+
+Notes:
+- Default seed is `42`.
+- `set_seed` overrides `random_state` when both are provided.
+- Lightweight seeding improves repeatability without forcing strict deterministic kernels.
+- Tabular HPO now supports CV scoring too: `TabularClassifier.run(..., use_cv=True, n_cv_folds=3)`.
+
+### Runtime Reports (Timing + GPU/MPS)
+
+Runtime reports are written under each run directory in `runtime/`:
+
+- Wrapper-level pipeline report:
+  - `output_dir/runtime/pipeline_runtime.json`
+  - `output_dir/runtime/stage_timings.csv`
+- HPO report:
+  - `output_dir/hpo/runtime/hpo_runtime.json` (Optuna) or `ray_hpo_runtime.json` (Ray)
+  - `output_dir/hpo/runtime/stage_timings.csv`
+- Final training report:
+  - `output_dir/final/runtime/train_runtime.json`
+  - `output_dir/final/runtime/stage_timings.csv`
+- Prediction report:
+  - `output_dir/predictions/runtime/predict_runtime.json`
+  - `output_dir/predictions/runtime/stage_timings.csv`
+
+When GPU monitoring is enabled, `gpu_usage.csv` is also saved in the same `runtime/` folder.
+
+GPU monitor controls:
+- `MULTIMODALVA_ENABLE_GPU_MONITOR=0` to disable sampling
+- `MULTIMODALVA_GPU_MONITOR_INTERVAL_SEC=5` to sample every 5 seconds
+
 ## Demo Scripts
 
 The demos in `tests/` are intentionally small, synthetic where possible, and focused on one core workflow at a time.
 
 | Script | What it shows | Default mode |
 |---|---|---|
-| `demo_text_classification.py` | TextClassifier wrapper, small HPO example, low-level pipeline steps, `roberta-pm` resolution | `preview` |
-| `demo_tabular_classification.py` | TabularClassifier wrapper, adaptive HPO, low-level tabular steps | `preview` |
-| `demo_ensemble_data_fusion.py` | Tabular-to-text conversion and one end-to-end data-fusion run | `text` |
+| `demo_text_classification.py` | TextClassifier wrapper, small HPO example, low-level pipeline steps, `roberta-pm` resolution | `run` |
+| `demo_tabular_classification.py` | TabularClassifier wrapper, adaptive HPO, low-level tabular steps | `run` |
+| `demo_ensemble_data_fusion.py` | Tabular-to-text conversion, end-to-end data-fusion run, model-family timing benchmark | `text` |
 | `demo_ensemble_feature_fusion.py` | AutoMM feature fusion with a small fixed run | `preview` |
 | `demo_ensemble_voting.py` | Synthetic soft voting, tabular-only voting, mixed voting | `synthetic` |
 | `demo_ensemble_stacking.py` | Stage-wise stacking with meta-learner and class-aware voter | `meta` |

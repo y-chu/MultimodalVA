@@ -38,6 +38,10 @@ Public API
         accuracy(model) − accuracy(baseline).  Diverging colormap centred at 0.
         Optional include_baseline column (zeros) to keep baseline label visible.
 
+    csmf_scatterplot(y_true, y_pred, ...)
+        Scatter plot of true vs. modelled CSMF for one model.
+        Each cause is shown as a labelled point with a 45-degree equality line.
+
     confusion_heatmap(y_true, y_pred, label_order, ...)
         Seaborn heatmap of predicted vs. true labels for one model.
 """
@@ -481,6 +485,43 @@ def topk_accuracy(
     return pd.DataFrame(rows)
 
 
+def _csmf_dataframe(
+    y_true,
+    y_pred,
+    label_order: "list[str] | None" = None,
+    cause_map: "dict[str, str] | None" = None,
+    drop_zero_zero: bool = False,
+    percentage: bool = True,
+) -> pd.DataFrame:
+    """Build a cause-wise true/predicted CSMF comparison table."""
+    true_s = pd.Series(y_true, dtype="object").astype(str)
+    pred_s = pd.Series(y_pred, dtype="object").astype(str)
+
+    if label_order is None:
+        causes = sorted(set(true_s.unique()).union(pred_s.unique()))
+    else:
+        extras = [c for c in sorted(set(true_s.unique()).union(pred_s.unique())) if c not in label_order]
+        causes = list(label_order) + extras
+
+    n = len(true_s)
+    rows: list[dict] = []
+    for cause in causes:
+        true_csmf = float((true_s == cause).sum()) / n
+        pred_csmf = float((pred_s == cause).sum()) / n
+        if drop_zero_zero and true_csmf == 0.0 and pred_csmf == 0.0:
+            continue
+        rows.append(
+            {
+                "cause": cause,
+                "label": cause_map.get(cause, cause) if cause_map is not None else cause,
+                "true_csmf": true_csmf * 100 if percentage else true_csmf,
+                "pred_csmf": pred_csmf * 100 if percentage else pred_csmf,
+                "abs_error": abs(pred_csmf - true_csmf) * (100 if percentage else 1),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # 6. Top-K accuracy bar chart
 # ---------------------------------------------------------------------------
@@ -727,9 +768,252 @@ def plot_topk_accuracy(
         plt.tight_layout()
         if save_path is not None:
             fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        return fig, axes
+    return fig, axes
 
-    raise ValueError(f"kind must be 'grouped' or 'facet', got {kind!r}.")
+
+def csmf_scatterplot(
+    y_true,
+    y_pred,
+    label_order: "list[str] | None" = None,
+    cause_map: "dict[str, str] | None" = None,
+    title: str | None = None,
+    xlabel: str | None = None,
+    ylabel: str | None = None,
+    point_color: str = "#00468B",
+    point_size: float = 55,
+    alpha: float = 0.85,
+    annotate: bool = True,
+    label_fontsize: int = 8,
+    percentage: bool = True,
+    drop_zero_zero: bool = False,
+    max_val: float | None = None,
+    crowded_threshold: float | None = None,
+    figsize: tuple[float, float] = (7.2, 6.6),
+    save_path: "str | None" = None,
+    dpi: int = 150,
+):
+    """Plot true CSMF vs modelled CSMF with one labelled point per cause.
+
+    Labels are placed as close to their points as possible (≤ 18 pt offset).
+    Causes with both true and predicted CSMF below ``crowded_threshold`` are
+    marked with uppercase letters (A, B, C…) and listed in a footnote to avoid
+    crowding near the origin.  Any larger cause that still cannot fit a full
+    label also falls back to a letter tag.
+
+    Args:
+        y_true:             Ground-truth cause labels.
+        y_pred:             Model-predicted cause labels.
+        label_order:        Optional cause order for the underlying CSMF table.
+        cause_map:          Optional mapping from raw cause names to shorter
+                            display labels used in annotations.
+        title:              Plot title.
+        xlabel:             X-axis label. Defaults to ``"True CSMF (%)"``.
+        ylabel:             Y-axis label. Defaults to ``"Modelled CSMF (%)"``.
+        point_color:        Marker colour.
+        point_size:         Marker size passed to ``ax.scatter``.
+        alpha:              Marker opacity.
+        annotate:           Whether to label each point with the cause name.
+        label_fontsize:     Font size for point labels.
+        percentage:         Plot CSMF values as percentages when True, else
+                            proportions in [0, 1].
+        drop_zero_zero:     Drop causes with both true and predicted CSMF equal
+                            to zero.
+        max_val:            Optional common axis maximum.
+        crowded_threshold:  Causes with both true and pred CSMF below this
+                            value are tagged with a letter immediately instead
+                            of attempting a full label. Defaults to 8 % of
+                            ``axis_max`` (e.g. ~0.8 pp on a 10 % axis).
+                            Pass 0 to disable letter-tagging entirely.
+        figsize:            Figure size in inches.
+        save_path:          Optional output path for the figure.
+        dpi:                Save DPI.
+
+    Returns:
+        ``(fig, ax, csmf_df)`` where ``csmf_df`` contains one row per cause
+        with columns ``cause``, ``label``, ``true_csmf``, ``pred_csmf``,
+        ``abs_error``.
+    """
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    csmf_df = _csmf_dataframe(
+        y_true=y_true,
+        y_pred=y_pred,
+        label_order=label_order,
+        cause_map=cause_map,
+        drop_zero_zero=drop_zero_zero,
+        percentage=percentage,
+    )
+    if csmf_df.empty:
+        raise ValueError("No causes available to plot after filtering.")
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.scatter(
+        csmf_df["true_csmf"],
+        csmf_df["pred_csmf"],
+        s=point_size,
+        color=point_color,
+        alpha=alpha,
+        edgecolor="white",
+        linewidth=0.7,
+        zorder=3,
+    )
+
+    upper = float(max(csmf_df["true_csmf"].max(), csmf_df["pred_csmf"].max()))
+    axis_max = max_val if max_val is not None else upper * (1.12 if annotate else 1.08)
+    if axis_max <= 0:
+        axis_max = 1.0 if not percentage else 100.0
+
+    ax.set_xlim(0, axis_max)
+    ax.set_ylim(0, axis_max)
+    ax.plot([0, axis_max], [0, axis_max], linestyle="--", linewidth=1.2, color="#7E6148", zorder=2)
+
+    footnotes: list[str] = []
+    if annotate:
+        _threshold = crowded_threshold if crowded_threshold is not None else axis_max * 0.08
+        footnotes = _place_scatter_labels(
+            ax=ax,
+            csmf_df=csmf_df,
+            axis_max=axis_max,
+            label_fontsize=label_fontsize,
+            crowded_threshold=_threshold,
+            point_size=point_size,
+        )
+
+    ax.set_xlabel(xlabel or ("True CSMF (%)" if percentage else "True CSMF"))
+    ax.set_ylabel(ylabel or ("Modelled CSMF (%)" if percentage else "Modelled CSMF"))
+    if title:
+        ax.set_title(title)
+    ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.45, zorder=1)
+    ax.set_axisbelow(True)
+
+    if footnotes:
+        # Wrap footnotes into rows of 4 so the note block stays compact.
+        per_row = 4
+        rows = [footnotes[i : i + per_row] for i in range(0, len(footnotes), per_row)]
+        fn_text = "Note:  " + "\n       ".join("   ".join(r) for r in rows)
+        n_rows = len(rows)
+        bottom_frac = 0.045 + 0.038 * (n_rows - 1)  # ~4.5 % per line
+        fig.text(
+            0.02,
+            0.01,
+            fn_text,
+            ha="left",
+            va="bottom",
+            fontsize=max(7, label_fontsize - 1),
+            color="#1B1919",
+        )
+        plt.tight_layout(rect=(0, bottom_frac, 1, 1))
+    else:
+        plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        logger.info("CSMF scatter plot saved to %s", save_path)
+
+    return fig, ax, csmf_df
+
+
+def _place_scatter_labels(
+    ax,
+    csmf_df: pd.DataFrame,
+    axis_max: float,
+    label_fontsize: int,
+    crowded_threshold: float,
+    point_size: float = 55,
+) -> list[str]:
+    """Place labels using adjustText; letter-tag near-origin crowded points.
+
+    Causes with both true and pred CSMF below *crowded_threshold* are tagged
+    with uppercase letters (A, B, C…) and listed in the returned footnotes.
+    All other causes get their full label placed by adjustText.
+
+    Initial text positions are seeded *perpendicular to the diagonal* away from
+    the y = x line: points above the diagonal start upper-left, points below
+    start lower-right.  This gives adjustText a much better starting
+    configuration and naturally keeps labels on the open/less-crowded side of
+    their dots rather than on top of the diagonal.
+
+    Invisible scatter points are also planted along the diagonal so that
+    adjustText continues to repel labels away from it during iteration.
+    """
+    from adjustText import adjust_text
+
+    _LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    def _tag(i: int) -> str:
+        return _LETTERS[i] if i < 26 else f"{_LETTERS[i % 26]}{i // 26 + 1}"
+
+    arrowprops = dict(arrowstyle="-", color="#7E6148", lw=0.5,
+                      shrinkA=0, shrinkB=4)
+
+    footnotes: list[str] = []
+    texts: list = []
+    xs: list[float] = []
+    ys: list[float] = []
+    tag_n = 0
+
+    # Sort: outer (large CSMF) first so letter tags get A, B, C in a
+    # meaningful order (largest → smallest) for the footnote.
+    work = csmf_df.copy()
+    work["_r"] = np.hypot(work["true_csmf"], work["pred_csmf"])
+    work = work.sort_values("_r", ascending=False)
+
+    # Seed each text position perpendicular to the diagonal y = x and away from
+    # it.  Perpendicular direction: (-1, +1)/√2 for above-diagonal points,
+    # (+1, -1)/√2 for below-diagonal points.
+    # Magnitude: 7 % of axis_max — large enough to move the starting position
+    # clearly off the line but small enough that the connector arrow remains
+    # short for well-separated points.
+    _INV_SQRT2 = 1.0 / np.sqrt(2)
+    base_offset = axis_max * 0.07
+
+    for row in work.itertuples(index=False):
+        x, y = row.true_csmf, row.pred_csmf
+        if x < crowded_threshold and y < crowded_threshold:
+            tag = _tag(tag_n); tag_n += 1
+            label_text = tag
+            footnotes.append(f"{tag} = {row.label}")
+            # Single-character tags are small; place them at the point and let
+            # adjustText nudge them as needed.
+            tx, ty = x, y
+        else:
+            label_text = row.label
+            # Above diagonal (pred > true): push upper-left.
+            # Below diagonal (pred < true): push lower-right.
+            sign = 1.0 if (y >= x) else -1.0
+            tx = float(np.clip(x - sign * base_offset * _INV_SQRT2,
+                               0.0, axis_max * 0.97))
+            ty = float(np.clip(y + sign * base_offset * _INV_SQRT2,
+                               0.0, axis_max * 0.97))
+
+        t = ax.text(tx, ty, label_text, fontsize=label_fontsize,
+                    color="#1B1919", zorder=5,
+                    ha="center", va="center")
+        texts.append(t)
+        xs.append(x)
+        ys.append(y)
+
+    if texts:
+        # Plant invisible scatter points along the diagonal so that adjustText
+        # continues to repel labels away from the y = x line during iteration.
+        n_diag = 25
+        diag_v = np.linspace(0.0, axis_max, n_diag).tolist()
+        ax.scatter(diag_v, diag_v, s=0, alpha=0.0, zorder=0)
+
+        adjust_text(
+            texts,
+            x=xs, y=ys,
+            ax=ax,
+            arrowprops=arrowprops,
+            expand=(1.4, 1.6),
+            force_text=(0.15, 0.2),
+            force_points=(0.4, 0.5),
+            lim=300,
+            verbose=False,
+        )
+
+    return footnotes
 
 
 # ---------------------------------------------------------------------------
@@ -824,6 +1108,32 @@ def _compute_cause_accuracy_matrix(
 
     ordered_names = _reorder_insilicova_first(list(model_accs))
     return pd.DataFrame(model_accs)[ordered_names]
+
+
+def _resolve_true_label_counts(
+    df: pd.DataFrame | None,
+    true_col: str,
+    topk_dfs: dict[str, "pd.DataFrame"] | None,
+) -> pd.Series:
+    """Resolve per-cause sample counts for y-axis label annotations."""
+    if df is not None:
+        if true_col not in df.columns:
+            raise ValueError(
+                f"true_col {true_col!r} not found in df columns; cannot compute label counts."
+            )
+        return df[true_col].value_counts()
+
+    if not topk_dfs:
+        raise ValueError(
+            "show_n=True requires df or topk_dfs to compute per-cause sample counts."
+        )
+
+    first_topk = next(iter(topk_dfs.values()))
+    if "true_label" not in first_topk.columns:
+        raise ValueError(
+            "topk_dfs entries must contain 'true_label' when show_n=True."
+        )
+    return first_topk["true_label"].value_counts()
 
 
 def _group_boundaries_from_sizes(group_sizes: list[int], n_cols: int) -> list[tuple[float, float]]:
@@ -1169,11 +1479,7 @@ def cause_accuracy_heatmap(
     # Step 4b: compute per-cause sample counts (used when show_n=True)
     # ------------------------------------------------------------------
     if show_n:
-        if df is not None:
-            label_counts = df[true_col].value_counts()
-        else:
-            _first_topk = next(iter(topk_dfs.values()))
-            label_counts = _first_topk["true_label"].value_counts()
+        label_counts = _resolve_true_label_counts(df=df, true_col=true_col, topk_dfs=topk_dfs)
     else:
         label_counts = None
 
@@ -1279,6 +1585,7 @@ def cause_accuracy_diff_heatmap(
     cbar_label: str | None = None,
     x_rotation: int = 45,
     y_rotation: int = 0,
+    show_n: bool = False,
     insilicova_first: bool = True,
     save_path: str | None = None,
     dpi: int = 150,
@@ -1347,6 +1654,11 @@ def cause_accuracy_diff_heatmap(
                          or ``"Difference in accuracy"`` depending on ``percentage``.
         x_rotation:      X-axis tick rotation.  Default 45.
         y_rotation:      Y-axis tick rotation.  Default 0.
+        show_n:          Append true-label sample size to each y-axis tick,
+                         e.g. ``"HIV/AIDS (n=123)"``. Counts are taken from
+                         ``df[true_col]`` when ``df`` is provided, otherwise
+                         from the ``"true_label"`` column of the first entry
+                         in ``topk_dfs``. Default False.
         insilicova_first:
                          When True (default), any model whose name contains
                          ``"insilicova"`` is moved to the far-left side of the
@@ -1462,6 +1774,14 @@ def cause_accuracy_diff_heatmap(
     diff_df = diff_df.dropna(how="all")
 
     # ------------------------------------------------------------------
+    # Step 3b: compute per-cause sample counts (used when show_n=True)
+    # ------------------------------------------------------------------
+    if show_n:
+        label_counts = _resolve_true_label_counts(df=df, true_col=true_col, topk_dfs=topk_dfs)
+    else:
+        label_counts = None
+
+    # ------------------------------------------------------------------
     # Step 4: rename for display (copy to keep diff_df clean)
     # ------------------------------------------------------------------
     display_df = diff_df.copy()
@@ -1510,6 +1830,13 @@ def cause_accuracy_diff_heatmap(
     ax.set_ylabel("")
     ax.tick_params(axis="x", rotation=x_rotation)
     ax.tick_params(axis="y", rotation=y_rotation)
+
+    if show_n:
+        ytick_labels = [
+            f"{display_cause} (n={label_counts.get(orig_cause, 0)})"
+            for orig_cause, display_cause in zip(diff_df.index, display_df.index)
+        ]
+        ax.set_yticklabels(ytick_labels, rotation=y_rotation)
 
     # ------------------------------------------------------------------
     # Step 7: column grouping annotations above heatmap

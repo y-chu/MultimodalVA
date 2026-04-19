@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import shutil
 import tarfile
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -31,10 +33,66 @@ from transformers import (
     TrainingArguments,
 )
 
+from multimodalva.utils.runtime import RuntimeTracker
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 logger = logging.getLogger(__name__)
+
+
+def _set_lightweight_seeds(seed: int) -> None:
+    """Set lightweight RNG seeds for improved run-to-run reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _int_env(name: str, default: int | None = None) -> int | None:
+    """Return an integer environment variable, or default on parse failure."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _auto_num_workers() -> int:
+    """Infer a sensible DataLoader worker count for the current environment.
+
+    Priority order:
+      1) ``MULTIMODALVA_DATALOADER_WORKERS`` (explicit override)
+      2) Derive from CPU allocation and distributed world size
+
+    CPU allocation sources:
+      - ``SLURM_CPUS_PER_TASK`` (preferred on OSC/SLURM)
+      - ``SLURM_CPUS_ON_NODE`` (fallback when per-task value is absent)
+      - ``os.cpu_count()`` (local/non-SLURM)
+
+    The derived worker count is per process (not per node), so DDP runs divide
+    the total allocation by ``WORLD_SIZE`` to avoid CPU over-subscription.
+    """
+    explicit = _int_env("MULTIMODALVA_DATALOADER_WORKERS")
+    if explicit is not None:
+        return max(0, explicit)
+
+    total_cpus = (
+        _int_env("SLURM_CPUS_PER_TASK")
+        or _int_env("SLURM_CPUS_ON_NODE")
+        or (os.cpu_count() or 4)
+    )
+    world_size = max(1, _int_env("WORLD_SIZE", 1) or 1)
+    cpus_per_proc = max(1, total_cpus // world_size)
+
+    reserve = 2 if cpus_per_proc > 4 else 1
+    derived = max(1, cpus_per_proc - reserve)
+    max_workers = max(1, _int_env("MULTIMODALVA_MAX_DATALOADER_WORKERS", 24) or 24)
+    return min(max_workers, derived)
+
 
 # Default training hyperparameters (keys match TrainingArguments where applicable)
 DEFAULT_HYPERPARAMS: dict = {
@@ -47,8 +105,9 @@ DEFAULT_HYPERPARAMS: dict = {
     # Regularisation
     "label_smoothing": 0.0,            # set 0.05–0.1 to reduce overconfidence; set 0.0 when using focal loss
     "max_grad_norm": 1.0,              # gradient clipping; lower to 0.5 if loss spikes on small data
-    # Data loading
-    "dataloader_num_workers": 2,       # parallel CPU workers per GPU; 4–8 on multi-core systems
+    # Data loading — auto-scales to SLURM allocation on HPC; falls back to os.cpu_count()
+    "dataloader_num_workers": _auto_num_workers(),  # parallel CPU workers per GPU
+    "dataloader_prefetch_factor": 4,  # batches queued per worker (only when num_workers > 0)
     # Layer freezing — active by default for supported architectures (bert, roberta, longformer, bigbird, electra)
     # Skipped with a warning for unsupported architectures; set 0 to disable entirely
     "freeze_layers": 2,                # freeze embeddings + bottom N encoder layers; increase to 6 for very small datasets
@@ -495,8 +554,10 @@ def train(
     early_stopping_patience: int | None = None,
     resume: bool = True,
     cleanup_checkpoints: bool = False,
-    use_fast: bool = False,
-    eval_batch_size: int = 4,
+    use_fast: bool = True,
+    eval_batch_size: int = 32,
+    random_state: int = 42,
+    use_compile: bool = False,
 ) -> tuple[Trainer, AutoTokenizer, dict]:
     """Fine-tune a BERT-family model for multiclass classification.
 
@@ -545,13 +606,22 @@ def train(
                              space (equal to the full model size per checkpoint, up to
                              ``save_total_limit=2``).  The final model weights saved
                              directly in output_dir are unaffected.  Default False.
-        use_fast: Use the HuggingFace fast (Rust) tokenizer. Default False.
+        use_fast: Use the HuggingFace fast (Rust) tokenizer. Default True.
                   Set False for models that lack a fast tokenizer
                   (e.g. BlueBERT) to avoid a falling-back warning.
         eval_batch_size: Per-device batch size used exclusively for eval forward
-                         passes. Decoupled from training batch_size to prevent
-                         eval OOM when training uses large batches. Default 4.
+                         passes. Decoupled from training batch_size. Default 32.
+                         Increase further on GPUs with ample VRAM (e.g. 64 on A100).
                          Only relevant when val_size > 0.
+        random_state: Lightweight seed used for RNG initialization plus
+                      Hugging Face Trainer `seed` / `data_seed` settings.
+                      Default 42.
+        use_compile: Apply torch.compile() to the model before training.
+                     Uses the "reduce-overhead" mode with backend="aot_eager" on MPS
+                     (avoids unimplemented ops in the inductor backend) and
+                     backend="inductor" on CUDA. First-call compilation takes 30–90 s;
+                     subsequent calls are fast. Not recommended for HPO (compilation
+                     overhead per trial). Default False.
 
     Returns:
         trainer:   HuggingFace Trainer with the fine-tuned model at trainer.model.
@@ -572,12 +642,32 @@ def train(
     if hyperparams:
         hp.update(hyperparams)
 
+    runtime_tracker = RuntimeTracker(
+        output_dir,
+        report_name="train_runtime.json",
+        metadata={
+            "pipeline": "text_train",
+            "model_name": model_name,
+            "use_lora": use_lora,
+            "gradient_checkpointing": gradient_checkpointing,
+            "resume": resume,
+            "random_state": random_state,
+            "use_compile": use_compile,
+        },
+        logger_=logger,
+    )
+
+    _set_lightweight_seeds(random_state)
     num_labels = len(label2id)
 
     # --- Carve out validation split from training data ---
     # Test data must never enter train(); it is reserved exclusively for predict().
     if val_size is not None and val_size > 0.0:
-        train_dataset, val_dataset = _val_split(train_dataset, val_size)
+        train_dataset, val_dataset = _val_split(
+            train_dataset,
+            val_size,
+            random_state=random_state,
+        )
         has_eval = True
         logger.info(
             "Validation split: %d train / %d val (val_size=%.2f).",
@@ -637,6 +727,61 @@ def train(
                 "config key (e.g. hidden_dropout_prob) via the hyperparams dict.",
                 model_name, _cfg_cls.__name__, hp["classifier_dropout"],
             )
+
+    # --- MPS architecture compatibility ---
+    # Detect MPS early (before _is_mps is set further below) so we can configure
+    # model kwargs at load time.
+    _mps_at_load = torch.backends.mps.is_available() and not torch.cuda.is_available()
+    if _mps_at_load:
+        _model_lower = model_name.lower()
+        if "longformer" in _model_lower:
+            # LongformerSelfAttention uses scatter/gather ops that are not implemented
+            # in Metal.  PYTORCH_ENABLE_MPS_FALLBACK=1 silently routes those ops to
+            # CPU, but the resulting MPS↔CPU tensor copies frequently make the run
+            # *slower* than pure CPU execution on M-chip Macs — not faster.
+            # For local MPS development, BigBird with attention_type="original_full"
+            # is the recommended drop-in replacement: same capacity, MPS-native ops.
+            if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") != "1":
+                logger.warning(
+                    "Longformer on MPS: LongformerSelfAttention uses scatter/gather "
+                    "ops not natively supported by Metal.  Without "
+                    "PYTORCH_ENABLE_MPS_FALLBACK=1 this will raise a RuntimeError.  "
+                    "With the fallback enabled those ops run on CPU, which may be "
+                    "slower than using --device cpu directly due to MPS↔CPU copies.  "
+                    "Recommended MPS-native alternative: 'google/bigbird-roberta-base' "
+                    "or 'yikuan8/Clinical-BigBird' (auto-configured to use "
+                    "attention_type='original_full' on MPS)."
+                )
+            else:
+                logger.warning(
+                    "Longformer on MPS with PYTORCH_ENABLE_MPS_FALLBACK=1: "
+                    "scatter/gather ops will execute on CPU.  This avoids crashes but "
+                    "continuous MPS↔CPU tensor copies may make training slower than "
+                    "running entirely on CPU.  For faster local runs consider "
+                    "'google/bigbird-roberta-base' (MPS-native with original_full attention)."
+                )
+        elif "bigbird" in _model_lower:
+            # BigBird's block-sparse attention (default) also uses custom CUDA ops
+            # not available in Metal.  Setting attention_type="original_full" switches
+            # to standard dense self-attention — same model weights, fully MPS-native.
+            # The user can opt out by passing attention_type explicitly in hyperparams.
+            if "attention_type" not in hp and "attention_type" not in _extra_model_kwargs:
+                logger.info(
+                    "BigBird on MPS: auto-setting attention_type='original_full' for "
+                    "MPS-native computation.  Block-sparse attention requires custom "
+                    "CUDA ops not available in Metal.  To use block_sparse anyway "
+                    "(requires PYTORCH_ENABLE_MPS_FALLBACK=1), pass "
+                    "hyperparams={'attention_type': 'block_sparse'}."
+                )
+                _extra_model_kwargs["attention_type"] = "original_full"
+            elif hp.get("attention_type") == "block_sparse":
+                logger.warning(
+                    "BigBird on MPS with attention_type='block_sparse': this requires "
+                    "PYTORCH_ENABLE_MPS_FALLBACK=1 and may be slower than CPU due to "
+                    "MPS↔CPU tensor copies.  Remove attention_type from hyperparams to "
+                    "auto-use 'original_full' instead."
+                )
+
     base_model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=num_labels,
@@ -705,39 +850,153 @@ def train(
         except ValueError as e:
             logger.warning("Layer freezing skipped (unsupported architecture): %s", e)
 
-    model.to(get_device())
-
     # --- Device capability flags ---
     _is_cuda = torch.cuda.is_available()
     _is_mps  = torch.backends.mps.is_available() and not _is_cuda
+    _world_size = max(1, _int_env("WORLD_SIZE", 1) or 1)
+    _rank = _int_env("RANK", 0) or 0
+
+    # --- CUDA performance flags (no-ops on CPU / MPS) ---
+    if _is_cuda:
+        # TF32 cuts matmul latency ~2–3× on Ampere+ (A100, RTX 30xx) with negligible
+        # accuracy loss.  Both flags must be set: one for matmuls, one for cuDNN convs.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    # Use higher matmul precision kernels where available (CUDA + MPS).
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    # bf16 (bfloat16) is the preferred mixed-precision format on Ampere+ (A100, H100).
+    # It has the same dynamic range as fp32 (8-bit exponent) so it is numerically more
+    # stable than fp16 (5-bit exponent) and does not require loss scaling.
+    # Volta-class GPUs (V100) do NOT support native bf16 — fall back to fp16 there.
+    _cuda_bf16 = _is_cuda and torch.cuda.is_bf16_supported()
+
+    # Fused AdamW (PyTorch ≥ 2.0, CUDA only): kernel-fused optimizer step, ~10–20%
+    # faster per step and lower peak memory than the unfused implementation.
+    _torch_major = int(torch.__version__.split(".")[0])
+    _optim = "adamw_torch_fused" if (_is_cuda and _torch_major >= 2) else "adamw_torch"
+
+    # --- Device placement ---
+    # Use LOCAL_RANK for DDP (torchrun): each worker must land on its own GPU.
+    # Falls back to cuda:0 / mps / cpu for single-process runs.
+    _local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if _local_rank >= 0 and _is_cuda:
+        torch.cuda.set_device(_local_rank)
+        _device = torch.device("cuda", _local_rank)
+    elif _local_rank >= 0 and not _is_cuda:
+        logger.warning(
+            "LOCAL_RANK=%d is set but CUDA is unavailable; falling back to %s.",
+            _local_rank,
+            "mps" if _is_mps else "cpu",
+        )
+        _device = torch.device("mps" if _is_mps else "cpu")
+    elif _is_cuda:
+        if torch.cuda.device_count() > 1:
+            logger.warning(
+                "Detected %d CUDA GPUs but LOCAL_RANK is unset. "
+                "For efficient multi-GPU DDP on OSC, launch with torchrun "
+                "(e.g. --nproc_per_node=%d).",
+                torch.cuda.device_count(),
+                torch.cuda.device_count(),
+            )
+        _device = torch.device("cuda")
+    elif _is_mps:
+        _device = torch.device("mps")
+    else:
+        _device = torch.device("cpu")
+    model.to(_device)
+
+    # --- Optional torch.compile() ---
+    # "reduce-overhead" mode lowers Python dispatch overhead between ops (~10–30%
+    # throughput gain on long training runs after the one-time compilation cost).
+    # Use aot_eager on MPS — the default inductor backend has unimplemented ops for
+    # many transformer architectures on Metal and raises RuntimeError at compile time.
+    # Not recommended for HPO (compilation overhead is ~60 s per fresh trial start).
+    if use_compile:
+        _torch_ver = tuple(
+            int(x) for x in torch.__version__.split(".")[:2]
+            if x.isdigit()
+        )
+        if _torch_ver >= (2, 0):
+            try:
+                _compile_backend = "aot_eager" if _is_mps else "inductor"
+                model = torch.compile(
+                    model, backend=_compile_backend, mode="reduce-overhead"
+                )
+                logger.info(
+                    "torch.compile() applied: backend=%s, mode=reduce-overhead.",
+                    _compile_backend,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "torch.compile() failed (backend=%s): %s — continuing in eager mode.",
+                    "aot_eager" if _is_mps else "inductor",
+                    exc,
+                )
+        else:
+            logger.warning(
+                "torch.compile() requires PyTorch >= 2.0 (found %s) — skipping.",
+                torch.__version__,
+            )
 
     # --- Training arguments ---
-    # dataloader_pin_memory: True speeds up CUDA transfers but is unsupported on MPS.
-    #   HuggingFace TrainingArguments defaults to True, which triggers a UserWarning on
-    #   Apple Silicon. Explicitly set to False on MPS (and CPU) to suppress it.
-    # fp16: only safe on CUDA; MPS uses bfloat16 natively so fp16=False is correct.
+    # dataloader_pin_memory: True speeds up CUDA host→device transfers but is
+    #   unsupported on MPS. Explicitly False on MPS/CPU to suppress UserWarning.
+    # fp16 / bf16: mutually exclusive. bf16 preferred on Ampere+ (A100/H100);
+    #   fp16 for Volta (V100); neither on MPS (uses bf16 natively, no flag needed).
+    # group_by_length: group similarly-lengthed sequences into the same batch.
+    #   Reduces intra-batch padding significantly for VA narratives whose lengths
+    #   vary widely. Typical throughput gain: 15–35% depending on length distribution.
+    # ddp_find_unused_parameters: set False when layers are frozen — frozen params
+    #   are "unused" in the DDP backward pass, and the default True setting adds a
+    #   traversal cost that is wasted when we already know which params are inactive.
+    # optim: fused AdamW (PyTorch ≥ 2.0, CUDA) fuses the optimizer update kernel,
+    #   reducing CUDA kernel launch overhead ~10–20% per step.
     # label_names: force Trainer to treat "labels" as supervised targets even when
-    #   the model is wrapped by PEFT/LoRA. Some transformers versions cannot infer
-    #   label fields from wrapped forward signatures during evaluation, which causes
-    #   eval to emit only timing metrics and breaks metric_for_best_model.
-    # gradient_checkpointing_kwargs use_reentrant=False: the reentrant implementation
-    #   requires at least one input tensor to have requires_grad=True.  When layers are
-    #   frozen (freeze_layers > 0) the early checkpointed segments receive all-frozen
-    #   inputs, causing "None of the inputs have requires_grad=True. Gradients will be
-    #   None."  use_reentrant=False (non-reentrant autograd checkpointing, PyTorch >= 2.1)
-    #   removes this requirement and is the recommended modern default.
+    #   the model is wrapped by PEFT/LoRA across transformers versions.
+    # gradient_checkpointing_kwargs use_reentrant=False: non-reentrant autograd
+    #   checkpointing (PyTorch ≥ 2.1) does not require any input to have requires_grad,
+    #   eliminating the "Gradients will be None" warning with frozen layers.
     metric_for_best_model = _best_model_metric_name(has_eval)
     num_workers = int(hp["dataloader_num_workers"])
+    # On MPS (Apple Silicon), multiple DataLoader workers hurt rather than help:
+    # (1) macOS uses the "spawn" start method — each worker costs ~0.5 s to start.
+    # (2) Unified memory means batches don't need to be copied from CPU RAM to GPU;
+    #     multiprocessing just adds IPC overhead on top of shared physical memory.
+    # Override to 0 unless the user explicitly set MULTIMODALVA_DATALOADER_WORKERS.
+    if _is_mps and num_workers > 0 and _int_env("MULTIMODALVA_DATALOADER_WORKERS") is None:
+        logger.info(
+            "MPS device: overriding dataloader_num_workers %d → 0 "
+            "(unified memory + macOS spawn overhead; single-process loading is faster). "
+            "Set MULTIMODALVA_DATALOADER_WORKERS=N to override.",
+            num_workers,
+        )
+        num_workers = 0
+    prefetch_factor = int(hp.get("dataloader_prefetch_factor", 4))
+    _has_frozen = bool(hp.get("freeze_layers", 0))
+    runtime_tracker.update_metadata(
+        num_labels=num_labels,
+        has_eval=has_eval,
+        train_examples=len(train_dataset),
+        val_examples=(len(val_dataset) if val_dataset is not None else 0),
+        dataloader_num_workers=num_workers,
+        dataloader_prefetch_factor=(prefetch_factor if num_workers > 0 else None),
+        hyperparams=hp,
+    )
 
     training_args = TrainingArguments(
         output_dir=str(output_dir),
+        seed=random_state,
+        data_seed=random_state,
         learning_rate=hp["learning_rate"],
         per_device_train_batch_size=hp["batch_size"],
-        # eval_batch_size is intentionally decoupled from training batch_size.
-        # Using training batch_size for eval can OOM (especially with LoRA +
-        # gradient_accumulation where effective batch is already large), leaving
-        # eval_loss absent and causing KeyError in _determine_best_metric.
-        # A small fixed value (default 4) guarantees eval never OOMs.
+        # eval batch size is decoupled from training batch size to prevent eval OOM
+        # with LoRA + large gradient_accumulation. Default 32 is safe for all
+        # BERT-family models; increase to 64+ on GPUs with ≥ 40 GB VRAM.
         per_device_eval_batch_size=eval_batch_size,
         num_train_epochs=hp["epochs"],
         warmup_ratio=hp["warmup_ratio"],
@@ -749,19 +1008,26 @@ def train(
         save_strategy="epoch",
         save_total_limit=2,
         load_best_model_at_end=has_eval,
-        # Use the explicit evaluation metric key to match the metrics dict that
-        # Trainer produces at eval time across transformers versions.
         metric_for_best_model=metric_for_best_model,
         greater_is_better=True if has_eval else None,
         logging_steps=50,
         report_to="none",
-        fp16=_is_cuda,
+        # Mixed precision — bf16 preferred on Ampere+, fp16 fallback for Volta
+        fp16=(_is_cuda and not _cuda_bf16),
+        bf16=_cuda_bf16,
+        # Optimizer — fused kernel on PyTorch ≥ 2.0 + CUDA
+        optim=_optim,
         label_names=["labels"],
         dataloader_num_workers=num_workers,
         dataloader_pin_memory=_is_cuda,
         dataloader_persistent_workers=bool(num_workers > 0),
+        dataloader_prefetch_factor=(prefetch_factor if num_workers > 0 else None),
+        # Group sequences of similar length to minimise intra-batch padding waste
+        group_by_length=True,
         gradient_checkpointing=gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
+        # DDP: skip unused-parameter traversal when layers are frozen
+        ddp_find_unused_parameters=(False if _has_frozen else None),
         disable_tqdm=False,
     )
 
@@ -790,7 +1056,12 @@ def train(
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=DataCollatorWithPadding(tokenizer),
+        data_collator=DataCollatorWithPadding(
+            tokenizer,
+            # Padding to multiples of 8 improves memory alignment and throughput
+            # for CUDA (tensor core alignment) and MPS (Metal memory alignment).
+            pad_to_multiple_of=(8 if (_is_cuda or _is_mps) else None),
+        ),
         compute_metrics=_compute_eval_metrics if has_eval else None,
         callbacks=callbacks or None,
     )
@@ -842,38 +1113,69 @@ def train(
             )
 
     # --- Train ---
-    trainer.train(resume_from_checkpoint=resume_checkpoint)
+    with runtime_tracker.stage(
+        "trainer_train",
+        details={
+            "resume_from_checkpoint": str(resume_checkpoint) if resume_checkpoint else None,
+            "has_eval": has_eval,
+            "batch_size": hp["batch_size"],
+            "epochs": hp["epochs"],
+        },
+        monitor_gpu=True,
+        device=_device,
+    ):
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
+
+    # Release any MPS memory that the Metal runtime is holding but no longer
+    # needs.  Without an explicit cache flush, fragmented memory from the forward
+    # + backward passes can accumulate across multiple train() calls (e.g. HPO
+    # trials), eventually causing OOM on machines with limited unified memory.
+    if _is_mps:
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+    is_world_zero = trainer.is_world_process_zero() if hasattr(trainer, "is_world_process_zero") else True
 
     # --- Merge LoRA weights before saving for inference compatibility ---
-    if use_lora:
+    if use_lora and is_world_zero:
         model = model.merge_and_unload()
         trainer.model = model
 
-    # --- Save model and tokenizer ---
-    trainer.save_model(str(output_dir))
-    tokenizer.save_pretrained(str(output_dir))
+    with runtime_tracker.stage(
+        "save_artifacts",
+        details={
+            "cleanup_checkpoints": cleanup_checkpoints,
+            "is_world_process_zero": is_world_zero,
+        },
+    ):
+        if is_world_zero:
+            # --- Save model and tokenizer ---
+            trainer.save_model(str(output_dir))
+            tokenizer.save_pretrained(str(output_dir))
 
-    # --- Optionally remove intermediate checkpoints ---
-    # checkpoint-* dirs are only needed to resume an interrupted training run.
-    # After successful completion the final weights are in output_dir; the
-    # checkpoint copies are redundant and can be several hundred MB each.
-    if cleanup_checkpoints:
-        for ckpt in output_dir.iterdir():
-            if (
-                ckpt.is_dir()
-                and ckpt.name.startswith("checkpoint-")
-                and ckpt.name.split("-")[-1].isdigit()
-            ):
-                shutil.rmtree(ckpt)
-                logger.info("Removed checkpoint: %s", ckpt)
+            # --- Optionally remove intermediate checkpoints ---
+            # checkpoint-* dirs are only needed to resume an interrupted training run.
+            # After successful completion the final weights are in output_dir; the
+            # checkpoint copies are redundant and can be several hundred MB each.
+            if cleanup_checkpoints:
+                for ckpt in output_dir.iterdir():
+                    if (
+                        ckpt.is_dir()
+                        and ckpt.name.startswith("checkpoint-")
+                        and ckpt.name.split("-")[-1].isdigit()
+                    ):
+                        shutil.rmtree(ckpt)
+                        logger.info("Removed checkpoint: %s", ckpt)
 
-    # --- Save label maps and hyperparams ---
-    with open(output_dir / "label2id.json", "w") as f:
-        json.dump(label2id, f, indent=2)
-    with open(output_dir / "id2label.json", "w") as f:
-        json.dump({str(k): v for k, v in id2label.items()}, f, indent=2)
-    with open(output_dir / "hyperparams.json", "w") as f:
-        json.dump(hp, f, indent=2)
+            # --- Save label maps and hyperparams ---
+            with open(output_dir / "label2id.json", "w") as f:
+                json.dump(label2id, f, indent=2)
+            with open(output_dir / "id2label.json", "w") as f:
+                json.dump({str(k): v for k, v in id2label.items()}, f, indent=2)
+            with open(output_dir / "hyperparams.json", "w") as f:
+                json.dump(hp, f, indent=2)
 
     metadata = {
         "output_dir": str(output_dir),
@@ -882,9 +1184,23 @@ def train(
         "label2id": label2id,
         "id2label": id2label,
         "log_history": trainer.state.log_history,
+        "runtime_report": str(runtime_tracker.report_path),
+        "runtime_stage_csv": str(runtime_tracker.stage_csv_path),
     }
-    with open(output_dir / "training_metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    logger.info("Training complete. Artifacts saved to %s", output_dir)
+    if is_world_zero:
+        with open(output_dir / "training_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        logger.info("Training complete. Artifacts saved to %s", output_dir)
+    else:
+        logger.info(
+            "Training complete on rank %d/%d. Skipping artifact writes on non-zero rank.",
+            _rank,
+            _world_size,
+        )
+    runtime_tracker.update_metadata(
+        rank=_rank,
+        world_size=_world_size,
+        completed_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        training_metadata_path=str(output_dir / "training_metadata.json") if is_world_zero else None,
+    )
     return trainer, tokenizer, metadata

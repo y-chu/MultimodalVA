@@ -39,9 +39,9 @@ DEFAULT_SEARCH_SPACE: dict = {
     "epochs": ("categorical", [3, 5, 7]),
 
     # L2 regularisation on non-bias / non-LayerNorm parameters (AdamW decoupled decay).
-    # 0.01 is the HuggingFace default; 0.0–0.15 covers most reasonable settings.
-    # Increase toward 0.1–0.3 if overfitting on small datasets.
-    "weight_decay": ("float", 0.0, 0.15),
+    # 0.01 is the HuggingFace default; uniform [0.0, 0.1] covers the actionable range.
+    # Log-uniform is unnecessary — values below ~0.001 are functionally identical to 0.
+    "weight_decay": ("float", 0.0, 0.1),
 
     # Fraction of total training steps used for linear LR warmup.
     # BERT paper uses 0.1 (10%); 0.0–0.1 is common in practice.
@@ -61,12 +61,18 @@ DEFAULT_SEARCH_SPACE: dict = {
     # 6  — aggressive (half of BERT-base's 12 layers); use when heavily overfitting.
     "freeze_layers": ("categorical", [2, 4, 6]),
 
-    # Classifier dropout — strong regularizer for small / imbalanced datasets.
-    # 0.1–0.3 is a good range; 0.0 can work well for larger datasets.
-    "classifier_dropout": ("float", 0.1, 0.4),
+    # Classifier dropout — regularizes the randomly-initialised classification head.
+    # Kept narrow [0.1, 0.2]: values above 0.2 destroy signal from rare class examples
+    # (5–15 samples) by randomly dropping 20–40 % of head features per forward pass.
+    # The pretrained default (~0.1) is already sensible; this range allows modest tuning.
+    "classifier_dropout": ("float", 0.1, 0.2),
 
-    # Label smoothing — stabilizes multi-class training, especially with many classes.
-    "label_smoothing": ("float", 0.0, 0.1),
+    # label_smoothing intentionally omitted:
+    # - Reduces the loss contribution from every training example, including scarce
+    #   minority classes that already have limited learning signal.
+    # - No meaningful benefit for BERT fine-tuning on small, imbalanced VA datasets
+    #   (was popularised on ImageNet with millions of examples and 1 000 classes).
+    # - Use class_weights="effective_n" or loss_type="focal" for imbalance instead.
 }
 
 
@@ -200,18 +206,20 @@ def get_default_search_space(n_samples: int, n_classes: int) -> dict:
         space["freeze_layers"] = ("categorical", [0, 2, 4])
 
     # ── classifier_dropout ───────────────────────────────────────────────────
+    # Kept bounded: high dropout destroys signal from rare class examples.
     if st == "small" or ct == "many":
-        space["classifier_dropout"] = ("float", 0.2, 0.5)
+        space["classifier_dropout"] = ("float", 0.1, 0.25)  # slightly wider for more regularization need
     elif st == "large" and ct == "few":
-        space["classifier_dropout"] = ("float", 0.0, 0.3)
-    # else: default [0.1, 0.4]
+        space["classifier_dropout"] = ("float", 0.0, 0.15)  # less regularization needed
+    # else: default [0.1, 0.2]
 
     # ── weight_decay ─────────────────────────────────────────────────────────
+    # Scaled proportionally with the new narrower baseline [0.0, 0.1].
     if st == "small":
-        space["weight_decay"] = ("float", 0.0, 0.3)
+        space["weight_decay"] = ("float", 0.0, 0.15)   # slightly wider for regularization pressure
     elif st == "large":
-        space["weight_decay"] = ("float", 0.0, 0.1)
-    # moderate: default [0.0, 0.15]
+        space["weight_decay"] = ("float", 0.0, 0.05)   # large data needs less L2
+    # moderate: default [0.0, 0.1]
 
     # ── gradient_accumulation_steps ──────────────────────────────────────────
     # Small batches benefit from accumulation to maintain a reasonable effective size.
@@ -219,9 +227,6 @@ def get_default_search_space(n_samples: int, n_classes: int) -> dict:
         space["gradient_accumulation_steps"] = ("categorical", [2, 4])
     # moderate/large: default [1, 2]
 
-    # ── label_smoothing ──────────────────────────────────────────────────────
-    if ct == "many":
-        space["label_smoothing"] = ("float", 0.0, 0.15)
-    # few/moderate: default [0.0, 0.1]
+    # label_smoothing is intentionally not searched — see DEFAULT_SEARCH_SPACE comment.
 
     return space
