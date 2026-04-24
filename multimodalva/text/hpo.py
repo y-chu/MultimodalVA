@@ -4,7 +4,7 @@ Step 5: Hyperparameter optimization.
 Two backends are provided; both accept the same search_space format and return
 ``(best_hyperparams, backend_object)`` so callers can switch seamlessly:
 
-    optimize()      — Optuna (TPE sampler, SQLite persistence)
+    optimize()      — Optuna (TPE sampler, JournalStorage persistence)
                       Best for single-machine sequential or lightly parallel HPO.
 
     optimize_ray()  — Ray Tune (OptunaSearch / TPE, distributed runtime)
@@ -187,8 +187,11 @@ def optimize(
         gradient_checkpointing: Enable gradient checkpointing per trial. Default False.
         early_stopping_patience: Early stopping patience passed to each trial's train().
                                   Set to None to disable. Default 3.
-        storage_path: SQLite URL for persisting the study (enables resume across
-                      sessions). Defaults to output_dir/hpo_<model_name>.db.
+        storage_path: Path to the JournalStorage log file for persisting the study
+                      (enables resume across sessions).
+                      Defaults to output_dir/hpo_<model_name>.log.
+                      Accepts a bare path (.log) or legacy sqlite:///… / .db paths
+                      — .db paths are auto-redirected to .log with a warning.
         load_if_exists: Resume an existing study if storage_path already contains one.
                         Default True.
         enable_pruning: Use Optuna's MedianPruner to stop unpromising trials early.
@@ -212,7 +215,7 @@ def optimize(
                         completes.  The best trial is preserved at ``best_trial/``
                         before deletion.  Each trial directory contains a full model
                         checkpoint (≈400 MB for BERT-base); 20 trials can accumulate
-                        8+ GB.  The SQLite study DB, ``best_hyperparams.json``,
+                        8+ GB.  The JournalStorage log, ``best_hyperparams.json``,
                         ``best_trial/``, and the CSV are all kept.  Default True.
 
     Returns:
@@ -223,7 +226,7 @@ def optimize(
     # Raise the open-file-descriptor limit before the HPO loop.
     # On macOS the default soft limit is 256; Longformer HPO can exhaust this
     # (model weights, tokenizer files, checkpoint dirs, Dropbox daemon) causing
-    # SQLite to fail with "unable to open database file" which in turn makes
+    # file I/O errors in JournalStorage or tokenizer loading, which make
     # Optuna crash with AssertionError when it can't record a trial failure.
     try:
         import resource as _resource
@@ -303,29 +306,33 @@ def optimize(
                 model_name, _cfg_cls.__name__,
             )
 
+    # JournalStorage (append-only log + fcntl locking) replaces SQLite as the
+    # default backend.  It tolerates cloud-sync folders (Dropbox, iCloud) and
+    # network filesystems where SQLite's page-lock protocol tends to break.
     if storage_path is None:
         safe_name = model_name.replace("/", "_")
-        # Use resolved absolute path so the DB is always found regardless of CWD.
-        storage_path = f"sqlite:///{output_dir.resolve()}/hpo_{safe_name}.db"
-        # Warn when the SQLite DB will live inside a cloud-sync folder.
-        # Dropbox / iCloud / OneDrive hold their own file locks on .db files while
-        # syncing, which can cause "unable to open database file" mid-trial.
-        # Pass an explicit storage_path pointing to a local dir (e.g. /tmp/) to avoid this.
-        _cloud_markers = ("Dropbox", "iCloudDrive", "OneDrive", "Google Drive", "Box")
-        _db_path_str = str(output_dir.resolve())
-        if any(m in _db_path_str for m in _cloud_markers):
+        storage_path = str(output_dir.resolve() / f"hpo_{safe_name}.log")
+    else:
+        # Normalize legacy sqlite:/// URLs and auto-redirect .db → .log.
+        _sp = storage_path
+        if _sp.startswith("sqlite:///"):
+            _sp = _sp[len("sqlite:///"):]
+        _sp = str(Path(_sp).resolve())
+        if _sp.endswith(".db"):
+            _sp = _sp[:-3] + ".log"
             logger.warning(
-                "Optuna SQLite DB is inside a cloud-sync folder (%s).  "
-                "Cloud sync daemons can hold file locks that prevent SQLite writes "
-                "mid-trial (→ 'unable to open database file').  "
-                "Pass storage_path='/tmp/hpo_%s.db' (or any local path) to avoid this.",
-                _db_path_str, safe_name,
+                "storage_path points to a SQLite .db file; the HPO backend is now "
+                "JournalStorage (.log).  Redirecting to %s.  "
+                "To migrate existing trials: "
+                "python Analysis/utils/migrate_hpo_storage.py <dir>",
+                _sp,
             )
-    elif "://" not in storage_path:
-        # User passed a plain file path (e.g. "/tmp/hpo.db") without the SQLite URL
-        # scheme.  Convert it so SQLAlchemy can parse it.
-        storage_path = f"sqlite:///{Path(storage_path).resolve()}"
-        logger.info("storage_path converted to SQLite URL: %s", storage_path)
+        storage_path = _sp
+    try:
+        from optuna.storages.journal import JournalFileBackend as _JBackend
+    except ImportError:
+        from optuna.storages import JournalFileStorage as _JBackend  # type: ignore
+    storage_obj = optuna.storages.JournalStorage(_JBackend(storage_path))
 
     # --- Data split setup (fixed split only needed for use_cv=False) ---
     _all_labels = _get_dataset_labels(train_dataset)
@@ -495,7 +502,7 @@ def optimize(
         sampler=TPESampler(seed=random_state),
         pruner=pruner,
         study_name=study_name,
-        storage=storage_path,
+        storage=storage_obj,
         load_if_exists=load_if_exists,
     )
 
@@ -549,7 +556,7 @@ def optimize(
             "High HPO failure rate (%.1f%% success, %d/%d trials).  "
             "Likely causes: GPU OOM, file descriptor exhaustion, NaN loss, or "
             "checkpoint errors.  Check trial logs above for details.  "
-            "Tip: pass storage_path='/tmp/hpo_<name>.db' if output_dir is on Dropbox/cloud.",
+            "Tip: pass storage_path='/tmp/hpo_<name>.log' if output_dir is on Dropbox/cloud.",
             _success_rt, _n_complete, _n_total,
         )
 
@@ -596,7 +603,7 @@ def optimize(
     # Each trial dir contains a full model copy (≈400 MB for BERT-base).
     # After HPO the best trial is in best_trial/ and hyperparams in best_hyperparams.json;
     # the individual trial_N/ directories serve no further purpose.
-    # The SQLite study DB is kept for resumability / further Optuna analysis.
+    # The JournalStorage log is kept for resumability / further Optuna analysis.
     if cleanup_trials:
         removed = 0
         for trial_dir in sorted(output_dir.iterdir()):
@@ -911,7 +918,7 @@ def optimize_ray(
     # RunConfig auto-injects checkpoint_at_end=True which raises ValueError,
     # forcing a no-RunConfig fallback where trial state goes to ~/ray_results
     # and cannot be restored → resume always restarts from trial 1.
-    # On MPS/CPU, optimize() (Optuna + SQLite) is the correct backend.
+    # On MPS/CPU, optimize() (Optuna + JournalStorage) is the correct backend.
     try:
         import torch as _torch
         _cuda_available = _torch.cuda.device_count() > 0
@@ -921,9 +928,9 @@ def optimize_ray(
         _safe = model_name.replace("/", "_")
         logger.info(
             "optimize_ray(): no CUDA GPUs detected — redirecting to optimize() "
-            "(Optuna sequential, SQLite-backed). Ray Tune requires CUDA for "
+            "(Optuna sequential, JournalStorage-backed). Ray Tune requires CUDA for "
             "reliable experiment persistence and resume. "
-            "SQLite DB: %s/hpo_%s.db",
+            "Journal log: %s/hpo_%s.log",
             output_dir, _safe,
         )
         return optimize(
@@ -941,7 +948,7 @@ def optimize_ray(
             use_focal=use_focal,
             gradient_checkpointing=gradient_checkpointing,
             early_stopping_patience=early_stopping_patience,
-            storage_path=str(output_dir / f"hpo_{_safe}.db"),
+            storage_path=str(output_dir / f"hpo_{_safe}.log"),
             load_if_exists=resume,
             save_trials_csv=save_trials_csv,
             cleanup_trials=cleanup_trials,
@@ -1021,7 +1028,7 @@ def optimize_ray(
             "devices — experiment state cannot be persisted and resume will not "
             "work across restarts. "
             "RECOMMENDATION: use optimize() (Optuna backend) instead — it uses "
-            "SQLite for reliable crash recovery and resume on MPS/CPU machines.",
+            "JournalStorage for reliable crash recovery and resume on MPS/CPU machines.",
         )
 
     _ray_mode = "min" if METRIC_DIRECTION.get(metric, "maximize") == "minimize" else "max"
@@ -1199,14 +1206,14 @@ def optimize_ray(
                     # state is saved to ~/ray_results — NOT to our exp_path — so
                     # resume via Tuner.restore() is impossible across restarts.
                     # On MPS/Apple Silicon: switch to optimize() (Optuna) for
-                    # reliable resume.  optimize() uses SQLite and resumes correctly
-                    # after crashes or SLURM preemptions.
+                    # reliable resume.  optimize() uses JournalStorage and resumes
+                    # correctly after crashes or SLURM preemptions.
                     logger.warning(
                         "checkpoint_at_end error from Ray Train v2 (%s). "
                         "Retrying without RunConfig — this run's trial state will be "
                         "saved to ~/ray_results (not %s) and CANNOT be resumed. "
                         "If you need resume support, use optimize() (Optuna backend) "
-                        "which persists state in SQLite and resumes correctly on "
+                        "which persists state in JournalStorage and resumes correctly on "
                         "MPS/CPU-only machines.", _ve, exp_path,
                     )
                     # Clean up the stale exp_path: tune.Tuner() constructor wrote
@@ -1281,7 +1288,7 @@ def optimize_ray(
             "High HPO failure rate (%.1f%% success, %d/%d trials).  "
             "Likely causes: GPU OOM, file descriptor limit, or Ray worker errors.  "
             "Consider: reduce batch_size, set num_gpus_per_trial=0 for CPU-only, "
-            "or pass storage_path='/tmp/...' to move the SQLite DB off cloud storage.",
+            "or pass storage_path='/tmp/hpo_<name>.log' to move the journal off cloud storage.",
             _succ_rt_r, _n_ok_r, _n_total_r,
         )
 

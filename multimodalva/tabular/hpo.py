@@ -4,7 +4,7 @@ Step 5 (tabular pipeline): Hyperparameter optimization.
 Two backends are provided; both accept the same search_space format and return
 ``(best_hyperparams, backend_object)`` so callers can switch seamlessly:
 
-    optimize()      — Optuna (TPE sampler, SQLite persistence)
+    optimize()      — Optuna (TPE sampler, JournalStorage persistence)
                       Best for single-machine sequential or lightly parallel HPO.
 
     optimize_ray()  — Ray Tune (OptunaSearch / TPE, distributed runtime)
@@ -164,15 +164,17 @@ def optimize(
         n_cv_folds:     Number of CV folds when use_cv=True. Default 3.
         random_state:   Seed for stratified split and Optuna sampler. Default 42.
         study_name:     Optuna study name. Default "tabular_hpo".
-        storage_path:   SQLite URL for study persistence.
-                        Defaults to output_dir/hpo_<model_name>.db.
+        storage_path:   Path to the JournalStorage log file for study persistence.
+                        Defaults to output_dir/hpo_<model_name>.log.
+                        Accepts a bare path (.log) or legacy sqlite:///… / .db paths
+                        — .db paths are auto-redirected to .log with a warning.
         load_if_exists: Resume an existing study. Default True.
         enable_pruning: MedianPruner for early trial termination. Default False
                         (pruning is less useful for fast sklearn fits).
         save_trials_csv: Save all trial results to hpo_trials.csv. Default True.
         cleanup_trials: Delete all per-trial directories (``trial_*/``) after HPO
                         completes.  The best trial is preserved at ``best_trial/``
-                        before deletion.  The SQLite study DB, ``best_hyperparams.json``,
+                        before deletion.  The JournalStorage log, ``best_hyperparams.json``,
                         ``best_trial/``, and the CSV are all kept.  Default True.
 
     Returns:
@@ -226,13 +228,32 @@ def optimize(
         X_train.shape[0], X_train.shape[1], n_classes,
     )
 
+    # JournalStorage (append-only log + fcntl locking) replaces SQLite as the
+    # default backend.  It tolerates cloud-sync folders (Dropbox, iCloud) and
+    # network filesystems where SQLite's page-lock protocol tends to break.
     if storage_path is None:
-        # Use resolved absolute path so the DB is always found regardless of CWD.
-        storage_path = f"sqlite:///{output_dir.resolve()}/hpo_{model_name}.db"
-    elif "://" not in storage_path:
-        # User passed a plain file path without the SQLite URL scheme; convert it.
-        storage_path = f"sqlite:///{Path(storage_path).resolve()}"
-        logger.info("storage_path converted to SQLite URL: %s", storage_path)
+        storage_path = str(output_dir.resolve() / f"hpo_{model_name}.log")
+    else:
+        # Normalize legacy sqlite:/// URLs and auto-redirect .db → .log.
+        _sp = storage_path
+        if _sp.startswith("sqlite:///"):
+            _sp = _sp[len("sqlite:///"):]
+        _sp = str(Path(_sp).resolve())
+        if _sp.endswith(".db"):
+            _sp = _sp[:-3] + ".log"
+            logger.warning(
+                "storage_path points to a SQLite .db file; the HPO backend is now "
+                "JournalStorage (.log).  Redirecting to %s.  "
+                "To migrate existing trials: "
+                "python Analysis/utils/migrate_hpo_storage.py <dir>",
+                _sp,
+            )
+        storage_path = _sp
+    try:
+        from optuna.storages.journal import JournalFileBackend as _JBackend
+    except ImportError:
+        from optuna.storages import JournalFileStorage as _JBackend  # type: ignore
+    storage_obj = optuna.storages.JournalStorage(_JBackend(storage_path))
 
     # Trial evaluation setup — never uses the held-out test set
     cv_splits: list[tuple[list[int], list[int]]] | None = None
@@ -347,7 +368,7 @@ def optimize(
         sampler=TPESampler(seed=random_state),
         pruner=pruner,
         study_name=study_name,
-        storage=storage_path,
+        storage=storage_obj,
         load_if_exists=load_if_exists,
     )
 
@@ -431,7 +452,7 @@ def optimize(
     # --- Remove per-trial directories (optional) ---
     # After HPO the best trial is in best_trial/ and hyperparams in best_hyperparams.json;
     # individual trial_N/ directories serve no further purpose.
-    # The SQLite study DB is kept for resumability / further Optuna analysis.
+    # The JournalStorage log is kept for resumability / further Optuna analysis.
     if cleanup_trials:
         removed = 0
         for trial_dir in sorted(output_dir.iterdir()):
@@ -809,7 +830,7 @@ def optimize_ray(
     # RunConfig auto-injects checkpoint_at_end=True which raises ValueError,
     # forcing a no-RunConfig fallback where trial state goes to ~/ray_results
     # and cannot be restored → resume always restarts from trial 1.
-    # On MPS/CPU, optimize() (Optuna + SQLite) is the correct backend.
+    # On MPS/CPU, optimize() (Optuna + JournalStorage) is the correct backend.
     try:
         import torch as _torch
         _cuda_available = _torch.cuda.device_count() > 0
@@ -819,9 +840,9 @@ def optimize_ray(
         _safe = model_name.replace("/", "_")
         logger.info(
             "optimize_ray(): no CUDA GPUs detected — redirecting to optimize() "
-            "(Optuna sequential, SQLite-backed). Ray Tune requires CUDA for "
+            "(Optuna sequential, JournalStorage-backed). Ray Tune requires CUDA for "
             "reliable experiment persistence and resume. "
-            "SQLite DB: %s/hpo_%s.db",
+            "Journal log: %s/hpo_%s.log",
             output_dir, _safe,
         )
         return optimize(
@@ -839,7 +860,7 @@ def optimize_ray(
             use_cv=use_cv,
             n_cv_folds=n_cv_folds,
             random_state=random_state,
-            storage_path=str(output_dir / f"hpo_{_safe}.db"),
+            storage_path=str(output_dir / f"hpo_{_safe}.log"),
             load_if_exists=resume,
             save_trials_csv=save_trials_csv,
             cleanup_trials=cleanup_trials,
@@ -955,7 +976,7 @@ def optimize_ray(
             "devices — experiment state cannot be persisted and resume will not "
             "work across restarts. "
             "RECOMMENDATION: use optimize() (Optuna backend) instead — it uses "
-            "SQLite for reliable crash recovery and resume on MPS/CPU machines.",
+            "JournalStorage for reliable crash recovery and resume on MPS/CPU machines.",
         )
     else:
         max_parallel = int(available_cpus // num_cpus_per_trial) if num_cpus_per_trial > 0 else None
@@ -1125,14 +1146,14 @@ def optimize_ray(
             # state is saved to ~/ray_results — NOT to our exp_path — so
             # resume via Tuner.restore() is impossible across restarts.
             # On MPS/Apple Silicon: switch to optimize() (Optuna) for
-            # reliable resume.  optimize() uses SQLite and resumes correctly
-            # after crashes or SLURM preemptions.
+            # reliable resume.  optimize() uses JournalStorage and resumes
+            # correctly after crashes or SLURM preemptions.
             logger.warning(
                 "checkpoint_at_end error from Ray Train v2 (%s). "
                 "Retrying without RunConfig — this run's trial state will be "
                 "saved to ~/ray_results (not %s) and CANNOT be resumed. "
                 "If you need resume support, use optimize() (Optuna backend) "
-                "which persists state in SQLite and resumes correctly on "
+                "which persists state in JournalStorage and resumes correctly on "
                 "MPS/CPU-only machines.", _ve, exp_path,
             )
             # Clean up the stale exp_path: tune.Tuner() constructor wrote
