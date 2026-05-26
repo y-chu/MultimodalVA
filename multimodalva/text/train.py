@@ -713,6 +713,13 @@ def train(
     # Not all architectures expose this kwarg (e.g. Longformer uses hidden_dropout_prob).
     # Auto-detect support via the config class __init__ signature to avoid TypeError.
     _extra_model_kwargs = {}
+    # When continuing fine-tuning from a checkpoint that already has a
+    # classification head (e.g. a published MultimodalVA model reloaded as
+    # `model_name`), the head size only matches if the new label set is identical.
+    # Pass hyperparams={"ignore_mismatched_sizes": True} to reinitialise a new head
+    # for a different cause set; it is a no-op when the head sizes already match.
+    if hp.get("ignore_mismatched_sizes"):
+        _extra_model_kwargs["ignore_mismatched_sizes"] = True
     if "classifier_dropout" in hp and hp["classifier_dropout"] is not None:
         import inspect
         from transformers import AutoConfig

@@ -225,6 +225,11 @@ class DataFusionClassifier:
         batch_size: int = 16,
         top_k: int = 3,
         use_fast: bool = True,
+        # --- publishing ---
+        push_to_hub: bool = False,
+        hub_repo_id: str | None = None,
+        hub_private: bool = True,
+        hub_token: str | None = None,
     ) -> dict:
         """Run the full data-level fusion pipeline.
 
@@ -471,5 +476,11 @@ class DataFusionClassifier:
         self.best_hyperparams = text_clf.best_hyperparams
         self.study             = text_clf.study
         self.predictions       = text_clf.predictions
+
+        # Publish the fused-text model with the data-fusion caveat in its card.
+        results["hub_url"] = text_clf._maybe_push_to_hub(
+            push_to_hub, hub_repo_id, hub_private, hub_token, max_length,
+            model_kind="data_fusion",
+        )
 
         return results

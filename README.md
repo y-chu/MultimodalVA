@@ -245,6 +245,71 @@ GPU monitor controls:
 - `MULTIMODALVA_ENABLE_GPU_MONITOR=0` to disable sampling
 - `MULTIMODALVA_GPU_MONITOR_INTERVAL_SEC=5` to sample every 5 seconds
 
+## Publishing And Re-using Models (Hugging Face Hub)
+
+Trained `TextClassifier` and `DataFusionClassifier` models are saved in the standard Hugging Face format (cause labels in `config.json`, LoRA adapters merged into the base weights), so they can be published to the Hub and reloaded by anyone.
+
+### Publish during a run
+
+Both wrappers accept `push_to_hub` / `hub_repo_id` (default off). Publishing runs on rank 0 only and auto-generates a model card with metrics and usage notes:
+
+```python
+from multimodalva.text import TextClassifier
+
+clf = TextClassifier(model_name="bioclinicalbert", output_dir="runs/text")
+results = clf.run(
+    df=df, text_col="narrative", label_col="cause",
+    push_to_hub=True,
+    hub_repo_id="your-org/va-bert-cod",
+    hub_private=True,          # default
+)
+print(results["hub_url"])
+```
+
+### Publish a past run (standalone util)
+
+`push_to_hub` works on any saved model directory — point it at the run's `final/` folder:
+
+```python
+from multimodalva.utils import push_to_hub
+
+push_to_hub("runs/text/final", "your-org/va-bert-cod", private=True)
+```
+
+Authenticate once with `huggingface-cli login` (or pass `token=...`). For data-fusion models pass `model_kind="data_fusion"` so the card notes the fused-input training format.
+
+### Re-use a published model
+
+```python
+# 1. Classify a narrative directly — the model already has a cause-of-death head:
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+
+tok = AutoTokenizer.from_pretrained("your-org/va-bert-cod")
+model = AutoModelForSequenceClassification.from_pretrained("your-org/va-bert-cod").eval()
+probs = model(**tok("male adult with cough and fever for 9 days", return_tensors="pt")).logits.softmax(-1)
+print(model.config.id2label[int(probs.argmax())])
+
+# 2. Continue fine-tuning on your own VA data (encoder transfers; a fresh head is
+#    initialised when your cause set differs, via ignore_mismatched_sizes):
+from multimodalva.text import TextClassifier
+
+clf = TextClassifier(model_name="your-org/va-bert-cod", output_dir="runs/finetuned")
+clf.run(df=my_df, text_col="narrative", label_col="cause",
+        hyperparams={"epochs": 3, "ignore_mismatched_sizes": True})
+```
+
+The model is an ordinary text classifier and accepts any string. Data-fusion models were fine-tuned on the narrative concatenated with structured fields rendered as sentences; for the closest match to training, rebuild that fused string with `multimodalva.ensemble.data_fusion.build_fused_text(...)` when you also have the structured fields.
+
+## Sample Data
+
+`tests/sample_data/` contains tiny, class-balanced **synthetic** CSVs showing the input schema the package expects:
+
+- `va_sample.csv` — narrative + tabular indicators + `cause` (works for text, tabular, and data-fusion demos)
+- `va_sample_text_only.csv` — narrative + `cause`
+
+Regenerate them with `python tests/demo_hub.py sample-data --output-dir tests/sample_data`.
+
 ## Demo Scripts
 
 The demos in `tests/` are intentionally small, synthetic where possible, and focused on one core workflow at a time.
@@ -258,6 +323,7 @@ The demos in `tests/` are intentionally small, synthetic where possible, and foc
 | `demo_ensemble_voting.py` | Synthetic soft voting, tabular-only voting, mixed voting | `synthetic` |
 | `demo_ensemble_stacking.py` | Stage-wise stacking with meta-learner and class-aware voter | `meta` |
 | `demo_results.py` | Leaderboard, top-k, confusion, and cause-specific heatmap utilities | `leaderboard` |
+| `demo_hub.py` | Publish to / re-use models from the Hugging Face Hub; write synthetic sample data | `sample-data` |
 
 ## Documentation
 

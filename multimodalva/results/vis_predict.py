@@ -819,10 +819,10 @@ def csmf_scatterplot(
         drop_zero_zero:     Drop causes with both true and predicted CSMF equal
                             to zero.
         max_val:            Optional common axis maximum.
-        crowded_threshold:  Causes with both true and pred CSMF below this
-                            value are tagged with a letter immediately instead
-                            of attempting a full label. Defaults to 8 % of
-                            ``axis_max`` (e.g. ~0.8 pp on a 10 % axis).
+        crowded_threshold:  Causes with both true and pred CSMF at or below
+                            this value are tagged with a letter immediately
+                            instead of attempting a full label. Defaults to 5
+                            (5 % CSMF when ``percentage=True``, 0.05 otherwise).
                             Pass 0 to disable letter-tagging entirely.
         figsize:            Figure size in inches.
         save_path:          Optional output path for the figure.
@@ -864,13 +864,30 @@ def csmf_scatterplot(
     if axis_max <= 0:
         axis_max = 1.0 if not percentage else 100.0
 
-    ax.set_xlim(0, axis_max)
-    ax.set_ylim(0, axis_max)
+    # Extend axes slightly into negative space so the dense cluster near the
+    # origin has breathing room and labels can sit below/left of their points
+    # without being clipped.  Shade the impossible (negative CSMF) L-region in
+    # light grey and hide tick labels there so it does not read as real data.
+    neg_margin = axis_max * 0.04
+    ax.set_xlim(-neg_margin, axis_max)
+    ax.set_ylim(-neg_margin, axis_max)
+    ax.axvspan(-neg_margin, 0, facecolor="#EEEEEE", edgecolor="none", zorder=0)
+    ax.axhspan(-neg_margin, 0, facecolor="#EEEEEE", edgecolor="none", zorder=0)
+    from matplotlib.ticker import FuncFormatter as _FuncFormatter
+    _hide_neg = _FuncFormatter(lambda v, _p: "" if v < -1e-9 else f"{v:g}")
+    ax.xaxis.set_major_formatter(_hide_neg)
+    ax.yaxis.set_major_formatter(_hide_neg)
     ax.plot([0, axis_max], [0, axis_max], linestyle="--", linewidth=1.2, color="#7E6148", zorder=2)
 
     footnotes: list[str] = []
     if annotate:
-        _threshold = crowded_threshold if crowded_threshold is not None else axis_max * 0.08
+        # Default: causes with both true and pred CSMF at or below 5% (5 % units
+        # if percentage=True, 0.05 if percentage=False) are letter-tagged in a
+        # footnote.  Larger causes get full labels placed next to their points.
+        if crowded_threshold is not None:
+            _threshold = crowded_threshold
+        else:
+            _threshold = 5.0 if percentage else 0.05
         footnotes = _place_scatter_labels(
             ax=ax,
             csmf_df=csmf_df,
@@ -923,20 +940,20 @@ def _place_scatter_labels(
     crowded_threshold: float,
     point_size: float = 55,
 ) -> list[str]:
-    """Place labels using adjustText; letter-tag near-origin crowded points.
+    """Place labels next to points; letter-tag everything ≤ crowded_threshold.
 
-    Causes with both true and pred CSMF below *crowded_threshold* are tagged
-    with uppercase letters (A, B, C…) and listed in the returned footnotes.
-    All other causes get their full label placed by adjustText.
-
-    Initial text positions are seeded *perpendicular to the diagonal* away from
-    the y = x line: points above the diagonal start upper-left, points below
-    start lower-right.  This gives adjustText a much better starting
-    configuration and naturally keeps labels on the open/less-crowded side of
-    their dots rather than on top of the diagonal.
-
-    Invisible scatter points are also planted along the diagonal so that
-    adjustText continues to repel labels away from it during iteration.
+    Strategy
+    --------
+    * Causes with both true and pred CSMF at or below *crowded_threshold* are
+      tagged with uppercase letters (A, B, C…) drawn at the point and listed
+      in the returned footnotes.
+    * All other causes get their full label placed adjacent to the point with
+      a small perpendicular-to-diagonal offset, *no connector line by default*.
+    * adjustText is then run only to push apart any labels that would still
+      overlap.  After it settles, a connector line is drawn **only for labels
+      that adjustText had to move significantly** from their adjacent
+      starting position — quiet, uncluttered points keep clean adjacent
+      labels; only crowded clusters show a short link line.
     """
     from adjustText import adjust_text
 
@@ -944,74 +961,86 @@ def _place_scatter_labels(
     def _tag(i: int) -> str:
         return _LETTERS[i] if i < 26 else f"{_LETTERS[i % 26]}{i // 26 + 1}"
 
-    arrowprops = dict(arrowstyle="-", color="#7E6148", lw=0.5,
-                      shrinkA=0, shrinkB=4)
-
     footnotes: list[str] = []
-    texts: list = []
-    xs: list[float] = []
-    ys: list[float] = []
+    texts: list = []          # full-label Text objects
+    xs: list[float] = []      # original data-point x for each text
+    ys: list[float] = []      # original data-point y for each text
+    init_pos: list[tuple[float, float]] = []  # initial (tx, ty) before adjust
     tag_n = 0
 
-    # Sort: outer (large CSMF) first so letter tags get A, B, C in a
-    # meaningful order (largest → smallest) for the footnote.
+    # Sort: largest CSMF first so letter tags A, B, C run from biggest to
+    # smallest among the crowded near-origin set.
     work = csmf_df.copy()
     work["_r"] = np.hypot(work["true_csmf"], work["pred_csmf"])
     work = work.sort_values("_r", ascending=False)
 
-    # Seed each text position perpendicular to the diagonal y = x and away from
-    # it.  Perpendicular direction: (-1, +1)/√2 for above-diagonal points,
-    # (+1, -1)/√2 for below-diagonal points.
-    # Magnitude: 7 % of axis_max — large enough to move the starting position
-    # clearly off the line but small enough that the connector arrow remains
-    # short for well-separated points.
+    # Initial offset for full labels: small (~2.5 % of axis_max) so the label
+    # starts visibly adjacent to the point.  Perpendicular to the diagonal so
+    # above-diagonal labels start upper-left, below-diagonal start lower-right.
     _INV_SQRT2 = 1.0 / np.sqrt(2)
-    base_offset = axis_max * 0.07
+    base_offset = axis_max * 0.025
+
+    # Transparent bbox gives adjustText a real text bbox to use for overlap
+    # detection while staying invisible to the viewer.
+    _bbox = dict(boxstyle="round,pad=0.10",
+                 facecolor="none", edgecolor="none")
 
     for row in work.itertuples(index=False):
         x, y = row.true_csmf, row.pred_csmf
-        if x < crowded_threshold and y < crowded_threshold:
+        if x <= crowded_threshold and y <= crowded_threshold:
             tag = _tag(tag_n); tag_n += 1
-            label_text = tag
             footnotes.append(f"{tag} = {row.label}")
-            # Single-character tags are small; place them at the point and let
-            # adjustText nudge them as needed.
-            tx, ty = x, y
-        else:
-            label_text = row.label
-            # Above diagonal (pred > true): push upper-left.
-            # Below diagonal (pred < true): push lower-right.
-            sign = 1.0 if (y >= x) else -1.0
-            tx = float(np.clip(x - sign * base_offset * _INV_SQRT2,
-                               0.0, axis_max * 0.97))
-            ty = float(np.clip(y + sign * base_offset * _INV_SQRT2,
-                               0.0, axis_max * 0.97))
-
-        t = ax.text(tx, ty, label_text, fontsize=label_fontsize,
+            ax.text(x, y, tag, fontsize=label_fontsize,
                     color="#1B1919", zorder=5,
-                    ha="center", va="center")
+                    ha="center", va="center", bbox=_bbox)
+            continue
+
+        # Above diagonal (pred > true) → label upper-left of point.
+        # Below diagonal (pred < true) → label lower-right of point.
+        sign = 1.0 if (y >= x) else -1.0
+        tx = float(np.clip(x - sign * base_offset * _INV_SQRT2,
+                           0.0, axis_max * 0.97))
+        ty = float(np.clip(y + sign * base_offset * _INV_SQRT2,
+                           0.0, axis_max * 0.97))
+        t = ax.text(tx, ty, row.label, fontsize=label_fontsize,
+                    color="#1B1919", zorder=5,
+                    ha="center", va="center", bbox=_bbox)
         texts.append(t)
         xs.append(x)
         ys.append(y)
+        init_pos.append((tx, ty))
 
     if texts:
-        # Plant invisible scatter points along the diagonal so that adjustText
-        # continues to repel labels away from the y = x line during iteration.
-        n_diag = 25
-        diag_v = np.linspace(0.0, axis_max, n_diag).tolist()
-        ax.scatter(diag_v, diag_v, s=0, alpha=0.0, zorder=0)
-
+        # Run adjustText WITHOUT arrows — we draw connectors ourselves below
+        # only for labels that actually had to move.
         adjust_text(
             texts,
             x=xs, y=ys,
             ax=ax,
-            arrowprops=arrowprops,
-            expand=(1.4, 1.6),
-            force_text=(0.15, 0.2),
-            force_points=(0.4, 0.5),
-            lim=300,
+            arrowprops=None,
+            expand=(1.05, 1.1),
+            force_text=(0.2, 0.3),
+            force_points=(0.25, 0.3),
+            lim=200,
             verbose=False,
         )
+
+        # Connector threshold: if the label moved more than ~4 % of axis_max
+        # from its initial adjacent position, draw a thin line back to the
+        # data point.  Otherwise leave it floating clean next to the point.
+        move_threshold = axis_max * 0.04
+        for t, x_orig, y_orig, (tx0, ty0) in zip(texts, xs, ys, init_pos):
+            fx, fy = t.get_position()
+            displacement = np.hypot(fx - tx0, fy - ty0)
+            if displacement > move_threshold:
+                ax.annotate(
+                    "",
+                    xy=(x_orig, y_orig),
+                    xytext=(fx, fy),
+                    arrowprops=dict(arrowstyle="-", color="#7E6148",
+                                    lw=0.5, shrinkA=2, shrinkB=2),
+                    zorder=4,
+                )
 
     return footnotes
 

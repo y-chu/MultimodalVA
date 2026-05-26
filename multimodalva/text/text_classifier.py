@@ -123,6 +123,10 @@ class TextClassifier:
         use_cv: bool = True,
         n_cv_folds: int = 3,
         use_compile: bool = False,
+        push_to_hub: bool = False,
+        hub_repo_id: str | None = None,
+        hub_private: bool = True,
+        hub_token: str | None = None,
     ) -> dict:
         """Run the full text classification pipeline.
 
@@ -192,6 +196,13 @@ class TextClassifier:
                          Not forwarded to HPO trials (compilation overhead per trial is
                          counterproductive). Uses aot_eager backend on MPS, inductor on
                          CUDA. Default False.
+            push_to_hub: After training, publish the final model to the Hugging Face
+                         Hub. Requires hub_repo_id. Rank-0 only in DDP runs. Default False.
+            hub_repo_id: Target Hub repo id (e.g. "your-org/va-bert"). Required when
+                         push_to_hub=True.
+            hub_private: Create/keep the Hub repo private. Default True.
+            hub_token:   HF auth token. None uses the cached `huggingface-cli login`
+                         credential or HF_TOKEN env var.
 
         Returns:
             results: Dict with keys:
@@ -346,6 +357,11 @@ class TextClassifier:
                 use_fast=use_fast,
             )
 
+        hub_url = self._maybe_push_to_hub(
+            push_to_hub, hub_repo_id, hub_private, hub_token, max_length,
+            model_kind="text",
+        )
+
         return {
             "predictions": self.predictions,
             "train_metadata": self.train_metadata,
@@ -353,9 +369,58 @@ class TextClassifier:
             "label2id": self.label2id,
             "id2label": self.id2label,
             "output_dir": self.output_dir,
+            "hub_url": hub_url,
             "runtime_report": runtime_tracker.report_path,
             "runtime_stage_csv": runtime_tracker.stage_csv_path,
         }
+
+    def _maybe_push_to_hub(
+        self,
+        push: bool,
+        hub_repo_id: str | None,
+        hub_private: bool,
+        hub_token: str | None,
+        max_length: int,
+        model_kind: str = "text",
+    ) -> str | None:
+        """Publish the final model to the Hugging Face Hub if requested.
+
+        Runs only on DDP rank 0. Computes held-out test metrics from
+        ``self.predictions`` (when available) to embed in the model card.
+        Returns the repo URL, or None if not pushed.
+        """
+        if not push:
+            return None
+        rank, _ = _distributed_state()
+        if rank != 0:
+            return None
+        if not hub_repo_id:
+            raise ValueError(
+                "push_to_hub=True requires hub_repo_id (e.g. 'your-org/va-bert')."
+            )
+
+        from multimodalva.utils.hub import push_to_hub as _push  # noqa: PLC0415
+
+        metrics = None
+        if self.predictions is not None:
+            from multimodalva.utils.metrics import score_predictions  # noqa: PLC0415
+
+            top1 = self.predictions.top1
+            metrics = {
+                m: float(score_predictions(top1, m))
+                for m in ("accuracy", "balanced_accuracy", "f1_macro",
+                          "f1_weighted", "csmf_accuracy")
+            }
+        return _push(
+            self.output_dir / "final",
+            hub_repo_id,
+            private=hub_private,
+            token=hub_token,
+            model_kind=model_kind,
+            base_model=self.model_name,
+            metrics=metrics,
+            max_length=max_length,
+        )
 
     def _run_from_datasets(
         self,

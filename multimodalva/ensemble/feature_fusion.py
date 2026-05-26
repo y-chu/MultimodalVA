@@ -220,11 +220,18 @@ def _build_automm_hyperparameters(
     Sets ``model.hf_text.checkpoint_name`` and overrides ``model.names`` when
     ``fusion_strategy`` is not ``"default"``.  ``extra`` is merged last and
     takes precedence over all resolved values.
+
+    When ``fusion_strategy`` excludes the text branch (``"tabular_only"``),
+    the ``model.hf_text.*`` override is skipped: AutoGluon strips the
+    ``hf_text`` block from the active config in that case, and overriding a
+    missing block raises a config-merge KeyError.
     """
-    hp: dict = {
-        "model.hf_text.checkpoint_name": checkpoint_name,
-    }
     model_names = FUSION_STRATEGIES[fusion_strategy]
+    text_in_use = model_names is None or "hf_text" in model_names
+
+    hp: dict = {}
+    if text_in_use:
+        hp["model.hf_text.checkpoint_name"] = checkpoint_name
     if model_names is not None:
         hp["model.names"] = model_names
     if extra:
@@ -394,6 +401,22 @@ def _ensure_nltk_deps() -> None:
             nltk.download(name, quiet=True)
 
 
+def _load_saved_prediction_result(output_dir: Path) -> PredictionResult:
+    """Load saved prediction artifacts from ``output_dir``.
+
+    Expects the standard files written by :meth:`FeatureFusionClassifier.run`:
+    ``predictions_top1.csv``, ``predictions_full.csv``, ``predictions_topk.csv``,
+    and ``id2label.json``.
+    """
+    top1 = pd.read_csv(output_dir / "predictions_top1.csv")
+    full = pd.read_csv(output_dir / "predictions_full.csv")
+    topk = pd.read_csv(output_dir / "predictions_topk.csv")
+    with open(output_dir / "id2label.json") as fh:
+        raw_id2label = json.load(fh)
+    id2label = {int(k): v for k, v in raw_id2label.items()}
+    return PredictionResult(top1=top1, full=full, topk=topk, id2label=id2label)
+
+
 # ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
@@ -547,6 +570,7 @@ class FeatureFusionClassifier:
         hpo_search_space: dict | None = None,
         hpo_scheduler: str = "local",
         hpo_searcher: str = "bayes",
+        resume: bool = True,
         # --- inference ---
         top_k: int = 3,
     ) -> dict:
@@ -610,6 +634,12 @@ class FeatureFusionClassifier:
             hpo_searcher:    Search algorithm.  ``"bayes"`` (default, Bayesian
                              optimisation), ``"random"``, or ``"grid"``.
                              Only used when ``use_hpo=True``.
+            resume:          If ``True`` (default), reuse an existing completed
+                             AutoMM run in ``output_dir`` when the saved
+                             predictions match the current deterministic split.
+                             If a checkpoint exists but prediction CSVs are
+                             missing, load the checkpoint and regenerate the
+                             downstream outputs instead of calling ``fit()``.
             top_k:           Number of top classes in topk output.  Default 3.
 
         Returns:
@@ -631,19 +661,6 @@ class FeatureFusionClassifier:
         Raises:
             ImportError: If ``autogluon.multimodal`` is not installed.
         """
-        try:
-            from autogluon.multimodal import MultiModalPredictor
-        except ImportError as exc:
-            raise ImportError(
-                "autogluon.multimodal is required for FeatureFusionClassifier. "
-                "Install with:  pip install autogluon.multimodal"
-            ) from exc
-
-        _patch_automm_gpu_logging()
-
-        # Fix macOS SSL cert errors and ensure NLTK corpora required by AutoMM.
-        _ensure_nltk_deps()
-
         self.output_dir.mkdir(parents=True, exist_ok=True)
         model_dir = self.output_dir / "automm_model"
 
@@ -698,66 +715,156 @@ class FeatureFusionClassifier:
         )
         logger.debug("AutoMM hyperparameters: %s", automm_hp)
 
+        saved_top1_path = self.output_dir / "predictions_top1.csv"
+        saved_full_path = self.output_dir / "predictions_full.csv"
+        saved_topk_path = self.output_dir / "predictions_topk.csv"
+        saved_id2label_path = self.output_dir / "id2label.json"
+        metadata_path = self.output_dir / "training_metadata.json"
+        has_saved_predictions = all(
+            p.exists()
+            for p in [saved_top1_path, saved_full_path, saved_topk_path, saved_id2label_path]
+        )
+        expected_true_labels = input_test[label_col].tolist()
+
+        if resume and has_saved_predictions:
+            try:
+                saved_predictions = _load_saved_prediction_result(self.output_dir)
+                saved_true_labels = saved_predictions.top1["true_label"].tolist()
+                if saved_true_labels == expected_true_labels:
+                    self.predictions = saved_predictions
+                    self.id2label = saved_predictions.id2label
+                    self.label2id = {lbl: idx for idx, lbl in saved_predictions.id2label.items()}
+                    if metadata_path.exists():
+                        with open(metadata_path) as fh:
+                            saved_meta = json.load(fh)
+                        self.best_hpo_config = saved_meta.get("best_hpo_config")
+                    logger.info(
+                        "Existing completed AutoMM run detected at %s — "
+                        "reusing saved predictions and skipping fit().",
+                        self.output_dir,
+                    )
+                    return {
+                        "predictions": self.predictions,
+                        "label2id": self.label2id,
+                        "id2label": self.id2label,
+                        "output_dir": self.output_dir,
+                        "best_hpo_config": self.best_hpo_config,
+                    }
+                logger.warning(
+                    "Existing predictions found at %s, but their true-label order "
+                    "does not match the current split. They will not be reused.",
+                    self.output_dir,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to load saved predictions from %s; falling back to checkpoint "
+                    "or fresh fit. Error: %s",
+                    self.output_dir, exc,
+                )
+
+        try:
+            from autogluon.multimodal import MultiModalPredictor
+        except ImportError as exc:
+            raise ImportError(
+                "autogluon.multimodal is required for FeatureFusionClassifier. "
+                "Install with:  pip install autogluon.multimodal"
+            ) from exc
+
+        _patch_automm_gpu_logging()
+
+        # Fix macOS SSL cert errors and ensure NLTK corpora required by AutoMM.
+        _ensure_nltk_deps()
+
+        reuse_loaded_predictor = False
+        if resume and model_dir.exists():
+            try:
+                predictor = MultiModalPredictor.load(str(model_dir))
+                reuse_loaded_predictor = True
+                logger.info(
+                    "Existing AutoMM checkpoint detected at %s — loading it and "
+                    "regenerating downstream outputs without fit().",
+                    model_dir,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Existing AutoMM checkpoint at %s could not be loaded; "
+                    "a fresh fit will be attempted. Error: %s",
+                    model_dir, exc,
+                )
+
         # --- Step 5: train -----------------------------------------------
         # path= directs AutoMM to write all checkpoints to model_dir.
-        predictor = MultiModalPredictor(
-            label=label_col,
-            problem_type="multiclass",
-            eval_metric=self.eval_metric,
-            path=str(model_dir),
-        )
-
-        if use_hpo:
-            # Build search space: DEFAULT_HPO_SPACE merged with caller overrides.
-            space: dict = {**DEFAULT_HPO_SPACE}
-            if hpo_search_space:
-                space.update(hpo_search_space)
-            ag_space = _to_ag_space(space)
-            # Merge ag.space objects into the fixed hyperparameters dict;
-            # search distributions take precedence over fixed scalars for the
-            # same key.
-            automm_hp.update(ag_space)
-            logger.info(
-                "HPO enabled — %d trials, scheduler=%s, searcher=%s, "
-                "search keys: %s",
-                n_hpo_trials, hpo_scheduler, hpo_searcher,
-                list(ag_space),
-            )
-            predictor.fit(
-                train_data=input_train,
-                hyperparameters=automm_hp,
-                presets=self.preset,
-                time_limit=time_limit,
-                hyperparameter_tune_kwargs={
-                    "num_trials": n_hpo_trials,
-                    "scheduler":  hpo_scheduler,
-                    "searcher":   hpo_searcher,
-                },
-            )
-            # Retrieve best config from fit summary; not all AutoMM versions
-            # expose this, so we fall back gracefully.
-            try:
-                summary = predictor.fit_summary()
-                self.best_hpo_config = summary.get("best_config")
-            except Exception:  # noqa: BLE001
-                self.best_hpo_config = None
-            if self.best_hpo_config:
-                _hpo_cfg_path = self.output_dir / "best_hpo_config.json"
-                with open(_hpo_cfg_path, "w") as fh:
-                    json.dump(self.best_hpo_config, fh, indent=2, default=str)
-                logger.info("Best HPO config saved to %s", _hpo_cfg_path)
-            else:
-                logger.info(
-                    "Best HPO config not available via fit_summary(); "
-                    "inspect the AutoMM model directory for trial results."
+        if not reuse_loaded_predictor:
+            if model_dir.exists():
+                raise RuntimeError(
+                    "Existing AutoMM model directory could not be safely reused: "
+                    f"{model_dir}. If you want a fresh fit, use a different output "
+                    "directory/run suffix or remove the stale AutoMM directory first."
                 )
-        else:
-            predictor.fit(
-                train_data=input_train,
-                hyperparameters=automm_hp,
-                presets=self.preset,
-                time_limit=time_limit,
+            predictor = MultiModalPredictor(
+                label=label_col,
+                problem_type="multiclass",
+                eval_metric=self.eval_metric,
+                path=str(model_dir),
             )
+
+            if use_hpo:
+                # Build search space: DEFAULT_HPO_SPACE merged with caller overrides.
+                space: dict = {**DEFAULT_HPO_SPACE}
+                if hpo_search_space:
+                    space.update(hpo_search_space)
+                ag_space = _to_ag_space(space)
+                # Merge ag.space objects into the fixed hyperparameters dict;
+                # search distributions take precedence over fixed scalars for the
+                # same key.
+                automm_hp.update(ag_space)
+                logger.info(
+                    "HPO enabled — %d trials, scheduler=%s, searcher=%s, "
+                    "search keys: %s",
+                    n_hpo_trials, hpo_scheduler, hpo_searcher,
+                    list(ag_space),
+                )
+                predictor.fit(
+                    train_data=input_train,
+                    hyperparameters=automm_hp,
+                    presets=self.preset,
+                    time_limit=time_limit,
+                    hyperparameter_tune_kwargs={
+                        "num_trials": n_hpo_trials,
+                        "scheduler":  hpo_scheduler,
+                        "searcher":   hpo_searcher,
+                    },
+                )
+                # Retrieve best config from fit summary; not all AutoMM versions
+                # expose this, so we fall back gracefully.
+                try:
+                    summary = predictor.fit_summary()
+                    self.best_hpo_config = summary.get("best_config")
+                except Exception:  # noqa: BLE001
+                    self.best_hpo_config = None
+                if self.best_hpo_config:
+                    _hpo_cfg_path = self.output_dir / "best_hpo_config.json"
+                    with open(_hpo_cfg_path, "w") as fh:
+                        json.dump(self.best_hpo_config, fh, indent=2, default=str)
+                    logger.info("Best HPO config saved to %s", _hpo_cfg_path)
+                else:
+                    logger.info(
+                        "Best HPO config not available via fit_summary(); "
+                        "inspect the AutoMM model directory for trial results."
+                    )
+            else:
+                predictor.fit(
+                    train_data=input_train,
+                    hyperparameters=automm_hp,
+                    presets=self.preset,
+                    time_limit=time_limit,
+                )
+                self.best_hpo_config = None
+        elif metadata_path.exists():
+            with open(metadata_path) as fh:
+                saved_meta = json.load(fh)
+            self.best_hpo_config = saved_meta.get("best_hpo_config")
+        else:
             self.best_hpo_config = None
 
         self.predictor = predictor
