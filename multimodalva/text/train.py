@@ -340,6 +340,32 @@ def _find_latest_checkpoint(output_dir: Path) -> Path | None:
     return max(checkpoints, key=lambda p: int(p.name.split("-")[-1]))
 
 
+def _remove_checkpoint_dirs(output_dir: Path) -> int:
+    """Delete all ``checkpoint-{step}/`` subdirectories under output_dir.
+
+    Used after a training run completes successfully to reclaim disk: the final
+    model (``model.safetensors`` + config + tokenizer + label maps) lives at the
+    output_dir root and is untouched — only the intermediate Trainer checkpoints
+    (each a full model + optimizer state) are removed.  Returns the count removed.
+
+    Safe to call mid-pipeline only after ``trainer.save_model(output_dir)``; never
+    call before a run completes (the latest checkpoint is needed to resume).
+    """
+    removed = 0
+    if not output_dir.exists():
+        return 0
+    for ckpt in output_dir.iterdir():
+        if (
+            ckpt.is_dir()
+            and ckpt.name.startswith("checkpoint-")
+            and ckpt.name.split("-")[-1].isdigit()
+        ):
+            shutil.rmtree(ckpt)
+            logger.info("Removed checkpoint: %s", ckpt)
+            removed += 1
+    return removed
+
+
 def get_device() -> torch.device:
     """Return the best available device: CUDA, MPS, CPU."""
     if torch.cuda.is_available():
@@ -553,7 +579,9 @@ def train(
     gradient_checkpointing: bool = False,
     early_stopping_patience: int | None = None,
     resume: bool = True,
-    cleanup_checkpoints: bool = False,
+    cleanup_checkpoints: bool = True,
+    save_total_limit: int = 2,
+    report_to: str | list[str] = "none",
     use_fast: bool = True,
     eval_batch_size: int = 32,
     random_state: int = 42,
@@ -603,9 +631,30 @@ def train(
                              from output_dir after training completes successfully.
                              These checkpoints are only needed to resume an interrupted
                              run; once training is done they consume significant disk
-                             space (equal to the full model size per checkpoint, up to
-                             ``save_total_limit=2``).  The final model weights saved
-                             directly in output_dir are unaffected.  Default False.
+                             space (see ``save_total_limit`` for rough per-checkpoint
+                             sizes; up to ``save_total_limit`` are kept during a run).
+                             The final model weights saved directly in output_dir
+                             (``model.safetensors`` + config + tokenizer + label maps)
+                             are unaffected and reload cleanly via ``predict()``.
+                             Cleanup happens only AFTER a successful run, so the latest
+                             checkpoint is always available to resume from mid-run.
+                             Default True; set False to retain checkpoints for inspection.
+        save_total_limit: Max number of ``checkpoint-*/`` dirs Trainer keeps during a
+                          run (HF always also protects the best checkpoint when
+                          ``load_best_model_at_end=True``, so up to 2 may exist
+                          transiently at limit 1).  Default 2 for final training; HPO
+                          trial training passes 1 (trials only need a score).  Do not
+                          reduce below what ``load_best_model_at_end`` needs in a real run.
+                          Size guide: each checkpoint holds the model weights plus the
+                          AdamW optimizer state (~2x the trainable-param size), so a full
+                          fine-tune checkpoint is roughly ~0.5-1.3 GB for a BERT-base-class
+                          model (~110M params) and ~0.7-1.8 GB for Longformer/BigBird-base
+                          (~150M), depending on saved precision.  With LoRA the optimizer
+                          state is negligible (only adapters are trainable), so a checkpoint
+                          is roughly just the base-model weight size.
+        report_to: Trainer logging integrations (``"none"`` disables
+                   ``events.out.tfevents.*`` writes).  Default ``"none"``; pass
+                   e.g. ``"tensorboard"`` to re-enable.
         use_fast: Use the HuggingFace fast (Rust) tokenizer. Default True.
                   Set False for models that lack a fast tokenizer
                   (e.g. BlueBERT) to avoid a falling-back warning.
@@ -1013,12 +1062,12 @@ def train(
         max_grad_norm=hp["max_grad_norm"],
         eval_strategy="epoch" if has_eval else "no",
         save_strategy="epoch",
-        save_total_limit=2,
+        save_total_limit=save_total_limit,
         load_best_model_at_end=has_eval,
         metric_for_best_model=metric_for_best_model,
         greater_is_better=True if has_eval else None,
         logging_steps=50,
-        report_to="none",
+        report_to=report_to,
         # Mixed precision — bf16 preferred on Ampere+, fp16 fallback for Volta
         fp16=(_is_cuda and not _cuda_bf16),
         bf16=_cuda_bf16,
@@ -1166,15 +1215,9 @@ def train(
             # checkpoint-* dirs are only needed to resume an interrupted training run.
             # After successful completion the final weights are in output_dir; the
             # checkpoint copies are redundant and can be several hundred MB each.
+            # Runs only here (post trainer.save_model), so interrupted-run resume is safe.
             if cleanup_checkpoints:
-                for ckpt in output_dir.iterdir():
-                    if (
-                        ckpt.is_dir()
-                        and ckpt.name.startswith("checkpoint-")
-                        and ckpt.name.split("-")[-1].isdigit()
-                    ):
-                        shutil.rmtree(ckpt)
-                        logger.info("Removed checkpoint: %s", ckpt)
+                _remove_checkpoint_dirs(output_dir)
 
             # --- Save label maps and hyperparams ---
             with open(output_dir / "label2id.json", "w") as f:

@@ -14,6 +14,8 @@ Four self-contained modes:
 Usage:
     # 4. Make sample data (no model download, fully offline) — start here:
     python tests/demo_hub.py sample-data --output-dir tests/sample_data
+    #    WHO 2016 ODK schema (Id10xxx codes, broad cause grouping labels, instrument-modeled):
+    python tests/demo_hub.py sample-data --schema who2016 --output-dir tests/sample_data
 
     # 1. Train + push (needs `huggingface-cli login` or --hub-token):
     python tests/demo_hub.py push --repo-id your-org/va-bert-demo
@@ -42,35 +44,59 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from demo_utils import ensure_dir, load_data, make_sample_va_df
+from demo_utils import ensure_dir, load_data, make_sample_va_df, make_who2016_va_df
 
 
 # --- Mode 4: sample data --------------------------------------------------------
 def make_sample_data(args: argparse.Namespace) -> None:
-    """Write tiny synthetic CSVs showing the expected input schema."""
+    """Write synthetic CSVs showing the expected input schema."""
     out = ensure_dir(args.output_dir)
-    df = make_sample_va_df(n_per_class=args.n_per_class)
 
+    if args.schema == "who2016":
+        # Larger, instrument-modeled dataset using WHO 2016 ODK Id10xxx codes +
+        # broad cause grouping cause labels — pairs with utils/qdesc_who2016.csv.
+        df = make_who2016_va_df(n_samples=args.n_samples)
+        path = out / "va_who2016_sample.csv"
+        df.to_csv(path, index=False)
+        print(f"Wrote {len(df)} rows × {df.shape[1]} columns (WHO 2016 ODK schema).\n")
+        print("Schema (pairs with multimodalva/utils/qdesc_who2016.csv):")
+        print("  id             : fake record id")
+        print("  cause_of_death : label (broad cause grouping level)")
+        print("  narrative      : synthetic free-text VA narrative")
+        print("  sex, age_group : demographics (male/female; adult/child/neonate)")
+        print("  Id10xxx        : WHO 2016 ODK indicators, yes/no (tabular features)\n")
+        print(df["cause_of_death"].value_counts().to_string())
+        print(f"\nCSV: {path}")
+        print("\nSmoke-test it (pass the WHO2016 qdesc to data fusion):")
+        print(f"  python tests/demo_text_classification.py run --data {path} "
+              "--label cause_of_death --text-col narrative --exclude-cols id")
+        print(f"  python tests/demo_tabular_classification.py run --data {path} "
+              "--label cause_of_death --exclude-cols id,narrative")
+        return
+
+    # Class-balanced InterVA i-code-style sample using InterVA i-code variables —
+    # pairs with the default utils/qdesc.csv (auto-loaded by data fusion).
+    df = make_sample_va_df(n_per_class=args.n_per_class)
     multimodal_path = out / "va_sample.csv"
     text_only_path = out / "va_sample_text_only.csv"
     df.to_csv(multimodal_path, index=False)
-    df[["narrative", "cause"]].to_csv(text_only_path, index=False)
+    df[["id", "cause_of_death", "narrative"]].to_csv(text_only_path, index=False)
 
-    print(f"Wrote {len(df)} rows × {df.shape[1]} columns.\n")
-    print("Schema (what the package expects):")
-    print("  narrative     : free-text VA narrative   (text + data-fusion pipelines)")
-    print("  age, sex      : demographics")
-    print("  fever, cough, ...: binary 0/1 symptom indicators (tabular features)")
-    print("  symptom_days  : numeric feature")
-    print("  cause         : the label (cause of death)\n")
-    print(df.to_string(index=False))
+    print(f"Wrote {len(df)} rows × {df.shape[1]} columns (InterVA i-code i-code schema).\n")
+    print("Schema (pairs with the default multimodalva/utils/qdesc.csv):")
+    print("  id             : fake record id")
+    print("  cause_of_death : label (broad cause grouping level)")
+    print("  narrative      : synthetic free-text VA narrative")
+    print("  i019a/i019b    : sex; i022x : age band (binary demographics)")
+    print("  i147o, i153o...: InterVA indicators, y/n (tabular features)\n")
+    print(df["cause_of_death"].value_counts().to_string())
     print(f"\nMultimodal CSV : {multimodal_path}")
     print(f"Text-only CSV  : {text_only_path}")
     print("\nSmoke-test it:")
     print(f"  python tests/demo_text_classification.py run --data {multimodal_path} "
-          "--label cause --text-col narrative")
+          "--label cause_of_death --text-col narrative --exclude-cols id")
     print(f"  python tests/demo_tabular_classification.py run --data {multimodal_path} "
-          "--label cause")
+          "--label cause_of_death --exclude-cols id,narrative")
 
 
 # --- Mode 1: train + push -------------------------------------------------------
@@ -207,8 +233,15 @@ def main() -> None:
                         help="HF auth token (else uses cached `huggingface-cli login`).")
     parser.add_argument("--public", action="store_true",
                         help="(push) Make the repo public (default: private).")
-    parser.add_argument("--n-per-class", type=int, default=4, dest="n_per_class",
-                        help="(sample-data) Rows per cause (default: 4).")
+    parser.add_argument("--schema", default="simple", choices=["simple", "who2016"],
+                        help="(sample-data) 'simple' = tiny human-readable multimodal "
+                             "CSV; 'who2016' = instrument-modeled dataset with WHO 2016 ODK "
+                             "Id10xxx codes + broad cause grouping labels (default: simple).")
+    parser.add_argument("--n-per-class", type=int, default=6, dest="n_per_class",
+                        help="(sample-data, simple) Rows per cause (default: 6; with 11 "
+                             "causes this keeps a 0.2 test split stratifiable).")
+    parser.add_argument("--n-samples", type=int, default=400, dest="n_samples",
+                        help="(sample-data, who2016) Total rows (default: 400).")
     parser.add_argument("--max-length", type=int, default=128, dest="max_length",
                         help="Tokeniser max sequence length (default: 128).")
     parser.add_argument("--top-k", type=int, default=3, dest="top_k",

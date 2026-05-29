@@ -245,6 +245,34 @@ GPU monitor controls:
 - `MULTIMODALVA_ENABLE_GPU_MONITOR=0` to disable sampling
 - `MULTIMODALVA_GPU_MONITOR_INTERVAL_SEC=5` to sample every 5 seconds
 
+### Disk footprint (HPO + training)
+
+Text HPO and training are storage-efficient out of the box. The relevant defaults:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `train(cleanup_checkpoints=...)` | `True` | Delete `checkpoint-*/` after a run completes successfully |
+| `train(save_total_limit=...)` | `2` | Max `checkpoint-*/` kept *during* a run |
+| `train(report_to=...)` | `"none"` | No `events.out.tfevents.*` (TensorBoard) files |
+| `optimize(export_best_trial=...)` | `False` | HPO trials train in temp dirs; no per-trial weights kept |
+| `optimize(cleanup_trials=...)` | `True` | Remove any persisted `trial_*/` (only present if `export_best_trial=True`) |
+
+- **HPO trials persist no model weights.** Each Optuna trial/fold trains inside a temporary directory that is deleted as soon as its score is computed (crash-safe — nothing accumulates even if a sweep is interrupted). Only the scores survive, in the resumable JournalStorage `hpo_<model>.log` and `hpo_trials.csv`, plus `best_hyperparams.json`. Set `optimize(..., export_best_trial=True)` to also keep a reloadable copy of the best trial's model.
+- **Final training cleans intermediate checkpoints.** `train(..., cleanup_checkpoints=True)` (the default) removes `checkpoint-*/` after a run completes successfully; the final model (`model.safetensors` + config + tokenizer + label maps) remains and reloads via `predict()`. Interrupted-run resume is unaffected — cleanup runs only on completion, so the latest checkpoint is always available to resume from mid-run. Pass `cleanup_checkpoints=False` to keep checkpoints for inspection.
+- TensorBoard event files are off by default (`report_to="none"`; pass e.g. `"tensorboard"` to re-enable).
+
+**How big is a checkpoint?** Each `checkpoint-*/` stores the model weights **plus** the AdamW optimizer state (two moment tensors per trainable parameter, ≈ 2× the weight size). Exact size depends on the model, the precision the weights/optimizer are saved in, and whether the optimizer state is written, but as a rough guide:
+
+| Model (full fine-tune) | ~weights | ~per checkpoint (weights + optimizer) |
+|---|---|---|
+| BERT-base / BioClinicalBERT / RoBERTa-base (~110M) | ~0.4 GB | **~0.5–1.3 GB** |
+| Longformer-base / BigBird-base (~150M) | ~0.6 GB | **~0.7–1.8 GB** |
+| bert-tiny (~4M, demos/tests) | ~17 MB | ~30–50 MB |
+
+(The downstream sweep that motivated this saw ~0.5–0.6 GB per checkpoint for a BERT-base-class model.) With **LoRA** only the adapter params are trainable, so the optimizer state is negligible and a checkpoint is roughly just the base-model weight size (the LoRA path also merges adapters into the base model before the final save). At the default `save_total_limit=2`, a completed run holds up to 2 of these *until* `cleanup_checkpoints` removes them — so an uncleaned BERT-base run could leave ~1–2.5 GB behind, and a 20-trial HPO sweep without temp dirs could leave tens of GB.
+
+**Choosing `save_total_limit`:** `1` is the leanest (HuggingFace still protects the best checkpoint when `load_best_model_at_end=True`, so up to 2 exist transiently during a run); `2` (default) is a safe balance for resume + best-model selection; raise it only if you want to inspect several epochs' checkpoints. HPO trials internally use `save_total_limit=1` since they only need a score. These limits apply *during* a run — `cleanup_checkpoints=True` removes all of them afterward regardless.
+
 ## Publishing And Re-using Models (Hugging Face Hub)
 
 Trained `TextClassifier` and `DataFusionClassifier` models are saved in the standard Hugging Face format (cause labels in `config.json`, LoRA adapters merged into the base weights), so they can be published to the Hub and reloaded by anyone.
@@ -303,12 +331,46 @@ The model is an ordinary text classifier and accepts any string. Data-fusion mod
 
 ## Sample Data
 
-`tests/sample_data/` contains tiny, class-balanced **synthetic** CSVs showing the input schema the package expects:
+The quickest way to see the input the package expects is the built-in `data()` loader (R-style; synthetic, no real records):
 
-- `va_sample.csv` — narrative + tabular indicators + `cause` (works for text, tabular, and data-fusion demos)
-- `va_sample_text_only.csv` — narrative + `cause`
+```python
+from multimodalva import data, list_datasets
 
-Regenerate them with `python tests/demo_hub.py sample-data --output-dir tests/sample_data`.
+list_datasets()                 # {name: description}
+df = data("va_sample")          # InterVA i-code-style, InterVA i-codes  -> pairs with utils/qdesc.csv
+df = data("va_who2016")         # WHO 2016 ODK Id10xxx               -> pairs with utils/qdesc_who2016.csv
+df = data("va_sample", n_per_class=10, seed=0)   # kwargs forwarded to the generator
+```
+
+`import multimodalva` for `data()` is lightweight — it does not import torch/transformers.
+
+The same datasets are also committed as CSVs under `tests/sample_data/` (no real records):
+
+- `va_sample.csv` — class-balanced InterVA i-code style; `id`, `cause_of_death` (broad cause grouping labels), `narrative`, and **InterVA `i`-code indicator columns** (`i019a`/`i019b` sex, `i022x` age band, `i147o`/`i153o`… symptoms, `y`/`n`). Pairs with the **default** `multimodalva/utils/qdesc.csv` (auto-loaded by data fusion).
+- `va_sample_text_only.csv` — `id`, `cause_of_death`, `narrative`
+- `va_who2016_sample.csv` — larger, instrument-modeled; `id`, `cause_of_death` (broad cause grouping labels), `narrative`, `sex`, `age_group`, and **WHO 2016 ODK indicator columns (`Id10xxx`, yes/no)**. Pairs with `multimodalva/utils/qdesc_who2016.csv` for data fusion.
+
+Regenerate:
+
+```bash
+python tests/demo_hub.py sample-data --output-dir tests/sample_data                 # simple
+python tests/demo_hub.py sample-data --schema who2016 --output-dir tests/sample_data # WHO 2016 ODK
+```
+
+### Question-description tables (`qdesc`) for data fusion
+
+Data fusion converts tabular indicators to sentences using a `qdesc` table keyed by indicator code:
+
+- `multimodalva/utils/qdesc.csv` — InterVA **`i`-codes** (`i019a`, `i077o`...). Auto-loaded default.
+- `multimodalva/utils/qdesc_who2016.csv` — WHO 2016 ODK **`Id10xxx`** codes. Pass explicitly:
+
+```python
+from multimodalva.ensemble.data_fusion import load_qdesc
+qdesc = load_qdesc("multimodalva/utils/qdesc_who2016.csv")
+# DataFusionClassifier.run(..., qdesc=qdesc)
+```
+
+Both `qdesc` files are curated, pre-defined data tables shipped with the package — edit the CSV directly to add or adjust indicators (columns: `indic, qdesc, sdesc, type, yes, no, desc`; a blank `yes`/`no` falls back to per-type default verbs).
 
 ## Demo Scripts
 
@@ -332,3 +394,7 @@ The demos in `tests/` are intentionally small, synthetic where possible, and foc
 ## License
 
 MIT
+
+## Use of Generative AI Tools
+
+Claude Code (Opus) and Codex (GPT-5.5) were used as software development assistants for code optimization, package engineering, debugging, generating documentation, synthesizing demo datasets, and preparing testing scripts. The tools did not determine the scientific content of the work. All research questions, methodological choices, analytical strategies, model development, parameter optimization, result validation, interpretation, and scientific conclusions were conceived, evaluated, and approved by the author. All AI-generated outputs were reviewed, tested, and verified by the author prior to use.

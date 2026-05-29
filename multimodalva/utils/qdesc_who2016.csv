@@ -1,0 +1,174 @@
+indic,qdesc,sdesc,type,yes,no,desc
+Id10123,Did (s)he die suddenly?,sudden death,symptom,,,sudden death
+Id10077,Did (s)he suffer from any injury or accident that led to her/his death?,injury led to death,injury,,,injured in an accident that led to death
+Id10125,Was there any diagnosis by a health professional of tuberculosis?,dx TB,diagnosis,,,diagnosis of tuberculosis
+Id10126,Was an HIV test ever positive?,HIV+ test,diagnosis,,,positive HIV test
+Id10127,Was there any diagnosis by a health professional of AIDS?,dx AIDS,diagnosis,,,diagnosis of AIDS
+Id10128,Did (s)he have a recent positive test by a health professional for malaria?,malaria+ test,diagnosis,,,recent positive malaria test
+Id10129,Did (s)he have a recent negative test by a health professional for malaria?,malaria- test,diagnosis,,,recent negative malaria test
+Id10130,Was there any diagnosis by a health professional of dengue fever?,dx dengue,diagnosis,,,diagnosis of dengue fever
+Id10131,Was there any diagnosis by a health professional of measles?,dx measles,diagnosis,,,diagnosis of measles
+Id10132,Was there any diagnosis by a health professional of high blood pressure?,dx high BP,diagnosis,,,diagnosis of high blood pressure
+Id10133,Was there any diagnosis by a health professional of heart disease?,dx heart disease,diagnosis,,,diagnosis of heart disease
+Id10134,Was there any diagnosis by a health professional of diabetes?,dx diabetes,diagnosis,,,diagnosis of diabetes
+Id10135,Was there any diagnosis by a health professional of asthma?,dx asthma,diagnosis,,,diagnosis of asthma
+Id10136,Was there any diagnosis by a health professional of epilepsy?,dx epilepsy,diagnosis,,,diagnosis of epilepsy
+Id10137,Was there any diagnosis by a health professional of cancer?,dx cancer,diagnosis,,,diagnosis of cancer
+Id10138,Was there any diagnosis by a health professional of Chronic Obstructive Pulmonary Disease (COPD)?,dx COPD,diagnosis,,,diagnosis of chronic obstructive pulmonary disease
+Id10139,Was there any diagnosis by a health professional of dementia?,dx dementia,diagnosis,,,diagnosis of dementia
+Id10140,Was there any diagnosis by a health professional of depression?,dx depression,diagnosis,,,diagnosis of depression
+Id10141,Was there any diagnosis by a health professional of stroke?,dx stroke,diagnosis,,,diagnosis of stroke
+Id10142,Was there any diagnosis by a health professional of sickle cell disease?,dx sickle cell,diagnosis,,,diagnosis of sickle cell disease
+Id10143,Was there any diagnosis by a health professional of kidney disease?,dx kidney disease,diagnosis,,,diagnosis of kidney disease
+Id10144,Was there any diagnosis by a health professional of liver disease?,dx liver disease,diagnosis,,,diagnosis of liver disease
+Id10147,Did (s)he have a fever?,fever,symptom,,,fever
+Id10149,Did the fever continue until death?,fever until death,symptom,,,fever that continued until death
+Id10152,Did (s)he have night sweats?,night sweats,symptom,,,night sweats
+Id10153,Did (s)he have a cough?,cough,symptom,,,cough
+Id10155,Was the cough productive with sputum?,productive cough,symptom,,,productive cough with sputum
+Id10156,Was the cough very severe?,severe cough,symptom,,,very severe cough
+Id10157,Did (s)he cough up blood?,cough up blood,symptom,,,coughing up of blood
+Id10158,Did (s)he make a whooping sound when coughing?,whooping cough,symptom,,,whooping sound when coughing
+Id10159,Did (s)he have any difficulty breathing?,difficulty breathing,symptom,,,difficulty breathing
+Id10166,During the illness that led to death did (s)he have fast breathing?,fast breathing,symptom,,,fast breathing
+Id10168,Did (s)he have breathlessness?,breathlessness,symptom,,,breathlessness
+Id10170,Was (s)he unable to carry out daily routines due to breathlessness?,breathless on exertion,symptom,,,breathlessness limiting daily activities
+Id10171,Was (s)he breathless while lying flat?,breathless lying flat,symptom,,,breathlessness while lying flat
+Id10172,Did you see the lower chest wall/ribs being pulled in as the child breathed in?,chest indrawing,symptom,,,chest indrawing
+Id10174,Did (s)he have chest pain?,chest pain,symptom,,,chest pain
+Id10175,Was the chest pain severe?,severe chest pain,symptom,,,severe chest pain
+Id10181,Did (s)he have more frequent loose or liquid stools than usual?,loose stools,symptom,,,frequent loose or liquid stools
+Id10185,Did the frequent loose or liquid stools continue until death?,diarrhea until death,symptom,,,diarrhea that continued until death
+Id10186,At any time during the final illness was there blood in the stools?,blood in stool,symptom,,,blood in the stools
+Id10188,Did (s)he vomit?,vomiting,symptom,,,vomiting
+Id10191,Was there blood in the vomit?,blood in vomit,symptom,,,blood in the vomit
+Id10192,Was the vomit black?,black vomit,symptom,,,black vomit
+Id10193,Did (s)he have any belly (abdominal) problem?,abdominal problem,symptom,,,abdominal problem
+Id10194,Did (s)he have belly (abdominal) pain?,abdominal pain,symptom,,,abdominal pain
+Id10195,Was the belly (abdominal) pain severe?,severe abdominal pain,symptom,,,severe abdominal pain
+Id10200,Did (s)he have a more than usually protruding belly (abdomen)?,protruding belly,symptom,,,more than usually protruding abdomen
+Id10204,Did (s)he have any mass in the belly (abdomen)?,abdominal mass,symptom,,,mass in the abdomen
+Id10207,Did (s)he have a severe headache?,severe headache,symptom,,,severe headache
+Id10208,Did (s)he have a stiff neck during illness that led to death?,stiff neck,symptom,,,stiff neck
+Id10210,Did (s)he have a painful neck during the illness that led to death?,painful neck,symptom,,,painful neck
+Id10212,Did (s)he have mental confusion?,mental confusion,symptom,,,mental confusion
+Id10214,Was (s)he unconscious during the illness that lead to death?,unconsciousness,symptom,,,loss of consciousness
+Id10215,Was (s)he unconscious for more than 24 hours before death?,unconscious >24h,symptom,,,unconsciousness lasting more than 24 hours
+Id10217,Did the unconsciousness start suddenly quickly (at least within a single day)?,sudden unconsciousness,symptom,,,sudden onset of unconsciousness
+Id10218,Did the unconsciousness continue until death?,unconscious until death,symptom,,,unconsciousness that continued until death
+Id10219,Did (s)he have convulsions?,convulsions,symptom,,,convulsions
+Id10220,Did (s)he experience any generalized convulsions or fits during the illness that led to death?,generalized convulsions,symptom,,,generalized convulsions
+Id10222,Did (s)he become unconscious immediately after the convulsions?,unconscious after fits,symptom,,,unconsciousness immediately after convulsions
+Id10223,Did (s)he have any urine problems?,urine problems,symptom,,,urinary problems
+Id10224,Did (s)he stop urinating?,stopped urinating,symptom,,,stopped passing urine
+Id10225,Did (s)he go to urinate more often than usual?,frequent urination,symptom,,,more frequent urination than usual
+Id10226,During the final illness did (s)he ever pass blood in the urine?,blood in urine,symptom,,,blood in the urine
+Id10227,Did (s)he have sores or ulcers anywhere on the body?,sores/ulcers,symptom,,,sores or ulcers on the body
+Id10228,Did (s)he have sores?,sores,symptom,,,skin sores
+Id10230,Did (s)he have an ulcer (pit) on the foot?,foot ulcer,symptom,,,ulcer on the foot
+Id10233,During the illness that led to death did (s)he have any skin rash?,skin rash,symptom,,,skin rash
+Id10236,Did (s)he have measles rash (use local term)?,measles rash,symptom,,,measles rash
+Id10237,Did (s)he ever have shingles or herpes zoster?,shingles,symptom,,,shingles or herpes zoster
+Id10238,During the illness that led to death did her/his skin flake off in patches?,skin flaking,symptom,,,skin flaking off in patches
+Id10239,During the illness that led to death did he/she have areas of the skin that turned black?,skin blackening,symptom,,,areas of skin that turned black
+Id10240,During the illness that led to death did he/she have areas of the skin with redness and swelling?,skin redness/swelling,symptom,,,areas of skin with redness and swelling
+Id10245,During the illness that led to death did s/he have a whitish rash inside the mouth or on the tongue?,oral thrush,symptom,,,whitish rash in the mouth or on the tongue
+Id10241,During the illness that led to death did (s)he bleed from anywhere?,bleeding,symptom,,,bleeding from somewhere on the body
+Id10242,Did (s)he bleed from the nose mouth or anus?,bleed orifice,symptom,,,"bleeding from the nose, mouth, or anus"
+Id10243,Did (s)he have noticeable weight loss?,weight loss,symptom,,,noticeable weight loss
+Id10244,Was (s)he severely thin or wasted?,wasting,symptom,,,severe thinness or wasting
+Id10246,Did (s)he have stiffness of the whole body or was unable to open the mouth?,lockjaw/stiffness,symptom,,,whole-body stiffness or inability to open the mouth
+Id10247,Did (s)he have puffiness of the face?,facial puffiness,symptom,,,puffiness of the face
+Id10249,During the illness that led to death did (s)he have swollen legs or feet?,swollen legs/feet,symptom,,,swollen legs or feet
+Id10251,Did (s)he have both feet swollen?,both feet swollen,symptom,,,swelling of both feet
+Id10252,Did (s)he have general puffiness all over his/her body?,generalized puffiness,symptom,,,generalized body puffiness
+Id10253,Did (s)he have any lumps?,lumps,symptom,,,lumps
+Id10254,Did (s)he have any lumps or lesions in the mouth?,mouth lumps,symptom,,,lumps or lesions in the mouth
+Id10255,Did (s)he have any lumps on the neck?,neck lumps,symptom,,,lumps on the neck
+Id10256,Did (s)he have any lumps on the armpit?,armpit lumps,symptom,,,lumps in the armpit
+Id10257,Did (s)he have any lumps on the groin?,groin lumps,symptom,,,lumps in the groin
+Id10258,Was (s)he in any way paralyzed?,paralysis,symptom,,,paralysis
+Id10259,Did s(he) have paralysis of only one side of the body?,one-sided paralysis,symptom,,,paralysis of one side of the body
+Id10261,Did (s)he have difficulty swallowing?,difficulty swallowing,symptom,,,difficulty swallowing
+Id10264,Did (s)he have pain upon swallowing?,painful swallowing,symptom,,,pain on swallowing
+Id10265,Did (s)he have yellow discoloration of the eyes?,yellow eyes,symptom,,,yellow discoloration of the eyes
+Id10267,Did her/his hair change in color to a reddish or yellowish color?,hair color change,symptom,,,change in hair color
+Id10268,Did (s)he look pale (thinning/lack of blood) or have pale palms eyes or nail beds?,pallor,symptom,,,"pallor of the palms, eyes, or nail beds"
+Id10269,Did (s)he have sunken eyes?,sunken eyes,symptom,,,sunken eyes
+Id10270,Did (s)he drink a lot more water than usual?,excessive thirst,symptom,,,excessive thirst
+Id10107,Did the baby stop being able to cry?,stopped crying,symptom,,,stopped being able to cry
+Id10112,Did the baby have a breathing problem?,baby breathing problem,symptom,,,breathing problem at birth
+Id10113,Was the baby given assistance to breathe at birth?,needed breathing help,symptom,,,needed assistance to breathe at birth
+Id10115,Were there any bruises or signs of injury on baby's body after the birth?,birth injury signs,symptom,,,bruises or signs of injury at birth
+Id10273,Did the baby stop suckling?,stopped suckling,symptom,,,stopped suckling
+Id10275,Did the baby have convulsions starting within the first 24 hours of life?,early neonatal fits,symptom,,,convulsions within 24 hours of birth
+Id10277,Did the baby's body become stiff with the back arched backwards?,arched back stiffness,symptom,,,body stiffening with the back arched
+Id10278,During the illness that led to death did the baby have a bulging or raised fontanelle? (ask only up to 18 months),bulging fontanelle,symptom,,,bulging fontanelle
+Id10279,During the illness that led to death did the baby have a sunken fontanelle? (ask only up to 18 months),sunken fontanelle,symptom,,,sunken fontanelle
+Id10281,During the illness that led to death did the baby become unresponsive or unconscious?,baby unresponsive,symptom,,,became unresponsive or unconscious
+Id10284,During the illness that led to death did the baby become cold to touch?,cold to touch,symptom,,,became cold to the touch
+Id10286,During the illness that led to death did the baby become lethargic after a period of normal activity?,lethargy,symptom,,,became lethargic after normal activity
+Id10287,Did the baby have redness or pus drainage from the umbilical cord stump?,umbilical infection,symptom,,,redness or pus at the umbilical stump
+Id10289,During the illness that led to death did the baby have yellow skin palms (hand) or soles (foot)?,neonatal jaundice,symptom,,,"yellow skin, palms, or soles"
+Id10290,Did the baby or infant appear to be healthy and then just die suddenly?,sudden infant death,symptom,,,appeared healthy and then died suddenly
+Id10347,Was the baby born more than one month early?,preterm birth,symptom,,,"preterm birth, more than a month early"
+Id10363,At birth was the baby smaller than usual (weighing under 2.5 kg)?,low birth weight,symptom,,,"low birth weight, under 2.5 kg"
+Id10364,At birth was the baby very much smaller than usual (weighing under 1 kg)?,very low birth weight,symptom,,,"very low birth weight, under 1 kg"
+Id10365,At birth was the baby larger than usual (weighing over 4.5 kg)?,high birth weight,symptom,,,"high birth weight, over 4.5 kg"
+Id10370,Was any part of the baby physically abnormal at time of delivery? (for example: body part too large or too small additional growth on body)?,physical abnormality,symptom,,,physical abnormality at birth
+Id10371,Did the baby/ child have a swelling or defect on the back at time of birth?,spinal defect,symptom,,,swelling or defect on the back at birth
+Id10372,Did the baby/ child have a very large head at time of birth?,large head,symptom,,,very large head at birth
+Id10373,Did the baby/ child have a very small head at time of birth?,small head,symptom,,,very small head at birth
+Id10404,Was the umbilical cord wrapped more than once around the neck of the child at birth?,cord around neck,symptom,,,the umbilical cord wrapped around the neck
+Id10406,Was the baby blue in color at birth?,blue at birth,symptom,,,blue color at birth
+Id10294,Did she have any swelling or lump in the breast?,breast lump,symptom,,,swelling or lump in the breast
+Id10295,Did she have any ulcers (pits) in the breast?,breast ulcers,symptom,,,ulcers in the breast
+Id10297,Did she have vaginal bleeding in between menstrual periods?,intermenstrual bleeding,symptom,,,vaginal bleeding between periods
+Id10300,Did she have vaginal bleeding after cessation of menstruation?,postmenopausal bleeding,symptom,,,vaginal bleeding after menopause
+Id10301,Was there excessive vaginal bleeding in the week prior to death?,excessive bleeding pre-death,symptom,,,excessive vaginal bleeding in the week before death
+Id10304,Did she have a sharp pain in her belly (abdomen) shortly before death?,acute abdominal pain,symptom,,,sharp abdominal pain shortly before death
+Id10305,Was she pregnant at the time of death?,pregnant at death,symptom,was,was not,pregnant at the time of death
+Id10306,Did she die within 6 weeks of delivery abortion or miscarriage?,death near delivery,symptom,died,did not die,"within six weeks of delivery, abortion, or miscarriage"
+Id10312,Did she die during labor or delivery?,died in labor,symptom,died,did not die,during labor or delivery
+Id10313,Did she die after delivering a baby?,died after delivery,symptom,died,did not die,after delivering a baby
+Id10318,Was she breastfeeding the child in the days before death?,breastfeeding,symptom,was,was not,breastfeeding in the days before death
+Id10320,Had she had any previous Caesarean section?,prior C-section,symptom,,,previous Caesarean section
+Id10321,During pregnancy did she suffer from high blood pressure?,gestational hypertension,symptom,,,high blood pressure during pregnancy
+Id10322,Did she have foul smelling vaginal discharge during pregnancy or after delivery?,foul discharge,symptom,,,foul-smelling vaginal discharge during or after pregnancy
+Id10323,During the last 3 months of pregnancy did she suffer from convulsions?,late-pregnancy fits,symptom,,,convulsions in the last 3 months of pregnancy
+Id10324,During the last 3 months of pregnancy did she suffer from blurred vision?,late-pregnancy blurred vision,symptom,,,blurred vision in the last 3 months of pregnancy
+Id10328,Did she have excessive bleeding during labor or delivery?,bleeding in labor,symptom,,,excessive bleeding during labor or delivery
+Id10329,Did she have excessive bleeding after delivery or abortion?,postpartum bleeding,symptom,,,excessive bleeding after delivery or abortion
+Id10334,Did she recently have a pregnancy that ended in an abortion (spontaneous or induced)?,recent abortion,symptom,,,recent pregnancy that ended in abortion or miscarriage
+Id10411,Did (s)he drink alcohol?,alcohol use,behavior,,,history of drinking alcohol
+Id10412,Did (s)he use tobacco?,tobacco use,behavior,,,history of using tobacco
+Id10413,Did (s)he smoke tobacco (cigarette cigar pipe etc.)?,smoking,behavior,,,history of smoking tobacco
+Id10079,Was it a road traffic accident?,road traffic accident,injury,,,injured in a road traffic accident
+Id10082,Was (s)he injured in a non-road traffic accident?,non-road transport accident,injury,,,injured in a non-road transport accident
+Id10083,Was (s)he injured in a fall?,fall,injury,,,injured in a fall
+Id10084,Was there any poisoning?,poisoning,injury,,,poisoned
+Id10085,Did (s)he die of drowning?,drowning,injury,,,drowned
+Id10086,Was (s)he injured by a bite or sting by venomous animal?,venomous bite,injury,,,injured by a bite or sting from a venomous animal
+Id10087,Was (s)he injured by an animal or insect (non-venomous)?,animal injury,injury,,,injured by a non-venomous animal or insect
+Id10089,Was (s)he injured by burns/fire?,burns,injury,,,injured by burns or fire
+Id10090,Was (s)he subject to violence (suicide homicide abuse)?,violence,injury,,,subject to violence
+Id10091,Was (s)he injured by a firearm?,firearm,injury,,,injured by a firearm
+Id10092,Was (s)he stabbed cut or pierced?,stabbing,injury,,,"stabbed, cut, or pierced"
+Id10093,Was (s)he strangled?,strangulation,injury,,,strangled
+Id10094,Was (s)he injured by a blunt force?,blunt force,injury,,,injured by a blunt force
+Id10095,Was (s)he injured by a force of nature?,force of nature,injury,,,injured by a force of nature
+Id10096,Was it electrocution?,electrocution,injury,,,electrocuted
+Id10098,Was the injury accidental?,accidental injury,injury,,,injured accidentally
+Id10099,Was the injury or accident self-inflicted?,self-inflicted injury,injury,,,injured by a self-inflicted act
+Id10100,Was the injury or accident intentionally inflicted by someone else?,inflicted by other,injury,,,injured intentionally by someone else
+Id10418,Did (s)he receive any treatment for the illness that led to death?,received treatment,service,received,did not receive,treatment for the fatal illness
+Id10419,Did (s)he receive oral rehydration salts?,ORS,service,received,did not receive,oral rehydration salts
+Id10420,Did (s)he receive (or need) intravenous fluids (drip) treatment?,IV fluids,service,received,did not receive,intravenous fluids
+Id10421,Did (s)he receive (or need) a blood transfusion?,blood transfusion,service,received,did not receive,a blood transfusion
+Id10423,Did (s)he receive (or need) injectable antibiotics?,injectable antibiotics,service,received,did not receive,injectable antibiotics
+Id10424,Did (s)he receive (or need) antiretroviral therapy (ART)?,ART,service,received,did not receive,antiretroviral therapy
+Id10425,Did (s)he have (or need) an operation for the illness?,surgery,service,had,did not have,an operation for the illness
+Id10427,Was (s)he discharged from hospital very ill?,discharged very ill,service,was,was not,discharged from hospital very ill
+Id10428,Had (s)he received immunizations?,immunizations,service,received,did not receive,immunizations
+Id10432,Was care sought outside the home while (s)he had this illness?,care sought,service,had,had no,care sought outside the home during the illness
+Id10457,In the final days before death was traditional medicine used?,traditional medicine,service,had,had no,traditional medicine used in the final days

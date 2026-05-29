@@ -23,7 +23,9 @@ import inspect
 import logging
 import os
 import shutil
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -115,6 +117,26 @@ def _get_ray_trial_dir() -> Path:
     )
 
 
+@contextmanager
+def _trial_workdir(persistent: Path | None):
+    """Yield a directory for one trial/fold's train()+predict() artifacts.
+
+    HPO trials only need the resulting *score* — never the model weights.  When
+    ``persistent`` is None (the default path), training runs inside a
+    ``tempfile.TemporaryDirectory`` that is removed as soon as the score has been
+    computed, so no checkpoints / optimizer state / model weights survive on disk,
+    even if the sweep is interrupted mid-run.  When ``persistent`` is a Path (only
+    when ``export_best_trial=True``), that directory is used and left in place so
+    the best trial can be exported afterwards.
+    """
+    if persistent is not None:
+        persistent.mkdir(parents=True, exist_ok=True)
+        yield persistent
+    else:
+        with tempfile.TemporaryDirectory(prefix="mmva_hpo_trial_") as td:
+            yield Path(td)
+
+
 def optimize(
     train_dataset,
     label2id: dict,
@@ -145,6 +167,7 @@ def optimize(
     enable_pruning: bool = True,
     save_trials_csv: bool = True,
     cleanup_trials: bool = True,
+    export_best_trial: bool = False,
     use_fast: bool = True,
     # ── CV options ────────────────────────────────────────────────────────────
     use_cv: bool = True,
@@ -156,10 +179,16 @@ def optimize(
     opt-train / opt-eval split. Each trial trains on opt-train and is scored
     on opt-eval. The held-out test set from prepare_dataset() is never used here.
 
-    After all trials complete, the best trial's artifacts are copied to
-    output_dir/best_trial/ and best hyperparams are saved as best_hyperparams.json.
-    The returned best_hyperparams can be passed directly to
-    train(hyperparams=best_hyperparams) for a final run on the full training set.
+    Storage: each trial/fold is trained inside a ``tempfile.TemporaryDirectory``
+    that is deleted as soon as its score is computed — no model weights, optimizer
+    state, or checkpoints survive per trial (the historical bloat: 500+ trial dirs
+    × ~hundreds of MB each).  Only the *scores* persist, via the JournalStorage
+    ``hpo_<model>.log`` (also drives resume) and the trials CSV.  best_hyperparams
+    is saved to best_hyperparams.json.  The returned best_hyperparams can be passed
+    directly to train(hyperparams=best_hyperparams) for a final run on the full
+    training set — this is what the TextClassifier wrapper does, so the best trial's
+    weights are never needed.  Set ``export_best_trial=True`` to additionally keep a
+    reloadable copy of the best trial's model in output_dir/best_trial/.
 
     Args:
         train_dataset: Tokenized ClassificationDataset from prepare_dataset().
@@ -211,12 +240,21 @@ def optimize(
                          optimization completes. Includes hyperparameters, objective
                          score, all user_attrs_* metrics, state, and duration.
                          Default True.
-        cleanup_trials: Delete all per-trial directories (``trial_*/``) after HPO
-                        completes.  The best trial is preserved at ``best_trial/``
-                        before deletion.  Each trial directory contains a full model
-                        checkpoint (≈400 MB for BERT-base); 20 trials can accumulate
-                        8+ GB.  The JournalStorage log, ``best_hyperparams.json``,
-                        ``best_trial/``, and the CSV are all kept.  Default True.
+        cleanup_trials: Only relevant when ``export_best_trial=True`` (otherwise trials
+                        leave no directories to clean — see ``export_best_trial``).
+                        When True, deletes the non-best persisted ``trial_*/`` dirs
+                        after the best is exported.  The JournalStorage log,
+                        ``best_hyperparams.json``, ``best_trial/``, and the CSV are kept.
+                        Default True.
+        export_best_trial: Keep a reloadable copy of the best trial's model at
+                           ``output_dir/best_trial/``.  Default False — trials run in
+                           temporary directories (no weights persisted), which is the
+                           storage fix.  Set True to persist trials in ``trial_*/`` dirs
+                           (each holding only the final merged model, no checkpoints or
+                           optimizer state) so the best one can be exported afterwards.
+                           The wrapper retrains ``final/`` from best_hyperparams, so this
+                           is rarely needed; best_hyperparams.json + the .log already
+                           capture everything required to retrain.
 
     Returns:
         best_hyperparams: Dict of hyperparameter values from the best trial.
@@ -370,7 +408,9 @@ def optimize(
         hp = sample_hyperparams(trial, active_space)
         if use_focal:
             hp["loss_type"] = "focal"
-        trial_dir = output_dir / f"trial_{trial.number}"
+        # Persist this trial's dir only when we intend to export the best trial;
+        # otherwise train into an auto-deleted tempdir (see _trial_workdir).
+        trial_dir = (output_dir / f"trial_{trial.number}") if export_best_trial else None
         score = float("nan")
         failed = False
 
@@ -390,28 +430,32 @@ def optimize(
                 for fold_idx, (cv_train_idx, cv_val_idx) in enumerate(_cv_splits):
                     fold_train = Subset(train_dataset, cv_train_idx)
                     fold_val   = Subset(train_dataset, cv_val_idx)
-                    fold_dir   = trial_dir / f"fold_{fold_idx}"
+                    fold_persistent = (trial_dir / f"fold_{fold_idx}") if trial_dir is not None else None
 
-                    train(
-                        train_dataset=fold_train,
-                        label2id=label2id,
-                        id2label=id2label,
-                        model_name=model_name,
-                        output_dir=fold_dir,
-                        hyperparams=hp,
-                        val_size=None,               # full fold-train used; no internal split
-                        use_lora=use_lora,
-                        gradient_checkpointing=gradient_checkpointing,
-                        early_stopping_patience=None,  # no early stopping within fold
-                        resume=False,
-                        use_fast=use_fast,
-                        random_state=random_state,
-                    )
-                    fold_result = predict(fold_dir, fold_val, use_fast=use_fast)
-
-                    for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"):
-                        _fold_scores[m].append(score_predictions(fold_result.top1, m))
-                    _fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
+                    # Train + score inside the workdir; weights are discarded as soon
+                    # as the fold score is read (only the score is needed for HPO).
+                    with _trial_workdir(fold_persistent) as fold_dir:
+                        train(
+                            train_dataset=fold_train,
+                            label2id=label2id,
+                            id2label=id2label,
+                            model_name=model_name,
+                            output_dir=fold_dir,
+                            hyperparams=hp,
+                            val_size=None,               # full fold-train used; no internal split
+                            use_lora=use_lora,
+                            gradient_checkpointing=gradient_checkpointing,
+                            early_stopping_patience=None,  # no early stopping within fold
+                            resume=False,
+                            cleanup_checkpoints=True,      # trials never need checkpoints
+                            save_total_limit=1,            # minimise peak disk per fold
+                            use_fast=use_fast,
+                            random_state=random_state,
+                        )
+                        fold_result = predict(fold_dir, fold_val, use_fast=use_fast)
+                        for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"):
+                            _fold_scores[m].append(score_predictions(fold_result.top1, m))
+                        _fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
 
                     # Store per-fold score for the target metric
                     trial.set_user_attr(f"fold_{fold_idx}_{metric}", _fold_scores[metric][-1])
@@ -437,27 +481,30 @@ def optimize(
                 # ── Single fixed-split path (original behaviour) ────────────
                 # val_size=0.1: train() carves an internal eval split from opt_train
                 # for early stopping / best-checkpoint selection; separate from opt_val.
-                train(
-                    train_dataset=opt_train,
-                    label2id=label2id,
-                    id2label=id2label,
-                    model_name=model_name,
-                    output_dir=trial_dir,
-                    hyperparams=hp,
-                    val_size=0.1,
-                    use_lora=use_lora,
-                    gradient_checkpointing=gradient_checkpointing,
-                    early_stopping_patience=early_stopping_patience,
-                    resume=False,
-                    use_fast=use_fast,
-                    random_state=random_state,
-                )
-                result = predict(trial_dir, opt_val, use_fast=use_fast)
-                all_scores = {
-                    m: score_predictions(result.top1, m)
-                    for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
-                }
-                all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
+                with _trial_workdir(trial_dir) as tdir:
+                    train(
+                        train_dataset=opt_train,
+                        label2id=label2id,
+                        id2label=id2label,
+                        model_name=model_name,
+                        output_dir=tdir,
+                        hyperparams=hp,
+                        val_size=0.1,
+                        use_lora=use_lora,
+                        gradient_checkpointing=gradient_checkpointing,
+                        early_stopping_patience=early_stopping_patience,
+                        resume=False,
+                        cleanup_checkpoints=True,      # trials never need checkpoints
+                        save_total_limit=1,            # minimise peak disk per trial
+                        use_fast=use_fast,
+                        random_state=random_state,
+                    )
+                    result = predict(tdir, opt_val, use_fast=use_fast)
+                    all_scores = {
+                        m: score_predictions(result.top1, m)
+                        for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                    }
+                    all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
 
             # Store all metrics as user attributes for traceability (both paths).
             for name, val in all_scores.items():
@@ -474,7 +521,10 @@ def optimize(
         finally:
             trial_elapsed = round(time.perf_counter() - trial_started, 3)
             trial.set_user_attr("elapsed_seconds", trial_elapsed)
-            trial.set_user_attr("trial_dir", str(trial_dir))
+            trial.set_user_attr(
+                "trial_dir",
+                str(trial_dir) if trial_dir is not None else "<tempdir (not persisted)>",
+            )
             logger.info(
                 "Optuna trial %d %s in %.2fs%s",
                 trial.number,
@@ -573,19 +623,24 @@ def optimize(
 
     best_hyperparams = study.best_params
 
-    # --- Copy best trial artifacts ---
-    best_trial_dir = output_dir / f"trial_{study.best_trial.number}"
-    best_output_dir = output_dir / "best_trial"
-    if best_trial_dir.exists():
-        # Remove stale artifacts from any previous run before copying to avoid
-        # silently mixing weights from two different trials when resuming.
-        if best_output_dir.exists():
-            shutil.rmtree(best_output_dir)
-        shutil.copytree(best_trial_dir, best_output_dir)
-    else:
-        logger.warning(
-            "Best trial directory not found at %s — best_trial/ not updated.", best_trial_dir
-        )
+    # --- Copy best trial artifacts (opt-in) ---
+    # Default path: trials ran in tempdirs, so there is nothing to copy — the
+    # best trial's config lives in best_hyperparams.json + the JournalStorage log,
+    # and the wrapper retrains final/ from it.  Only when export_best_trial=True did
+    # trials persist in trial_*/ dirs, so copy the best one out for direct reuse.
+    if export_best_trial:
+        best_trial_dir = output_dir / f"trial_{study.best_trial.number}"
+        best_output_dir = output_dir / "best_trial"
+        if best_trial_dir.exists():
+            # Remove stale artifacts from any previous run before copying to avoid
+            # silently mixing weights from two different trials when resuming.
+            if best_output_dir.exists():
+                shutil.rmtree(best_output_dir)
+            shutil.copytree(best_trial_dir, best_output_dir)
+        else:
+            logger.warning(
+                "Best trial directory not found at %s — best_trial/ not updated.", best_trial_dir
+            )
 
     with open(output_dir / "best_hyperparams.json", "w") as f:
         json.dump(best_hyperparams, f, indent=2)
@@ -599,11 +654,11 @@ def optimize(
         study.trials_dataframe().to_csv(trials_csv_path, index=False)
         logger.info("Saved trial results to %s", trials_csv_path)
 
-    # --- Remove per-trial directories (optional) ---
-    # Each trial dir contains a full model copy (≈400 MB for BERT-base).
-    # After HPO the best trial is in best_trial/ and hyperparams in best_hyperparams.json;
-    # the individual trial_N/ directories serve no further purpose.
-    # The JournalStorage log is kept for resumability / further Optuna analysis.
+    # --- Remove per-trial directories (only present when export_best_trial=True) ---
+    # In the default path trials ran in tempdirs, so no trial_*/ dirs exist here and
+    # this is a no-op.  When export_best_trial=True the best is already copied to
+    # best_trial/, so the remaining trial_*/ dirs serve no further purpose.
+    # The JournalStorage log is always kept for resumability / further Optuna analysis.
     if cleanup_trials:
         removed = 0
         for trial_dir in sorted(output_dir.iterdir()):
@@ -766,6 +821,8 @@ def _ray_trial_fn(
             gradient_checkpointing=gradient_checkpointing,
             early_stopping_patience=early_stopping_patience,
             resume=False,
+            cleanup_checkpoints=True,  # trials only need a score, not checkpoints
+            save_total_limit=1,        # minimise per-trial disk under ray_experiment/
             use_fast=use_fast,
             random_state=random_state,
         )
@@ -836,6 +893,7 @@ def optimize_ray(
     experiment_name: str | None = None,
     save_trials_csv: bool = True,
     cleanup_trials: bool = True,
+    export_best_trial: bool = False,
     use_asha: bool = False,
     use_fast: bool = True,
 ) -> tuple[dict, Any]:
@@ -1307,18 +1365,21 @@ def optimize_ray(
     with open(output_dir / "best_hyperparams_ray.json", "w") as fh:
         json.dump(best_hyperparams, fh, indent=2)
 
-    # --- Copy best trial artifacts ---
+    # --- Copy best trial artifacts (opt-in) ---
+    # best_hyperparams_ray.json + the trials CSV already capture everything needed
+    # to retrain; only persist the best trial's weights when explicitly requested.
     best_trial_path = Path(best_result.path)
-    best_output_dir = output_dir / "best_trial"
-    if best_trial_path.exists():
-        # Remove stale artifacts from any previous run before copying.
-        if best_output_dir.exists():
-            shutil.rmtree(best_output_dir)
-        shutil.copytree(best_trial_path, best_output_dir)
-    else:
-        logger.warning(
-            "Best trial path not found at %s — best_trial/ not updated.", best_trial_path
-        )
+    if export_best_trial:
+        best_output_dir = output_dir / "best_trial"
+        if best_trial_path.exists():
+            # Remove stale artifacts from any previous run before copying.
+            if best_output_dir.exists():
+                shutil.rmtree(best_output_dir)
+            shutil.copytree(best_trial_path, best_output_dir)
+        else:
+            logger.warning(
+                "Best trial path not found at %s — best_trial/ not updated.", best_trial_path
+            )
 
     # --- Save trial CSV ---
     if save_trials_csv:
