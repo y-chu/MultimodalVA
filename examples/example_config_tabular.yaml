@@ -1,5 +1,5 @@
 # Declarative YAML config — unimodal tabular.
-# Run with:  multimodalva run tests/examples/example_config_tabular.yaml
+# Run with:  multimodalva run examples/example_config_tabular.yaml
 
 task: tabular
 data: demo                            # "demo" = built-in synthetic data; or give a CSV/Parquet path

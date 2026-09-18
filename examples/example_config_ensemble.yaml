@@ -1,5 +1,5 @@
 # Declarative YAML config — ensemble (stacking).
-# Run with:  multimodalva run tests/examples/example_config_ensemble.yaml
+# Run with:  multimodalva run examples/example_config_ensemble.yaml
 #
 # YAML is the natural home for the voting/stacking base-model spec lists, which
 # are lists of dicts and awkward to pass on the command line.

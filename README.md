@@ -13,20 +13,62 @@ confidence), `full` (all class probabilities), `topk`, and `id2label`.
 
 ## Installation
 
+The package is not on PyPI yet, so install from GitHub:
+
 ```bash
 pip install git+https://github.com/y-chu/MultimodalVA.git
 ```
 
-Optional extras:
+Requires Python 3.12 or 3.13. Runs on CUDA, Apple Silicon (MPS) or CPU.
+
+### What the default install gives you
+
+The base install covers five of the six pipelines and all nine tabular models,
+including LightGBM, XGBoost and CatBoost:
+
+| | Default install | Needs an extra |
+|---|---|---|
+| Text classification (`task="text"`) | ✅ | |
+| Tabular, all 9 models (`task="tabular"`) | ✅ | |
+| Data fusion (`task="data_fusion"`) | ✅ | |
+| Soft voting (`task="voting"`) | ✅ | |
+| Stacking (`task="stacking"`) | ✅ | |
+| Hyperparameter search, all pipelines | ✅ | |
+| Evaluation, plots, calibration, bootstrap CIs | ✅ | |
+| Publishing models to the Hugging Face Hub | ✅ | |
+| **LoRA fine-tuning** (`use_lora=True`) | ❌ | `[lora]` |
+| **Feature fusion** (`task="feature_fusion"`) | ❌ | `[feature_fusion]` |
+
+So: **the default install does not include LoRA.** Text models train with full
+fine-tuning unless you install the extra and pass `use_lora=True`.
+
+### Extras
 
 ```bash
-pip install "multimodalva[tabular]"         # LightGBM / XGBoost / CatBoost
-pip install "multimodalva[lora]"            # LoRA fine-tuning (PEFT)
-pip install "multimodalva[feature_fusion]"  # AutoGluon AutoMM
-pip install "multimodalva[all]"             # everything above
+pip install "multimodalva[all]"                 # recommended — adds both extras
+pip install "multimodalva[lora]"                # LoRA fine-tuning (PEFT)
+pip install "multimodalva[feature_fusion]"      # AutoGluon AutoMM
 ```
 
-Requires Python 3.12 or 3.13. Runs on CUDA, Apple Silicon (MPS) or CPU.
+From GitHub the same syntax applies:
+
+```bash
+pip install "multimodalva[all] @ git+https://github.com/y-chu/MultimodalVA.git"
+```
+
+⚠️ **`[feature_fusion]` narrows your environment.** AutoGluon AutoMM pins
+`torch>=2.6,<2.10` and `transformers>=4.51,<4.58`, where the rest of the package
+accepts `torch>=2.1` and `transformers>=4.38,<5`, and it pulls in a large
+dependency tree of its own. Install it when you want feature fusion; skip it on a
+cluster where the available torch is outside that window. The other five
+pipelines are unaffected either way. See the
+[FAQ](FAQ.md#feature-fusion-fails-to-install-or-conflicts-with-my-torch-version)
+if the install conflicts.
+
+InSilicoVA is not installable here: `pyinsilicova` requires Python <3.10 while
+this package requires 3.12+. The stacking code keeps the
+`model_name="insilicova"` hook for a future release; for now use a separate
+Python 3.7–3.9 environment or the R implementation.
 
 ## How to use
 
@@ -110,7 +152,7 @@ scatter plots and HPO diagnostics.
 
 ## Examples
 
-All examples live in [`tests/examples/`](tests/examples/README.md) and run on the
+All examples live in [`examples/`](examples/README.md) and run on the
 built-in synthetic data, so they need no external files.
 
 | Start here | |
@@ -119,20 +161,48 @@ built-in synthetic data, so they need no external files.
 | `notebooks/02_multimodal_fusion.ipynb` | the four fusion strategies |
 | `example_python_api.py`, `example_cli.sh`, `example_yaml.sh` | the same pipelines through each interface |
 
-Check your install end-to-end (offline, no GPU): `python tests/smoke_test.py`.
+Check your install end-to-end (offline, no GPU):
+
+```bash
+python tests/smoke_test.py      # is it working? ~10 s
+python tests/diagnose.py        # which pipelines and models work here? ~1 min
+```
+
+Both use only the standard library, so they run straight after `pip install`
+with nothing else to add. `diagnose.py` reports a missing optional dependency as
+`SKIP` with the install command, so it doubles as an environment check.
 
 ## Documentation
 
 - [FAQ](FAQ.md) — hardware, run time, disk use, reproducibility, resuming,
   publishing models to the Hugging Face Hub, common errors
 - [API reference](docs/index.html)
-- [Examples](tests/examples/README.md)
+- [Examples](examples/README.md)
 
 ## Questions and contributions
 
 Questions, bug reports and feature requests are welcome as
 [GitHub issues](https://github.com/y-chu/MultimodalVA/issues). See
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
+## Built on
+
+`MultimodalVA` is a layer over existing tools rather than a reimplementation:
+
+| | |
+|---|---|
+| [Hugging Face Transformers](https://github.com/huggingface/transformers) | text model fine-tuning and inference |
+| [scikit-learn](https://scikit-learn.org) | tabular models, preprocessing, cross-validation |
+| [LightGBM](https://github.com/microsoft/LightGBM), [XGBoost](https://github.com/dmlc/xgboost), [CatBoost](https://github.com/catboost/catboost) | gradient-boosting tabular models |
+| [Optuna](https://optuna.org) and [Ray Tune](https://docs.ray.io/en/latest/tune/) | hyperparameter search |
+| [AutoGluon AutoMM](https://github.com/autogluon/autogluon) (Apache-2.0) | joint text–tabular feature fusion |
+| [PEFT](https://github.com/huggingface/peft) | LoRA adapters |
+
+If you use the feature-fusion pipeline, please also cite AutoMM:
+
+> Tang Z, Fang H, Zhou S, Yang T, Zhong Z, Hu C, Kirchhoff K, Karypis G.
+> *AutoGluon-Multimodal (AutoMM): Supercharging Multimodal AutoML with Foundation
+> Models.* AutoML Conference, PMLR 256, 2024.
 
 ## Citation
 

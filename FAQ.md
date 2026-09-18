@@ -43,19 +43,77 @@ lowers your reported CPU efficiency without running faster.
 
 ## How long does a run take?
 
-Very roughly, for a VA dataset of a few thousand narratives on one modern GPU:
+Ballpark only — enough to size a job request, not to quote. Wall time scales with
+the number of deaths, the number of epochs, and the sequence length, so treat
+these as order-of-magnitude.
 
-| Job | Typical wall time |
-|---|---|
-| Tabular model, 50 HPO trials | minutes |
-| Text model (512 tokens), single training run | under an hour |
-| Text model, 30–50 HPO trials with 3-fold CV | several hours to a day |
-| Long-context data fusion, single training run | a few hours |
-| Feature fusion (AutoMM) | set explicitly with `time_limit` |
+| Pipeline | MPS ~1k | MPS ~5k | GPU ~1k | GPU ~5k |
+|---|---|---|---|---|
+| Tabular, one fit (any of the 9 models) | seconds | seconds | seconds | seconds |
+| Text, one fit (512 tokens) | ~2 min | ~10 min | <1 min | ~3 min |
+| Text, prediction only | seconds | <1 min | seconds | seconds |
+| Text HPO, 30 trials, no CV | ~1 h | ~5 h | ~10 min | ~1 h |
+| Text HPO, 30 trials, 3-fold CV | ~3 h | ~12 h | ~30 min | ~3 h |
+| Data fusion, one fit (1,346 tokens, BigBird) | ~30 min | ~2 h | ~5 min | ~30 min |
+| Data fusion, one fit (1,346 tokens, Longformer) | ~1.5 h | ~5 h | ~10 min | ~45 min |
+| Stage-1 OOF for stacking (5 text models × 5 folds) | ~1 h | ~4 h | ~15 min | ~1 h |
+| Feature fusion (AutoMM) | you set `time_limit` | | | |
 
-HPO cost scales with `n_trials × n_cv_folds`, so cross-validated search costs
-about *k* times a single trial. Suggested trial counts: 20–25 with CV and no
-LoRA, 15–20 with CV and LoRA, 30–40 without CV.
+Not listed because they finish in seconds to a couple of minutes on a laptop, at
+any of these sizes: soft voting, the stacking meta-learner itself, class-aware
+voting, bootstrap confidence intervals, calibration, and every plot. Once the
+base models exist, combining them is cheap — the cost is all in Stage 1.
+
+**LoRA does not make training much faster.** Measured on the same machine and
+model, a training step took 1.32 s with LoRA and 1.31 s without: the forward and
+backward passes still run through the full frozen network, and only the optimizer
+state shrinks. Use it to fit a larger model in memory, not to save wall time.
+
+**CPU is not a realistic option for the text pipelines.** The same step took
+15.5 s on CPU against 1.3 s on Apple Silicon, about 12× slower, which turns a
+10-minute fit into two hours and a CV search into weeks. Tabular pipelines are
+fine on CPU; the transformer ones are not.
+
+Long-context models are where hardware matters most. Longformer's attention has
+no Metal implementation, so on Apple Silicon it runs with
+`PYTORCH_ENABLE_MPS_FALLBACK=1` and those operations execute on CPU with a copy
+each way every step. That penalty is not proportional to the hardware gap, which
+is why the advice is BigBird locally and Longformer on a GPU.
+
+*Basis and disclaimer: these figures were derived with AI assistance by
+normalising the runtime logs the package writes itself (per death, per epoch) and
+rounding to an order of magnitude. MPS figures come from an Apple M4 Max
+(16-core, 128 GB); GPU figures from an NVIDIA H200. The GPU runs used LoRA and
+smaller datasets than the MPS runs, so most of the GPU column is extrapolated
+rather than measured at that size, and no cell was benchmarked at every
+combination shown. Treat the whole table as indicative only — not as a benchmark,
+and not as a basis for a performance claim. Measure on your own hardware before
+planning a long job: `runtime/gpu_usage.csv` in any run directory records the
+accelerator and `*_runtime.json` the wall time.*
+
+## What SLURM resources should I request?
+
+More CPUs is not better. The dataloader is the only part that scales with them,
+and past 16 they sit idle:
+
+```bash
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64GB
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+```
+
+With 16 CPUs the package derives 14 dataloader workers, which keeps ~94% of the
+allocation busy and saturates one GPU. Requesting 48 CPUs gives 24 workers and
+about 52% efficiency — the same wall time, three times the CPU-hours, and a
+longer queue. 24 CPUs is also fine (~96%) if memory headroom matters.
+
+One GPU is the right request for every pipeline here. Multi-GPU only helps
+through `torchrun`, and these datasets are too small for it to pay off.
 
 ## How much disk space does a run use?
 
@@ -236,45 +294,32 @@ to training, rebuild that string with
 
 ## Why is there no confidence interval for ECE and MCE?
 
-`calibration_summary()` returns a bootstrap interval for the Brier score but not
-for ECE or MCE. That is deliberate: both are biased upward on small samples, and
-a bootstrap resample is a small sample.
+`calibration_summary()` returns a bootstrap interval for Brier but not for ECE or
+MCE, because both are biased upward on small samples — and a bootstrap resample
+*is* a small sample, holding only ~63% distinct rows.
 
-Drawing *n* cases with replacement from *n* cases — the standard bootstrap —
-lands on only about 63% distinct rows, so each resample behaves like a smaller
-dataset. Measured on 1000 held-out cases:
+Measured on 1,000 held-out cases, same resamples for every metric:
 
-| metric | point estimate | bootstrap mean | shift |
+| metric | point | bootstrap mean | shift |
 |---|---|---|---|
 | accuracy | 0.6940 | 0.6943 | +0.0% |
 | Brier | 0.0224 | 0.0224 | −0.0% |
-| CSMF accuracy | 0.9256 | 0.9157 | −1.1% |
 | **ECE** | 0.0121 | 0.0152 | **+25%** |
 | **MCE** | 0.6347 | 0.7218 | **+14%** |
 
-Accuracy, Brier and CSMF accuracy come back essentially unbiased under the very
-same resamples, so the resampling scheme is not the problem — these two metrics
-are. ECE averages `|observed frequency − predicted probability|`, and an absolute
-value cannot cancel noise, so a noisier observed frequency can only push the
-score up. MCE takes the single worst bin, which is the sparsest and noisiest one.
-Brier is a plain mean, so its noise cancels.
+Accuracy and Brier are plain means, so their noise cancels. ECE averages
+`|observed − predicted|`, and an absolute value cannot cancel noise; MCE takes
+the sparsest, noisiest bin. The shift is large enough that the interval can sit
+entirely above the point estimate, so quoting one would misstate the uncertainty.
 
-The shift is big enough that the interval can sit entirely above the point
-estimate, which would misstate the uncertainty rather than describe it. So the
-package reports ECE and MCE as point estimates and leaves the choice of
-uncertainty method to you.
+### If you need one anyway
 
-### Building one yourself
-
-Everything needed is already in the run's outputs — the `full` predictions table
-(`true_label` plus `prob_0`, `prob_1`, …) and `id2label.json`, both written to
-`<output_dir>/predictions/` and `<output_dir>/final/`. The metric functions are
-importable, so you can resample however your analysis calls for:
+Everything required is in the run outputs — `predictions_full.csv` and
+`id2label.json` — and the metric functions are importable, so you can resample
+however your analysis calls for:
 
 ```python
-import json
-import numpy as np
-import pandas as pd
+import json, numpy as np, pandas as pd
 from multimodalva.results.calibration import classwise_bin_data, ece_score
 
 full = pd.read_csv("runs/text/predictions/predictions_full.csv")
@@ -285,35 +330,72 @@ y_prob = full[[f"prob_{i}" for i in sorted(id2label)]].to_numpy(float)
 y_true = np.zeros_like(y_prob)
 y_true[np.arange(len(full)), full["true_label"].map({c: i for i, c in enumerate(classes)})] = 1
 
-def ece(idx):
-    return ece_score(classwise_bin_data(y_true[idx], y_prob[idx], classes), len(idx))
-
+ece = lambda idx: ece_score(classwise_bin_data(y_true[idx], y_prob[idx], classes), len(idx))
 point = ece(np.arange(len(full)))
 
 rng = np.random.default_rng(42)
 draws = np.array([ece(rng.integers(0, len(full), len(full))) for _ in range(2000)])
-
-print(f"ECE {point:.4f}")
-print(f"percentile interval {np.percentile(draws, [2.5, 97.5]).round(4)}")
-print(f"bootstrap mean {draws.mean():.4f}  (shift {draws.mean() - point:+.4f})")
+print(f"ECE {point:.4f}  interval {np.percentile(draws, [2.5, 97.5]).round(4)}  shift {draws.mean()-point:+.4f}")
 ```
 
-Whatever you report, state the method and show the shift, because the interval
-and the point estimate are not describing the same sample size.
+State the method and report the shift alongside it: the interval and the point
+estimate describe different effective sample sizes.
 
-If you want a bias-corrected value rather than an interval, the shift is a
-function of sample size, so you can estimate it: score subsamples of several
-sizes *m* (drawn **without** replacement, to keep duplicates out of it), fit
-`ECE(m) = a + C·m^(−α)`, and read off `a` as the large-sample limit. On the
-reference predictions this gives α ≈ 0.65 and a limit roughly 1.4–1.65× below
-the reported value across models. Treat that as a sensitivity check rather than
-a headline number: it is an extrapolation, and it is fitted, not measured.
+## Feature fusion fails to install, or conflicts with my torch version
+
+Feature fusion is the one pipeline that is not in the default install, because
+AutoGluon AutoMM constrains the environment more tightly than the rest of the
+package:
+
+| | rest of the package | `[feature_fusion]` |
+|---|---|---|
+| torch | `>=2.1` | `>=2.6,<2.10` |
+| transformers | `>=4.38,<5` | `>=4.51,<4.58` |
+| accelerate | `>=0.26` | `>=0.34,<2.0` |
+
+AutoGluon also brings about forty direct dependencies of its own. Those pins are
+AutoGluon's, not ours — we state them explicitly so a failed resolve is legible
+rather than mysterious.
+
+Two situations come up:
+
+**Your torch is outside 2.6–2.9.** Common on a cluster where the module system
+fixes the torch build. Nothing can be done about the pin, but nothing needs to
+be: the other five pipelines run on any torch from 2.1 up. Install without the
+extra and use `task="stacking"` or `task="voting"` for multimodal work — both
+combine text and tabular models, they just do it at the decision level instead
+of jointly.
+
+**pip cannot resolve the environment.** Install the extra into a clean virtual
+environment rather than on top of an existing one, so pip is free to choose the
+torch build AutoGluon wants:
+
+```bash
+python -m venv .venv-fusion && source .venv-fusion/bin/activate
+pip install "multimodalva[feature_fusion] @ git+https://github.com/y-chu/MultimodalVA.git"
+```
+
+To check what you have, ask the package:
+
+```bash
+python tests/diagnose.py --group pipelines --with-text
+```
+
+Pipelines whose dependencies are missing are reported `SKIP` with the install
+command, not `FAIL`.
 
 ## Common errors
 
-**`ImportError` for lightgbm / xgboost / catboost / peft / autogluon** — these
-live in optional extras: `pip install "multimodalva[tabular]"`, `[lora]`,
-`[feature_fusion]`, or `[all]`.
+**`ImportError` for peft or autogluon** — these live in optional extras:
+`pip install "multimodalva[lora]"`, `[feature_fusion]`, or `[all]`. LightGBM,
+XGBoost and CatBoost are in the default install and need no extra.
+
+**`TypeError` about `group_by_length` when training a text model** — you are on
+transformers 5.x, which removed that `TrainingArguments` argument. The package
+requires `transformers>=4.38,<5`, so a normal `pip install` downgrades for you;
+this only appears if the constraint was bypassed (`--no-deps`, a module-provided
+build, or a conda-managed transformers). Install a 4.x build in your environment.
+Support for 5.x is planned for a future release.
 
 **`RuntimeError` about Metal/MPS operations with Longformer** — set
 `PYTORCH_ENABLE_MPS_FALLBACK=1`, or switch to BigBird, or run on CPU.

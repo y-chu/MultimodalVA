@@ -32,13 +32,13 @@ models: `text` and `data_fusion`).
 
 ```bash
 # Python
-python tests/examples/example_python_api.py tabular
+python examples/example_python_api.py tabular
 
 # CLI (or: python -m multimodalva.cli ...)
-bash tests/examples/example_cli.sh
+bash examples/example_cli.sh
 
 # YAML
-multimodalva run tests/examples/example_config_tabular.yaml
+multimodalva run examples/example_config_tabular.yaml
 ```
 
 All examples use the built-in synthetic dataset (`data("va_sample")`) so they

@@ -10,10 +10,10 @@ Every example below is one call. ``data`` accepts a path OR an in-memory
 DataFrame, so preprocess however you like first, then hand the frame to ``run``.
 
 Run a single example:
-    python tests/examples/example_python_api.py tabular
-    python tests/examples/example_python_api.py text
-    python tests/examples/example_python_api.py ensemble
-    python tests/examples/example_python_api.py all       # default
+    python examples/example_python_api.py tabular
+    python examples/example_python_api.py text
+    python examples/example_python_api.py ensemble
+    python examples/example_python_api.py all       # default
 
 The examples use the built-in synthetic dataset so they run with no external
 data. Swap ``data("va_sample")`` for your own ``pd.read_csv("clean.csv")`` (or
@@ -27,7 +27,7 @@ import sys
 
 from multimodalva import data, run
 
-OUT = "tests/examples/_runs"
+OUT = "examples/_runs"
 
 
 # ---------------------------------------------------------------------------

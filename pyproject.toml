@@ -110,22 +110,20 @@ dependencies = [
     # (e.g. BlueBERT, T5, XLNet, DeBERTa-v2). transformers will raise
     # ImportError at tokenizer load time if this is missing.
     "sentencepiece>=0.1.99",
-]
-
-[project.optional-dependencies]
-# --- Tabular ML models (sklearn-compatible) ---
-# Install with: pip install multimodalva[tabular]
-tabular = [
+    # Gradient-boosting backends. In core rather than an extra because they are
+    # the strongest tabular models in this package and the three most likely to
+    # be wanted; unlike AutoGluon they add no constraint on torch/transformers.
     # lightgbm 4.1: first release with Python 3.12 wheels (Oct 2023).
     "lightgbm>=4.1",
     # xgboost 2.0: released Oct 2023 alongside Python 3.12, includes 3.12 wheels.
-    # xgboost 2.1+ added NumPy 2.x support but is backward-compatible with numpy<2.
+    # 2.1+ added NumPy 2.x support and is backward-compatible with numpy<2.
     "xgboost>=2.0",
-    # catboost 1.2.2: first release with Python 3.12 wheels (Dec 2023).
-    # compiled against NumPy 1.x; compatible with numpy<2 cap in core deps.
+    # catboost 1.2.2: first release with Python 3.12 wheels (Dec 2023);
+    # compiled against NumPy 1.x, compatible with the numpy<2 cap above.
     "catboost>=1.2.2",
 ]
 
+[project.optional-dependencies]
 # --- LoRA fine-tuning (parameter-efficient text training) ---
 # Install with: pip install multimodalva[lora]
 lora = ["peft>=0.7"]
@@ -138,34 +136,35 @@ lora = ["peft>=0.7"]
 # stack does. This avoids under-constrained feature-fusion environments.
 feature_fusion = [
     "autogluon.multimodal>=1.5,<1.6",
+    # AutoGluon 1.5 requires numpy<2.4; the core deps allow numpy>=2.0 with no
+    # upper bound on Python 3.13, so without this an otherwise-valid environment
+    # resolves to numpy 2.4+ and AutoGluon fails its own import check.
+    "numpy<2.4",
     "torch>=2.6,<2.10",
     "transformers>=4.51,<4.58",
     "accelerate>=0.34,<2.0",
 ]
 
-# --- Ensemble strategy 4: InSilicoVA base model in stacking ---
-# Placeholder extra kept for backward compatibility.
-# The Python InSilicoVA dependency path is not available under this package's
-# supported Python range (>=3.12). Use the R-based InSilicoVA workflow instead,
-# or a separate legacy environment if pyinsilicova support is needed.
-insilicova = []
-
-# --- Install everything compatible with Python 3.12 ---
-# pip install multimodalva[all]
-# Note: pyinsilicova is excluded — it requires Python <3.10 and must be
-# installed separately in a Python 3.7–3.9 environment.
+# --- Everything optional, in one install ---
+# pip install "multimodalva[all]"
+# The recommended install when disk and environment constraints allow: it adds
+# LoRA and AutoGluon feature fusion on top of the core pipelines.
+# Note: InSilicoVA is not included. `pyinsilicova` requires Python <3.10 while
+# this package requires >=3.12, so it cannot be installed here at all; the
+# stacking code keeps the `model_name="insilicova"` hook for a future release.
 all = [
-    "lightgbm>=4.1",
-    "xgboost>=2.0",
-    "catboost>=1.2.2",
     "peft>=0.7",
     "autogluon.multimodal>=1.5,<1.6",
+    "numpy<2.4",
     "torch>=2.6,<2.10",
     "transformers>=4.51,<4.58",
     "accelerate>=0.34,<2.0",
 ]
 
-dev = ["pytest", "pytest-cov"]
+# --- Contributors only: what `pytest` needs ---
+# Not required to use the package. Kept as an extra so CI and humans install the
+# same thing from one declaration (.github/workflows/tests.yml uses it too).
+dev = ["pytest"]
 
 [project.scripts]
 # Installs the `multimodalva` CLI: `multimodalva run --task text --data ...`

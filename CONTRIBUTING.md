@@ -30,16 +30,39 @@ cd MultimodalVA
 pip install -e ".[all,dev]"
 ```
 
+Three parts, and they do different things:
+
+- **`-e`** installs in editable mode, so your edits take effect without
+  reinstalling. This is what makes the checkout editable — not the `dev` extra.
+- **`dev`** is exactly `pytest`, the one thing the unit tests need that the
+  package itself does not. CI installs the same extra, so there is a single
+  declaration of what running the tests requires.
+
+Note that `smoke_test.py` and `diagnose.py` need none of this — they use only
+the standard library and the package itself, so a user can run them straight
+after `pip install` to check their environment.
+- **`all`** pulls in the optional LoRA and feature-fusion paths so the full test
+  matrix can run.
+
 ## Running the tests
 
+Three layers, and the first two are not collected by `pytest` (their filenames
+are not `test_*.py`) because they train real models:
+
 ```bash
-python tests/smoke_test.py          # end-to-end check: offline, CPU-only, ~1 minute
-python tests/smoke_test.py --with-text   # also exercises the text pipeline (downloads a tiny model)
-pytest tests/ -q                    # unit tests
+pytest -q                           # unit tests, ~10 s
+python tests/smoke_test.py          # is it alive: offline, CPU-only, ~10 s
+python tests/smoke_test.py --with-text   # also trains a tiny text model
+python tests/diagnose.py            # full matrix: 9 tabular models x 6 pipelines
+python tests/diagnose.py --with-text     # adds the text pipelines, ~6 min
 ```
 
-Please make sure both pass before opening a pull request. The same commands run
-in CI on every push.
+A green `pytest` run does **not** mean the pipelines work — run `diagnose.py`
+before a release. It exits non-zero on failure and prints, for each failing cell,
+the last line inside `multimodalva` that ran, so there is a file:line to open.
+
+Please make sure `pytest` and `smoke_test.py` pass before opening a pull request.
+Both run in CI on every push.
 
 ## Pull requests
 
