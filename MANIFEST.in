@@ -1,0 +1,15 @@
+# Files to add to the source distribution beyond what setuptools includes by
+# default (the package itself, tests, README, LICENSE, pyproject.toml).
+#
+# CITATION.cff travels with the source so that anyone who obtains the package
+# from PyPI rather than GitHub still has the citation metadata.
+include CITATION.cff
+
+# Deliberately NOT shipped in the sdist:
+#   docs/       index.html is a generated artifact, 204 KB against a 261 KB
+#               sdist, and it is rebuilt from the docstrings that the sdist
+#               already contains (python docs/build_docs.py). The published
+#               copy lives in the repository.
+#   FAQ.md, CONTRIBUTING.md, paper/   repository-facing, not needed to install
+#               or use the package.
+#   CLAUDE.md, .claude/               internal working notes; also gitignored.

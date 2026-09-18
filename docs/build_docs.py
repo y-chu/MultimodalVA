@@ -48,6 +48,15 @@ DOCS_FILE = REPO_ROOT / "docs" / "index.html"
 # ---------------------------------------------------------------------------
 
 DOC_PLAN: dict[str, list[dict]] = {
+    "api": [
+        {
+            "kind": "standalone",
+            "anchor": "api-run",
+            "heading": "run()",
+            "file": "multimodalva/runner.py",
+            "name": "run",
+        },
+    ],
     "utils": [
         {
             "kind": "standalone",
@@ -71,6 +80,19 @@ DOC_PLAN: dict[str, list[dict]] = {
                 {"file": "multimodalva/utils/metrics.py", "name": "csmf_accuracy"},
                 {"file": "multimodalva/utils/metrics.py", "name": "score_predictions"},
                 {"file": "multimodalva/utils/metrics.py", "name": "sample_hyperparams"},
+            ],
+        },
+        {
+            "kind": "group",
+            "anchor": "utils-runtime",
+            "heading": "Device and run helpers",
+            "items": [
+                {"file": "multimodalva/utils/runtime.py", "name": "get_device"},
+                {"file": "multimodalva/utils/runtime.py", "name": "is_cuda"},
+                {"file": "multimodalva/utils/runtime.py", "name": "is_mps"},
+                {"file": "multimodalva/utils/runtime.py", "name": "empty_accelerator_cache"},
+                {"file": "multimodalva/utils/runtime.py", "name": "distributed_state"},
+                {"file": "multimodalva/utils/runtime.py", "name": "resolve_seed"},
             ],
         },
     ],
@@ -233,6 +255,28 @@ DOC_PLAN: dict[str, list[dict]] = {
                 {"file": "multimodalva/results/vis_predict.py", "name": "cause_accuracy_heatmap"},
                 {"file": "multimodalva/results/vis_predict.py", "name": "cause_accuracy_diff_heatmap"},
                 {"file": "multimodalva/results/vis_predict.py", "name": "confusion_heatmap"},
+            ],
+        },
+        {
+            "kind": "group",
+            "anchor": "results-calibration",
+            "heading": "Calibration",
+            "items": [
+                {"file": "multimodalva/results/calibration.py", "name": "calibration_summary"},
+                {"file": "multimodalva/results/calibration.py", "name": "classwise_bin_data"},
+                {"file": "multimodalva/results/calibration.py", "name": "ece_score"},
+                {"file": "multimodalva/results/calibration.py", "name": "mce_score"},
+                {"file": "multimodalva/results/calibration.py", "name": "brier_multiclass"},
+            ],
+        },
+        {
+            "kind": "group",
+            "anchor": "results-bootstrap",
+            "heading": "Confidence intervals",
+            "items": [
+                {"file": "multimodalva/results/bootstrap.py", "name": "bootstrap_ci"},
+                {"file": "multimodalva/results/bootstrap.py", "name": "paired_bootstrap_ci"},
+                {"file": "multimodalva/results/bootstrap.py", "name": "predictions_frame"},
             ],
         },
     ],

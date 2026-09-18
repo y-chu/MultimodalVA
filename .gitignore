@@ -7,3 +7,34 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Editor and OS files
+.DS_Store
+*.bak
+*.swp
+
+# Run outputs (training artefacts are not committed)
+runs/
+
+# CatBoost writes this next to the working directory during training
+catboost_info/
+
+# Paper
+paper/

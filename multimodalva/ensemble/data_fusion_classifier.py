@@ -33,38 +33,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from multimodalva.utils.runtime import RuntimeTracker
+from multimodalva.utils.runtime import RuntimeTracker, distributed_state, resolve_seed
 
 from .data_fusion import build_fused_text, DEFAULT_SEPARATOR
 
 logger = logging.getLogger(__name__)
 
-
-def _distributed_state() -> tuple[int, int]:
-    """Return (rank, world_size) from env vars used by torchrun."""
-    try:
-        rank = int(os.environ.get("RANK", "0"))
-    except ValueError:
-        rank = 0
-    try:
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    except ValueError:
-        world_size = 1
-    return rank, max(1, world_size)
-
-
-def _resolve_seed(random_state: int, set_seed: int | None) -> int:
-    """Resolve an effective seed value, with `set_seed` taking precedence."""
-    if set_seed is None:
-        return int(random_state)
-    resolved = int(set_seed)
-    if resolved != int(random_state):
-        logger.info(
-            "set_seed=%d provided; overriding random_state=%d.",
-            resolved,
-            random_state,
-        )
-    return resolved
 
 # ---------------------------------------------------------------------------
 # Default HPO search space for long-context models
@@ -205,6 +179,7 @@ class DataFusionClassifier:
         random_state: int = 42,
         set_seed: int | None = None,
         stratify: bool = True,
+        split_col: str | None = None,
         # --- tokenisation ---
         max_length: int = 1024,
         # --- training ---
@@ -225,6 +200,7 @@ class DataFusionClassifier:
         batch_size: int = 16,
         top_k: int = 3,
         use_fast: bool = True,
+        id_col: str | None = None,
         # --- publishing ---
         push_to_hub: bool = False,
         hub_repo_id: str | None = None,
@@ -243,6 +219,9 @@ class DataFusionClassifier:
 
         Args:
             df:            Input DataFrame containing both text and tabular columns.
+            id_col:        Optional column holding a row identifier. When given,
+                           the identifiers appear as a leading ``id`` column in
+                           the prediction tables.
             text_col:      Column with the free-text narrative.
             feature_cols:  Tabular columns to convert and prepend to the narrative.
             label_col:     Column containing cause-of-death labels.
@@ -324,8 +303,8 @@ class DataFusionClassifier:
             },
             logger_=logger,
         )
-        effective_seed = _resolve_seed(random_state=random_state, set_seed=set_seed)
-        rank, world_size = _distributed_state()
+        effective_seed = resolve_seed(random_state=random_state, set_seed=set_seed)
+        rank, world_size = distributed_state()
         save_fused_path = (
             self.output_dir / "fused_text.csv"
             if (save_fused_csv and (world_size == 1 or rank == 0))
@@ -371,6 +350,10 @@ class DataFusionClassifier:
                 # Build a minimal DataFrame: fused text + label only.
                 fused_df = df[[label_col]].copy()
                 fused_df[fused_col] = fused_series.values
+                # Carry a pre-defined split marker through so the split step
+                # can honour an external/fixed train-test assignment.
+                if split_col is not None and split_col in df.columns:
+                    fused_df[split_col] = df[split_col].values
 
         # ------------------------------------------------------------------
         # Step 2 — Split
@@ -393,6 +376,7 @@ class DataFusionClassifier:
                 test_size=test_size,
                 random_state=effective_seed,
                 stratify=stratify,
+                split_col=split_col,
             )
         self.train_df = train_df
         self.test_df  = test_df
@@ -415,6 +399,7 @@ class DataFusionClassifier:
                 model_name=self.model_name,
                 max_length=max_length,
                 use_fast=use_fast,
+                id_col=id_col,
             )
         self.label2id = label2id
         self.id2label = id2label

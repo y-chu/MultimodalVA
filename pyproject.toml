@@ -14,6 +14,30 @@ license = {text = "MIT"}
 authors = [
     {name = "Yue Chu", email = "ychu612@gmail.com"},
 ]
+keywords = [
+    "verbal autopsy",
+    "cause of death",
+    "clinical NLP",
+    "multimodal learning",
+    "health surveillance",
+    "global health",
+    "BERT",
+    "transformers",
+    "medical AI",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
 dependencies = [
     # torch 2.1: first release with Python 3.12 wheels (Oct 2023).
     "torch>=2.1",
@@ -143,6 +167,10 @@ all = [
 
 dev = ["pytest", "pytest-cov"]
 
+[project.scripts]
+# Installs the `multimodalva` CLI: `multimodalva run --task text --data ...`
+multimodalva = "multimodalva.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/y-chu/MultimodalVA"
 Repository = "https://github.com/y-chu/MultimodalVA"
@@ -151,3 +179,9 @@ Documentation = "https://github.com/y-chu/MultimodalVA/blob/main/docs/index.html
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["multimodalva*"]
+
+# qdesc.csv and qdesc_who2016.csv are loaded at runtime by
+# multimodalva.ensemble.data_fusion.load_qdesc() and by
+# multimodalva.datasets. They must ship with the wheel.
+[tool.setuptools.package-data]
+multimodalva = ["utils/*.csv", "py.typed"]

@@ -1,0 +1,60 @@
+cff-version: 1.2.0
+title: "MultimodalVA: cause-of-death classification from verbal autopsy data"
+message: "If you use this software, please cite it using these metadata."
+type: software
+authors:
+  - given-names: Yue
+    family-names: Chu
+    orcid: "https://orcid.org/0000-0001-8671-5362"
+    affiliation: "The Ohio State University"
+    email: ychu612@gmail.com
+repository-code: "https://github.com/y-chu/MultimodalVA"
+url: "https://github.com/y-chu/MultimodalVA"
+abstract: >-
+  A Python package for cause-of-death classification from verbal autopsy data.
+  It provides a single interface over text-only, tabular-only and multimodal
+  workflows, covering transformer fine-tuning, scikit-learn tabular models,
+  hyperparameter search, four ensemble strategies, and evaluation utilities
+  including CSMF accuracy and probability calibration.
+keywords:
+  - verbal autopsy
+  - cause of death
+  - clinical NLP
+  - multimodal learning
+  - health surveillance
+  - global health
+license: MIT
+version: 0.1.0
+references:
+  - type: article
+    title: >-
+      Multimodal Artificial Intelligence for Cause-of-Death Assignment From
+      Verbal Autopsy Records: A Nationally Representative Evaluation in South
+      Africa
+    authors:
+      - given-names: Yue
+        family-names: Chu
+        orcid: "https://orcid.org/0000-0001-8671-5362"
+      - given-names: Zhenke
+        family-names: Wu
+      - given-names: Richard
+        family-names: Li
+      - given-names: Tyler
+        family-names: McCormick
+      - given-names: Sam J.
+        family-names: Clark
+    year: 2026
+    notes: "Manuscript submitted for publication."
+  - type: thesis
+    title: >-
+      Leveraging Language Models and Machine Learning in Verbal Autopsy Analysis
+    authors:
+      - given-names: Yue
+        family-names: Chu
+        orcid: "https://orcid.org/0000-0001-8671-5362"
+    year: 2025
+    thesis-type: "PhD thesis"
+    institution:
+      name: "The Ohio State University"
+    doi: "10.48550/arXiv.2508.19274"
+    url: "https://arxiv.org/abs/2508.19274"

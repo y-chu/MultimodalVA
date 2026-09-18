@@ -2,7 +2,7 @@
 Step 5 (tabular pipeline): Hyperparameter optimization.
 
 Two backends are provided; both accept the same search_space format and return
-``(best_hyperparams, backend_object)`` so callers can switch seamlessly:
+``(best_hyperparams, backend_object)`` so callers can switch backends without changing call sites:
 
     optimize()      — Optuna (TPE sampler, JournalStorage persistence)
                       Best for single-machine sequential or lightly parallel HPO.
@@ -47,8 +47,10 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from ..utils.metrics import (  # noqa: F401
     csmf_accuracy, score_predictions, sample_hyperparams,
-    log_loss_from_full, METRIC_DIRECTION,
+    log_loss_from_full, METRIC_DIRECTION, decode_hyperparams_for_space,
+    decode_trials_dataframe_for_space, CV_METRICS, HPO_METRICS,
 )
+from ..utils.ray_compat import to_ray_space
 from .predict import predict
 from .train import SUPPORTED_MODELS, train
 
@@ -69,41 +71,6 @@ from .search_spaces import (  # noqa: E402
     _build_profile_space,
     get_default_search_space,
 )
-
-
-def _get_ray_trial_dir() -> Path:
-    """Return the current Ray Tune trial directory across Ray 2.x variants."""
-    try:
-        from ray import tune as _ray_tune
-
-        if hasattr(_ray_tune, "get_context"):
-            ctx = _ray_tune.get_context()
-            if ctx is not None:
-                return Path(ctx.get_trial_dir())
-    except Exception:
-        logger.debug("ray.tune.get_context() unavailable; trying legacy APIs.", exc_info=True)
-
-    try:
-        from ray.air import session as _air_session
-
-        trial_dir = _air_session.get_trial_dir()
-        if trial_dir:
-            return Path(trial_dir)
-    except Exception:
-        logger.debug("ray.air.session.get_trial_dir() unavailable.", exc_info=True)
-
-    cwd = Path.cwd()
-    if cwd.exists():
-        logger.warning(
-            "Falling back to current working directory for Ray trial artifacts: %s",
-            cwd,
-        )
-        return cwd
-
-    raise RuntimeError(
-        "Unable to resolve the Ray Tune trial directory. "
-        "Install a supported Ray Tune version or update the compatibility shim."
-    )
 
 
 def optimize(
@@ -194,7 +161,7 @@ def optimize(
             "Install with:  pip install 'optuna>=3.4'"
         ) from exc
 
-    _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
+    _VALID_METRICS = HPO_METRICS
     if metric not in _VALID_METRICS:
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
@@ -301,7 +268,7 @@ def optimize(
                 raise RuntimeError("use_cv=True but no CV splits were prepared.")
 
             fold_scores: dict[str, list[float]] = {
-                m: [] for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                m: [] for m in CV_METRICS
             }
             fold_log_losses: list[float] = []
             for fold_idx, (cv_train_idx, cv_val_idx) in enumerate(cv_splits):
@@ -323,7 +290,7 @@ def optimize(
                     use_gpu=use_gpu,
                 )
                 fold_result = predict(fold_dir, X_fold_val, y_fold_val)
-                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"):
+                for m in CV_METRICS:
                     fold_scores[m].append(score_predictions(fold_result.top1, m))
                 fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
                 trial.set_user_attr(f"fold_{fold_idx}_{metric}", fold_scores[metric][-1])
@@ -349,7 +316,7 @@ def optimize(
             result = predict(trial_dir, X_opt_val, y_opt_val)
             all_scores = {
                 m: score_predictions(result.top1, m)
-                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                for m in CV_METRICS
             }
             all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
 
@@ -420,7 +387,7 @@ def optimize(
             f"Trial artifacts are in: {output_dir}"
         )
 
-    best_hyperparams = study.best_params
+    best_hyperparams = decode_hyperparams_for_space(study.best_params, active_space)
 
     # Copy best trial artifacts — remove stale artifacts first so resume never
     # silently merges weights from two different best trials.
@@ -446,7 +413,9 @@ def optimize(
 
     if save_trials_csv:
         trials_csv_path = output_dir / "hpo_trials.csv"
-        study.trials_dataframe().to_csv(trials_csv_path, index=False)
+        decode_trials_dataframe_for_space(
+            study.trials_dataframe(), active_space
+        ).to_csv(trials_csv_path, index=False)
         logger.info("Saved trial results to %s", trials_csv_path)
 
     # --- Remove per-trial directories (optional) ---
@@ -472,57 +441,6 @@ def optimize(
 # ---------------------------------------------------------------------------
 # Ray Tune — distributed HPO across multiple CPUs / GPUs / cluster nodes
 # ---------------------------------------------------------------------------
-
-def _to_ray_space(search_space: dict) -> dict:
-    """Convert our ``(type, *args)`` search space format to Ray Tune's format.
-
-    Mapping::
-
-        ("float_log", low, high)  →  tune.loguniform(low, high)
-        ("float",     low, high)  →  tune.uniform(low, high)
-        ("int",       low, high)  →  tune.randint(low, high)
-        ("categorical", [vals])   →  tune.choice([vals])
-
-    Raises:
-        ImportError: If ``ray[tune]`` is not installed.
-        ValueError:  If an unknown type string is encountered.
-    """
-    try:
-        from ray import tune
-    except ImportError as exc:
-        raise ImportError(
-            "Ray Tune is required for optimize_ray(). "
-            "Install with: pip install 'ray[tune]'"
-        ) from exc
-
-    ray_space: dict = {}
-    for key, spec in search_space.items():
-        if not isinstance(spec, (tuple, list)) or not spec:
-            raise ValueError(
-                f"Search space entry {key!r} has an invalid spec {spec!r}. "
-                "Each entry must be a non-empty tuple: "
-                "('float_log', low, high), ('float', low, high), "
-                "('int', low, high), or ('categorical', [values]). "
-                f"Got type {type(spec).__name__!r}."
-            )
-        kind, *args = spec
-        if kind == "float_log":
-            ray_space[key] = tune.loguniform(args[0], args[1])
-        elif kind == "float":
-            ray_space[key] = tune.uniform(args[0], args[1])
-        elif kind == "int":
-            ray_space[key] = tune.randint(args[0], args[1])
-        elif kind == "categorical":
-            ray_space[key] = tune.choice(args[0])
-        else:
-            raise ValueError(
-                f"Search space entry {key!r} has unknown type {kind!r} "
-                f"(full spec: {spec!r}). "
-                "Valid types: 'float_log', 'float', 'int', 'categorical'. "
-                "Example: ('categorical', [8, 16, 32]) or ('float_log', 1e-5, 1e-4)."
-            )
-    return ray_space
-
 
 def _tabular_ray_trial_fn(
     config: dict,
@@ -570,9 +488,10 @@ def _tabular_ray_trial_fn(
     from multimodalva.tabular.train import train as _train
     from multimodalva.tabular.predict import predict as _predict
     from multimodalva.utils.metrics import score_predictions, log_loss_from_full
+    from multimodalva.utils.ray_compat import get_ray_trial_dir
 
     # ----- Trial artifact directory (Ray Tune API compatibility shim) -----
-    trial_dir = _get_ray_trial_dir()
+    trial_dir = get_ray_trial_dir()
     _trial_logger.info("Resolved Ray trial artifact directory: %s", trial_dir)
     trial_dir.mkdir(parents=True, exist_ok=True)
 
@@ -590,7 +509,7 @@ def _tabular_ray_trial_fn(
                 raise ValueError("cv_splits mode requires X_train and y_train.")
 
             fold_scores: dict[str, list[float]] = {
-                m: [] for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                m: [] for m in CV_METRICS
             }
             fold_log_losses: list[float] = []
             for fold_idx, (cv_train_idx, cv_val_idx) in enumerate(cv_splits):
@@ -612,7 +531,7 @@ def _tabular_ray_trial_fn(
                     use_gpu=use_gpu,
                 )
                 fold_result = _predict(fold_dir, X_fold_val, y_fold_val)
-                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"):
+                for m in CV_METRICS:
                     fold_scores[m].append(score_predictions(fold_result.top1, m))
                 fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
 
@@ -637,7 +556,7 @@ def _tabular_ray_trial_fn(
             result = _predict(trial_dir, X_opt_val, y_opt_val)
             all_scores = {
                 m: score_predictions(result.top1, m)
-                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                for m in CV_METRICS
             }
             all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
     except Exception:
@@ -798,7 +717,7 @@ def optimize_ray(
         ValueError:  If model_name is not in SUPPORTED_MODELS.
         ImportError: If ``ray[tune]`` is not installed.
     """
-    _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
+    _VALID_METRICS = HPO_METRICS
     if metric not in _VALID_METRICS:
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
@@ -885,7 +804,7 @@ def optimize_ray(
     )
     if search_space:
         active_space.update(search_space)
-    ray_space = _to_ray_space(active_space)
+    ray_space = to_ray_space(active_space)
     logger.info(
         "Tabular HPO adaptive search space: profile=%s, class_tier=%s "
         "(n_samples=%d, n_features=%d, n_classes=%d).",

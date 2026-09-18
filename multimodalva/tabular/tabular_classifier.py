@@ -14,7 +14,7 @@ import pandas as pd
 
 from ..utils.split import split
 from ..utils.types import PredictionResult
-from .dataset import prepare_dataset
+from .dataset import prepare_dataset, valid_label_mask
 from .predict import predict
 from .train import train
 
@@ -80,6 +80,7 @@ class TabularClassifier:
         test_size: float = 0.2,
         random_state: int = 42,
         stratify: bool = True,
+        split_col: str | None = None,
         cat_cols: list[str] | None = None,
         num_cols: list[str] | None = None,
         drop_missing_label: bool = True,
@@ -96,6 +97,7 @@ class TabularClassifier:
         n_jobs: int = -1,
         use_gpu: bool | None = None,
         search_space_profile: str = "auto",
+        id_col: str | None = None,
     ) -> dict:
         """Run the full tabular classification pipeline.
 
@@ -112,6 +114,10 @@ class TabularClassifier:
             df:               Input DataFrame.
             feature_cols:     Columns to use as features.
             label_col:        Name of the label column.
+            id_col:           Optional column holding a row identifier. When
+                              given, the identifiers appear as a leading ``id``
+                              column in the prediction tables, so results can be
+                              joined back to the source records.
             test_size:        Fraction held out for testing. Default 0.2.
             random_state:     Random seed. Default 42.
             stratify:         Stratified split. Default True.
@@ -151,6 +157,7 @@ class TabularClassifier:
             test_size=test_size,
             random_state=random_state,
             stratify=stratify,
+            split_col=split_col,
         )
         logger.info("Split: %d train, %d test.", len(self.train_df), len(self.test_df))
 
@@ -216,12 +223,24 @@ class TabularClassifier:
         )
 
         # --- Step 5: predict on test set ---
+        # Identifiers for the rows that survive prepare_dataset()'s label drop,
+        # so they line up with the scored rows.
+        test_ids = None
+        if id_col is not None:
+            if id_col not in self.test_df.columns:
+                raise ValueError(f"id_col {id_col!r} not found in the DataFrame.")
+            kept = self.test_df
+            if drop_missing_label:
+                kept = kept[valid_label_mask(kept, label_col)]
+            test_ids = kept[id_col].tolist()
+
         self.predictions = predict(
             output_dir=self.output_dir / "final",
             X_test=self.X_test,
             y_test=self.y_test,
             top_k=top_k,
             save_dir=self.output_dir / "predictions",
+            ids=test_ids,
         )
 
         return {

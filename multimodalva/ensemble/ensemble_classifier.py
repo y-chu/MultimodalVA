@@ -143,7 +143,7 @@ class EnsembleClassifier:
 
                         feature_fusion:
                             preset (str)  — AutoMM quality preset; default "best_quality"
-                            fusion_strategy (str) — "attention" recommended; default "default"
+                            fusion_strategy (str) — "default" | "concat" | "attention" | "attention_ft" | "text_only" | "tabular_only"; default "default"
 
                         soft_voting:
                             text_models    (list[dict])  — required

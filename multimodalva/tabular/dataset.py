@@ -84,6 +84,15 @@ def _build_preprocessor(
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
 
+def valid_label_mask(df: pd.DataFrame, label_col: str) -> pd.Series:
+    """Rows whose label is usable — not missing and not an empty string.
+
+    Exposed so callers can select the same rows this module keeps, for example
+    to line up row identifiers with the prediction tables.
+    """
+    return ~(df[label_col].isna() | (df[label_col].astype(str).str.strip() == ""))
+
+
 def prepare_dataset(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -156,17 +165,13 @@ def prepare_dataset(
     # Optionally drop rows with missing or empty labels
     if drop_missing_label:
         for df_name, df in [("train_df", train_df), ("test_df", test_df)]:
-            bad = df[label_col].isna() | (df[label_col].astype(str).str.strip() == "")
+            bad = ~valid_label_mask(df, label_col)
             if bad.any():
                 logger.warning(
                     "Dropping %d rows with missing label in %s.", bad.sum(), df_name
                 )
-        train_df = train_df[
-            ~(train_df[label_col].isna() | (train_df[label_col].astype(str).str.strip() == ""))
-        ].reset_index(drop=True)
-        test_df = test_df[
-            ~(test_df[label_col].isna() | (test_df[label_col].astype(str).str.strip() == ""))
-        ].reset_index(drop=True)
+        train_df = train_df[valid_label_mask(train_df, label_col)].reset_index(drop=True)
+        test_df = test_df[valid_label_mask(test_df, label_col)].reset_index(drop=True)
 
     # Auto-detect column types from train_df feature subset
     feat_train = train_df[feature_cols]

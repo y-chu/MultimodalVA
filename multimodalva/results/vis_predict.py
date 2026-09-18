@@ -53,7 +53,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from ..utils.metrics import log_loss_from_full
+from ..utils.metrics import log_loss_from_full, REPORT_METRICS
 from .palettes import _TOPK_BAR_COLORS, HEATMAP_SEQ, HEATMAP_DIV, HEATMAP_CLINICAL
 
 logger = logging.getLogger(__name__)
@@ -90,13 +90,7 @@ def _make_metric_registry() -> dict:
     }
 
 
-_DEFAULT_METRICS = [
-    "accuracy", "balanced_accuracy",
-    "f1_macro", "f1_weighted",
-    "precision_macro", "precision_weighted",
-    "recall_macro", "recall_weighted",
-    "csmf_accuracy", "cccsmf_accuracy",
-]
+_DEFAULT_METRICS = list(REPORT_METRICS)
 
 
 # ---------------------------------------------------------------------------

@@ -13,57 +13,36 @@ DataFrame
   → MultiModalPredictor.predict_proba() — probability predictions
   → _assemble_prediction_result()  — same PredictionResult as text/tabular
 
-Fusion strategies
------------------
-AutoMM supports several fusion architectures, selected via ``fusion_strategy``:
+Fusion strategies (``fusion_strategy``)
+---------------------------------------
+    "default"       AutoMM preset picks the roster.  With preset="best_quality"
+                    it selected ft_transformer + fusion_mlp here — MLP fusion,
+                    no cross-modal attention.
+    "concat"        hf_text + numerical_mlp + categorical_mlp + fusion_mlp.
+    "attention"     hf_text + numerical_mlp + categorical_mlp +
+                    fusion_transformer — self-attention over the joint
+                    text-CLS + tabular token sequence.
+    "attention_ft"  hf_text + ft_transformer + fusion_transformer — 2x2 cell
+                    complement to "attention" and "default".
+    "text_only"     hf_text only (ablation).
+    "tabular_only"  numerical_mlp + categorical_mlp + fusion_mlp (ablation).
 
-``"default"``
-    Let the AutoMM preset choose.  ``"best_quality"`` uses a Fusion Transformer
-    (cross-modal attention); ``"medium_quality"`` uses a fusion MLP.
-    Recommended when you do not have a reason to override.
-
-``"concat"``
-    MLP fusion (``fusion_mlp``): concatenate text CLS embedding + tabular
-    embeddings, then pass through an MLP classifier.  Fastest option;
-    reliable baseline.  Good when text and tabular carry mostly independent
-    information.
-
-``"attention"``
-    Transformer fusion (``fusion_transformer``): treat text CLS token and
-    tabular embeddings as a joint token sequence and apply self-attention.
-    Allows each modality to attend to the other — recommended for VA data
-    where symptom indicators in the narrative interact with tabular covariates
-    (e.g. "fever" in text + malaria-endemic region indicator).
-
-``"text_only"``
-    Ablation: ignore tabular features, use text backbone only.
-
-``"tabular_only"``
-    Ablation: ignore narrative text, use tabular MLP only.
-
-Additional strategies for future extension
-------------------------------------------
-The following are not natively supported by AutoMM's ``model.names`` API but
-can be implemented with custom model code or by combining strategies:
-
-- **Gated multimodal fusion** (Arevalo et al., 2017): learns a per-sample
-  soft gate that weights the contribution of text vs. tabular.  Useful for
-  VA data where narrative quality varies (some are one-sentence summaries,
-  others are detailed clinical accounts).
-
-- **Cross-attention** (full cross-modal): text tokens attend *to* tabular
-  embedding and vice versa, rather than self-attention over the joint
-  sequence.  More expressive but requires a custom fusion module.
-
-- **Additive / weighted sum**: L2-normalise each modality embedding then add.
-  Surprisingly competitive on small datasets (< 2 000 samples) where complex
-  fusion overfits.
+AutoMM drops branches for data types not present, so the fitted roster in
+automm_model/config.yaml can be shorter than listed above.
 
 Text backbone
 -------------
-``model_name`` accepts any shorthand from the text pipeline's SUPPORTED_MODELS
-(e.g. ``"bioclinicalbert"``, ``"biobert"``, ``"longformer"``) or any full
-HuggingFace Hub ID (e.g. ``"emilyalsentzer/Bio_ClinicalBERT"``).
+``model_name`` is resolved by :func:`multimodalva.text.models.resolve_model_name`,
+the same resolver used by the text pipeline: a package alias
+(e.g. ``"bioclinicalbert"``, ``"biomedroberta"``), a remote key
+(``"roberta-pm"``), a Hugging Face Hub ID, or a local model directory.
+BioMed-RoBERTa (``"biomedroberta"``) and RoBERTa-PM (``"roberta-pm"``) are
+different models; see :mod:`multimodalva.text.models`.
+
+If ``hyperparameters`` passed to :meth:`FeatureFusionClassifier.run` contains
+``"model.hf_text.checkpoint_name"``, that checkpoint is used instead of
+``model_name``. The checkpoint actually used is written to
+``training_metadata.json`` as ``checkpoint_name``.
 
 Saving and reloading
 --------------------
@@ -100,7 +79,7 @@ import pandas as pd
 
 from ..utils.split import split
 from ..utils.types import PredictionResult
-from ..text.train import REMOTE_MODELS, SUPPORTED_MODELS as TEXT_BACKBONE_MODELS, download_model
+from ..text.models import SUPPORTED_MODELS as TEXT_BACKBONE_MODELS, resolve_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -153,12 +132,14 @@ def _patch_automm_gpu_logging() -> None:
 #: Maps strategy name → ``model.names`` list passed to AutoMM.
 #: ``None`` means "let the preset decide" (recommended default).
 FUSION_STRATEGIES: dict[str, list[str] | None] = {
-    # AutoMM preset decides; best_quality → fusion_transformer.
+    # AutoMM preset decides the roster; best_quality picked fusion_mlp here.
     "default":      None,
     # MLP over concatenated text CLS + tabular embeddings.
     "concat":       ["hf_text", "numerical_mlp", "categorical_mlp", "fusion_mlp"],
     # Self-attention over the joint modality token sequence.
     "attention":    ["hf_text", "numerical_mlp", "categorical_mlp", "fusion_transformer"],
+    # ft_transformer tabular encoder + fusion_transformer — 2x2 cell complement to "attention" and "default".
+    "attention_ft": ["hf_text", "ft_transformer", "fusion_transformer"],
     # Ablation — text only (tabular features ignored).
     "text_only":    ["hf_text"],
     # Ablation — tabular only (narrative ignored).
@@ -187,27 +168,12 @@ DEFAULT_HPO_SPACE: dict = {
 # ---------------------------------------------------------------------------
 
 def _resolve_checkpoint(model_name: str, cache_dir: str | Path | None = None) -> str:
-    """Return a resolved checkpoint path or HuggingFace model ID for ``model_name``.
+    """Return a loadable Hugging Face model ID or local path for ``model_name``.
 
-    Accepts:
-    - A shorthand key from TEXT_BACKBONE_MODELS (e.g. ``"bioclinicalbert"``)
-    - A shorthand key from REMOTE_MODELS that must be downloaded first
-      (e.g. ``"roberta-pm"``)
-    - Any full HuggingFace Hub ID  (e.g. ``"emilyalsentzer/Bio_ClinicalBERT"``)
-    - A local path to a saved model directory
-
-    Unknown values are passed through unchanged.
+    Thin wrapper around :func:`multimodalva.text.models.resolve_model_name`, so
+    feature fusion and the text pipeline interpret model names identically.
     """
-    if model_name in TEXT_BACKBONE_MODELS:
-        return TEXT_BACKBONE_MODELS[model_name]
-
-    # Allow both "roberta-pm" and "roberta_pm" style keys in Analysis scripts.
-    remote_key = model_name if model_name in REMOTE_MODELS else model_name.replace("_", "-")
-    if remote_key in REMOTE_MODELS:
-        resolved_cache_dir = Path(cache_dir) if cache_dir is not None else None
-        return download_model(remote_key, cache_dir=resolved_cache_dir)
-
-    return model_name
+    return resolve_model_name(model_name, cache_dir=cache_dir)
 
 
 def _build_automm_hyperparameters(
@@ -386,17 +352,20 @@ def _ensure_nltk_deps() -> None:
         return  # nltk not installed; AutoMM will surface its own error if needed
 
     # Map dataset name → nltk.data.find() path prefix.
-    # punkt lives under tokenizers/; newer NLTK (3.9+) uses punkt_tab.
     _needed = {
-        "wordnet":    "corpora/wordnet",
-        "omw-1.4":   "corpora/omw-1.4",
-        "punkt":      "tokenizers/punkt",
-        "punkt_tab":  "tokenizers/punkt_tab",
+        "wordnet":  "corpora/wordnet",
+        "omw-1.4":  "corpora/omw-1.4",
+        "punkt":    "tokenizers/punkt",
     }
+    # punkt_tab exists only in NLTK >= 3.9; older find() mangles the path and
+    # raises OSError instead of LookupError.
+    _ver = tuple(int(x) for x in nltk.__version__.split(".")[:2] if x.isdigit())
+    if _ver >= (3, 9):
+        _needed["punkt_tab"] = "tokenizers/punkt_tab"
     for name, find_path in _needed.items():
         try:
             nltk.data.find(find_path)
-        except LookupError:
+        except (LookupError, OSError):
             logger.info("Downloading NLTK data: %s", name)
             nltk.download(name, quiet=True)
 
@@ -453,18 +422,20 @@ class FeatureFusionClassifier:
 
     Fusion strategy guide for VA data
     ----------------------------------
-    ``"attention"`` (recommended)
-        Fusion Transformer applies self-attention over the joint sequence of
-        the text CLS token + tabular embeddings.  Captures cross-modal
-        interactions, e.g. "had fever" in narrative ↔ age + season tabular.
+    ``"attention"``
+        fusion_transformer: self-attention over the joint sequence of the
+        text CLS token + tabular embeddings.
 
     ``"concat"``
-        MLP over concatenated embeddings.  Faster to train; good baseline
-        when narrative and tabular indicators carry independent signals.
+        fusion_mlp over concatenated embeddings.  Faster to train.
 
     ``"default"``
-        AutoMM preset decides.  With ``"best_quality"`` this is equivalent to
-        ``"attention"``.  Use when you do not need explicit control.
+        AutoMM preset decides.  ``"best_quality"`` picked ft_transformer +
+        fusion_mlp here — not the same as ``"attention"``.
+
+    ``"attention_ft"``
+        ft_transformer tabular encoder + fusion_transformer — 2x2 cell
+        complement to ``"attention"`` and ``"default"``.
 
     ``"text_only"`` / ``"tabular_only"``
         Ablation: disable one modality to isolate its contribution.
@@ -479,12 +450,16 @@ class FeatureFusionClassifier:
     ``"bluebert"``        bionlp/bluebert_pubmed_mimic_uncased_...
     ``"biomedbert"``      microsoft/BiomedNLP-BiomedBERT-base-...
     ``"clinicalbert"``    medicalai/ClinicalBERT
-    ``"biomedroberta"``   allenai/biomed_roberta_base
+    ``"biomedroberta"``   allenai/biomed_roberta_base (BioMed-RoBERTa)
+    ``"roberta-pm"``      RoBERTa-base-PM-M3-Voc-distill-hf (RoBERTa-PM;
+                          downloaded, not on the Hub)
     ``"bioelectra"``      kamalkraj/bioelectra-base-discriminator-pubmed
     ``"longformer"``      allenai/longformer-base-4096
     ``"bigbird"``         google/bigbird-roberta-base
 
-    Or pass any full HuggingFace Hub ID or local path directly.
+    BioMed-RoBERTa and RoBERTa-PM are different models with different
+    vocabularies; see :mod:`multimodalva.text.models`.  Any full Hugging Face
+    Hub ID or local model directory can also be passed directly.
 
     Attributes (populated after run())
     -----------------------------------
@@ -511,12 +486,16 @@ class FeatureFusionClassifier:
         Args:
             output_dir:       Root directory for AutoMM checkpoints and outputs.
                               Model saved to ``output_dir/automm_model/``.
-            model_name:       Text backbone shorthand or full HuggingFace Hub ID.
+            model_name:       Text backbone: package alias, remote key, Hugging
+                              Face Hub ID, or local model directory.
                               Default ``"bioclinicalbert"``
-                              (emilyalsentzer/Bio_ClinicalBERT).
+                              (emilyalsentzer/Bio_ClinicalBERT).  Ignored when
+                              ``run(hyperparameters=...)`` sets
+                              ``"model.hf_text.checkpoint_name"``.
             fusion_strategy:  Cross-modal fusion architecture.  One of:
                               ``"default"``, ``"concat"``, ``"attention"``,
-                              ``"text_only"``, ``"tabular_only"``.
+                              ``"attention_ft"``, ``"text_only"``,
+                              ``"tabular_only"``.
                               Default ``"default"`` (preset decides).
             preset:           AutoMM quality preset:
                               ``"medium_quality"`` — fastest;
@@ -560,7 +539,9 @@ class FeatureFusionClassifier:
         # --- split ---
         test_size: float = 0.2,
         random_state: int = 42,
+        automm_seed: int | None = None,
         stratify: bool = True,
+        split_col: str | None = None,
         # --- AutoMM training ---
         time_limit: int = 3600,
         hyperparameters: dict | None = None,
@@ -595,14 +576,18 @@ class FeatureFusionClassifier:
                              object/str → text or categorical, numeric → numerical.
             label_col:       Column containing cause-of-death labels.
             test_size:       Fraction held out for testing.  Default 0.2.
-            random_state:    Random seed.  Default 42.
+            random_state:    Split seed.  Default 42.
+            automm_seed:     AutoMM trainer seed passed to fit(); None uses
+                             AutoMM's default (0). Varies training only.
             stratify:        Stratified split.  Default True.
             time_limit:      Training time budget in seconds.  Default 3 600
                              (1 hour).  Increase to 3–6 hours for
                              ``"best_quality"`` or large datasets.
             hyperparameters: AutoMM hyperparameters merged over the resolved
                              backbone + fusion settings.  Scalar values only
-                             (fixed training run).  Examples::
+                             (fixed training run).  A
+                             ``"model.hf_text.checkpoint_name"`` entry replaces
+                             the backbone given by ``model_name``.  Examples::
 
                                  # Longer context for verbose narratives
                                  {"model.hf_text.max_text_len": 512}
@@ -671,6 +656,7 @@ class FeatureFusionClassifier:
             test_size=test_size,
             random_state=random_state,
             stratify=stratify,
+            split_col=split_col,
         )
         logger.info(
             "Split: %d train / %d test samples.",
@@ -700,10 +686,20 @@ class FeatureFusionClassifier:
         input_test  = self.test_df[ordered_cols + [label_col]].copy()
 
         # --- Step 4: build AutoMM hyperparameters ------------------------
-        checkpoint_name = _resolve_checkpoint(
-            self.model_name,
-            cache_dir=self.output_dir / ".model_cache" / str(self.model_name),
-        )
+        # An explicit model.hf_text.checkpoint_name takes precedence over
+        # model_name, and model_name is then not resolved (nor downloaded).
+        explicit_checkpoint = (hyperparameters or {}).get("model.hf_text.checkpoint_name")
+        if explicit_checkpoint:
+            checkpoint_name = resolve_model_name(str(explicit_checkpoint))
+            if checkpoint_name != explicit_checkpoint:
+                hyperparameters = {**hyperparameters, "model.hf_text.checkpoint_name": checkpoint_name}
+            logger.info(
+                "Using hyperparameters['model.hf_text.checkpoint_name']=%s as the "
+                "text backbone (model_name=%r is not used).",
+                checkpoint_name, self.model_name,
+            )
+        else:
+            checkpoint_name = _resolve_checkpoint(self.model_name)
         automm_hp = _build_automm_hyperparameters(
             checkpoint_name, self.fusion_strategy, hyperparameters
         )
@@ -858,6 +854,7 @@ class FeatureFusionClassifier:
                     hyperparameters=automm_hp,
                     presets=self.preset,
                     time_limit=time_limit,
+                    **({"seed": automm_seed} if automm_seed is not None else {}),
                 )
                 self.best_hpo_config = None
         elif metadata_path.exists():

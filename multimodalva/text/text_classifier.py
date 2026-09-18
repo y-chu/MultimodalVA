@@ -19,39 +19,12 @@ import pandas as pd
 # from .hpo import optimize
 
 from multimodalva.utils.split import split
-from multimodalva.utils.runtime import RuntimeTracker
+from multimodalva.utils.runtime import RuntimeTracker, distributed_state, resolve_seed
 from multimodalva.text.dataset import prepare_dataset
 from multimodalva.text.train import train
 from multimodalva.text.predict import predict, PredictionResult
 
 logger = logging.getLogger(__name__)
-
-
-def _distributed_state() -> tuple[int, int]:
-    """Return (rank, world_size) from env vars used by torchrun."""
-    try:
-        rank = int(os.environ.get("RANK", "0"))
-    except ValueError:
-        rank = 0
-    try:
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    except ValueError:
-        world_size = 1
-    return rank, max(1, world_size)
-
-
-def _resolve_seed(random_state: int, set_seed: int | None) -> int:
-    """Resolve an effective seed value, with `set_seed` taking precedence."""
-    if set_seed is None:
-        return int(random_state)
-    resolved = int(set_seed)
-    if resolved != int(random_state):
-        logger.info(
-            "set_seed=%d provided; overriding random_state=%d.",
-            resolved,
-            random_state,
-        )
-    return resolved
 
 
 class TextClassifier:
@@ -105,6 +78,7 @@ class TextClassifier:
         random_state: int = 42,
         set_seed: int | None = None,
         stratify: bool = True,
+        split_col: str | None = None,
         max_length: int = 512,
         hyperparams: dict | None = None,
         use_optimize: bool = False,
@@ -120,6 +94,7 @@ class TextClassifier:
         resume_hpo: bool = True,
         resume_training: bool = True,
         use_fast: bool = True,
+        id_col: str | None = None,
         use_cv: bool = True,
         n_cv_folds: int = 3,
         use_compile: bool = False,
@@ -153,6 +128,9 @@ class TextClassifier:
             label_col: Name of the label column.
             test_size: Fraction of data held out for testing. Default 0.2.
             random_state: Random seed for splitting and HPO. Default 42.
+            id_col: Optional column holding a row identifier. When given, the
+                identifiers appear as a leading ``id`` column in the prediction
+                tables, so results can be joined back to the source records.
             set_seed: Optional alias for a single run-level seed. When provided,
                       overrides ``random_state`` so one value controls split, HPO,
                       and training seeds end-to-end.
@@ -226,7 +204,7 @@ class TextClassifier:
             },
             logger_=logger,
         )
-        effective_seed = _resolve_seed(random_state=random_state, set_seed=set_seed)
+        effective_seed = resolve_seed(random_state=random_state, set_seed=set_seed)
         # --- Step 1: split ---
         with runtime_tracker.stage(
             "split",
@@ -244,6 +222,7 @@ class TextClassifier:
                 test_size=test_size,
                 random_state=effective_seed,
                 stratify=stratify,
+                split_col=split_col,
             )
             logger.info(
                 "Split: %d train, %d test samples.",
@@ -264,6 +243,7 @@ class TextClassifier:
                     model_name=self.model_name,
                     max_length=max_length,
                     use_fast=use_fast,
+                    id_col=id_col,
                 )
             )
             logger.info("Prepared datasets: %d classes.", len(self.label2id))
@@ -325,7 +305,7 @@ class TextClassifier:
                 use_compile=use_compile,  # NOT forwarded to HPO — compile overhead per trial is counterproductive
             )
 
-        rank, world_size = _distributed_state()
+        rank, world_size = distributed_state()
         if world_size > 1 and rank != 0:
             logger.info(
                 "Skipping predict() on non-zero rank %d/%d in DDP run.",
@@ -391,7 +371,7 @@ class TextClassifier:
         """
         if not push:
             return None
-        rank, _ = _distributed_state()
+        rank, _ = distributed_state()
         if rank != 0:
             return None
         if not hub_repo_id:
@@ -403,13 +383,12 @@ class TextClassifier:
 
         metrics = None
         if self.predictions is not None:
-            from multimodalva.utils.metrics import score_predictions  # noqa: PLC0415
+            from multimodalva.utils.metrics import score_predictions, CV_METRICS  # noqa: PLC0415
 
             top1 = self.predictions.top1
             metrics = {
                 m: float(score_predictions(top1, m))
-                for m in ("accuracy", "balanced_accuracy", "f1_macro",
-                          "f1_weighted", "csmf_accuracy")
+                for m in CV_METRICS
             }
         return _push(
             self.output_dir / "final",
@@ -472,7 +451,7 @@ class TextClassifier:
             },
             logger_=logger,
         )
-        effective_seed = _resolve_seed(random_state=random_state, set_seed=set_seed)
+        effective_seed = resolve_seed(random_state=random_state, set_seed=set_seed)
 
         # --- Step 3: optional HPO ---
         if use_optimize:
@@ -529,7 +508,7 @@ class TextClassifier:
                 use_compile=use_compile,  # NOT forwarded to HPO — compile overhead per trial is counterproductive
             )
 
-        rank, world_size = _distributed_state()
+        rank, world_size = distributed_state()
         if world_size > 1 and rank != 0:
             logger.info(
                 "Skipping predict() on non-zero rank %d/%d in DDP run.",

@@ -17,4 +17,9 @@ __version__ = "0.1.0"
 # Lightweight (pandas/numpy only) — importing this does not pull the transformer stack.
 from .datasets import data, list_datasets  # noqa: E402
 
-__all__ = ["data", "list_datasets"]
+# One-call, config-driven entry point for every pipeline. Heavy dependencies
+# (torch/transformers/autogluon) are imported lazily inside run(), so importing
+# this name does not pull the transformer stack.
+from .runner import run, SUPPORTED_TASKS  # noqa: E402
+
+__all__ = ["data", "list_datasets", "run", "SUPPORTED_TASKS"]

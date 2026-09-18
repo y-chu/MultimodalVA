@@ -6,13 +6,12 @@ Quick look (R-style ``data()``):
     from multimodalva import data, list_datasets
 
     list_datasets()              # {name: description}
-    df = data("va_sample")       # InterVA i-code-style InterVA i-code sample
+    df = data("va_sample")       # InterVA i-code sample
     df = data("va_who2016")      # WHO 2016 ODK Id10xxx sample
     df = data("va_sample", n_per_class=10, seed=0)   # kwargs forwarded to the generator
 
 All data is fully SYNTHETIC (narratives generated from original templates; symptom
 responses drawn from cause-conditioned probabilities). No real records are reproduced.
-Cause labels are broad cause grouping-level.
 
 | name                  | tabular coding              | pairs with                          |
 |-----------------------|-----------------------------|-------------------------------------|
@@ -102,13 +101,12 @@ def make_demo_va_df(n_samples: int = 120, seed: int = 7) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# InterVA i-code-style synthetic sample (InterVA "i"-code variables)
+# Synthetic sample using InterVA "i"-code variables
 # ---------------------------------------------------------------------------
-# Tabular columns use the InterVA "i"-code indicators with "y"/"n" values, as in
-# the the source datasets, and pair with the default multimodalva/utils/
-# qdesc.csv (auto-loaded by data fusion). Demographics are binary i-codes
-# (i019a/i019b sex; i022x age band), so the package's prefix + demographics
-# rendering works fully. Cause labels are broad cause grouping-level. Fully synthetic.
+# Tabular columns are InterVA "i"-code indicators with "y"/"n" values, pairing
+# with the default multimodalva/utils/qdesc.csv (auto-loaded by data fusion).
+# Demographics are binary i-codes (i019a/i019b sex; i022x age band), so the
+# package's prefix + demographics rendering works fully. Fully synthetic.
 
 # Binary demographics i-codes (one sex + one age band set to "y" per row).
 _ISAMPLE_DEMO = ["i019a", "i019b", "i022a", "i022b", "i022c", "i022d", "i022e", "i022g"]
@@ -125,8 +123,8 @@ _ISAMPLE_CLIN = [
 ]
 ISAMPLE_COLS = _ISAMPLE_DEMO + _ISAMPLE_CLIN  # full tabular feature set
 
-# broad cause grouping cause -> (age_group, P(female), characteristic positive i-codes,
-# narrative clause pool). Same style as make_who2016_va_df but i-coded.
+# cause -> (age_group, P(female), characteristic positive i-codes, narrative
+# clause pool). Same style as make_who2016_va_df but i-coded.
 _ISAMPLE_PROFILES: dict[str, dict] = {
     "HIV/AIDS": dict(age="adult", pf=0.5,
         pos=["i243o", "i153o", "i152o", "i181o", "i245o", "i127o", "i268o"],
@@ -189,14 +187,14 @@ def _isample_age_band(age_group: str, rng: np.random.Generator) -> tuple[str, in
 
 
 def make_sample_va_df(n_per_class: int = 4, seed: int = 11) -> pd.DataFrame:
-    """Class-balanced synthetic VA sample in InterVA i-code style for smoke tests.
+    """Class-balanced synthetic sample, useful for smoke tests.
 
     Tabular columns are InterVA **"i"-code** indicators (``i019a``, ``i147o`` …)
-    with ``"y"``/``"n"`` values, matching the InterVA i-code datasets and the default
+    with ``"y"``/``"n"`` values, pairing with the default
     ``multimodalva/utils/qdesc.csv`` (auto-loaded by data fusion). Guarantees
     exactly ``n_per_class`` rows per cause so even a tiny sample stratifies.
 
-    Columns: ``id``, ``cause_of_death`` (broad cause grouping), ``narrative``, then i-code
+    Columns: ``id``, ``cause_of_death``, ``narrative``, then i-code
     demographics (``i019a/b`` sex, ``i022x`` age band) and clinical indicators.
     Fully synthetic — narratives are generated from original templates.
     """
@@ -247,12 +245,12 @@ def make_sample_va_df(n_per_class: int = 4, seed: int = 11) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# WHO 2016 ODK synthetic generator (modeled on the a study site dataset shape)
+# WHO 2016 ODK synthetic generator
 # ---------------------------------------------------------------------------
 # Tabular columns use WHO 2016 ODK indicator codes (Id10xxx) with "yes"/"no"
-# values, pairing with multimodalva/utils/qdesc_who2016.csv.  Cause labels are
-# broad cause grouping-level.  Everything below is SYNTHETIC — narratives are generated
-# from original templates, not copied from any real dataset.
+# values, pairing with multimodalva/utils/qdesc_who2016.csv.  Everything below
+# is SYNTHETIC — narratives are generated from original templates, not copied
+# from any real dataset.
 
 # Id10xxx symptom/diagnosis/injury/behavior columns emitted by the generator
 # (all present in qdesc_who2016.csv).
@@ -272,7 +270,7 @@ WHO2016_COLS = [
 ]
 
 # Per-cause profile: age group, P(female), characteristic positive indicators
-# (high probability), and narrative clause fragments. broad cause grouping labels.
+# (high probability), and narrative clause fragments.
 _WHO2016_PROFILES: dict[str, dict] = {
     "HIV/AIDS": dict(age="adult", pf=0.5,
         pos=["Id10243", "Id10153", "Id10152", "Id10181", "Id10245", "Id10126", "Id10268", "Id10149"],
@@ -343,12 +341,11 @@ _SUBJECT = {"male": "He", "female": "She"}
 
 
 def make_who2016_va_df(n_samples: int = 400, seed: int = 2016) -> pd.DataFrame:
-    """Synthetic WHO 2016 ODK verbal-autopsy dataset (broad cause grouping labels).
+    """Synthetic WHO 2016 ODK verbal-autopsy dataset.
 
-    Modeled on the *shape* of the a study site dataset (cause mix, demographics, narrative
-    style) but fully synthetic: narratives are generated from original templates
-    and symptom responses are randomly drawn from cause-conditioned probabilities.
-    No real records are reproduced.
+    Fully synthetic: narratives are generated from original templates and symptom
+    responses are randomly drawn from cause-conditioned probabilities. No real
+    records are reproduced.
 
     Columns: ``id``, ``cause_of_death``, ``narrative``, ``sex``, ``age_group``,
     then WHO 2016 ODK indicator columns (``Id10xxx``) with ``"yes"``/``"no"``
@@ -356,7 +353,7 @@ def make_who2016_va_df(n_samples: int = 400, seed: int = 2016) -> pd.DataFrame:
     """
     rng = np.random.default_rng(seed)
     causes = list(_WHO2016_PROFILES)
-    # a study site-like skew toward HIV/AIDS, TB, cardiac, stroke; lighter tail otherwise.
+    # Skewed toward HIV/AIDS, TB, cardiac and stroke; lighter tail otherwise.
     weights = np.array([
         0.20, 0.10, 0.10, 0.07, 0.07, 0.07, 0.05, 0.05, 0.04,
         0.05, 0.05, 0.03, 0.03, 0.02, 0.02,
@@ -410,7 +407,7 @@ def make_who2016_va_df(n_samples: int = 400, seed: int = 2016) -> pd.DataFrame:
 _DATASETS: dict[str, tuple] = {
     "va_sample": (
         make_sample_va_df,
-        "InterVA i-code-style: InterVA i-code indicators (y/n) + broad cause grouping labels; "
+        "InterVA i-code indicators (y/n) + cause labels; "
         "pairs with utils/qdesc.csv. kwargs: n_per_class, seed.",
     ),
     "va_sample_text_only": (
@@ -419,7 +416,7 @@ _DATASETS: dict[str, tuple] = {
     ),
     "va_who2016": (
         make_who2016_va_df,
-        "WHO 2016 ODK Id10xxx indicators (yes/no) + sex/age_group + broad cause grouping labels; "
+        "WHO 2016 ODK Id10xxx indicators (yes/no) + sex/age_group + cause labels; "
         "pairs with utils/qdesc_who2016.csv. kwargs: n_samples, seed.",
     ),
     "va_demo": (

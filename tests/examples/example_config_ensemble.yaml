@@ -1,0 +1,39 @@
+# Declarative YAML config — ensemble (stacking).
+# Run with:  multimodalva run tests/examples/example_config_ensemble.yaml
+#
+# YAML is the natural home for the voting/stacking base-model spec lists, which
+# are lists of dicts and awkward to pass on the command line.
+
+task: stacking                        # data_fusion | feature_fusion | voting | stacking
+data: demo                            # "demo" = built-in synthetic data; or give a CSV/Parquet path
+label: cause_of_death
+text_col: narrative
+features: "re:^i\\d{3}[a-zA-Z]$"
+output_dir: runs/yaml/stacking
+
+# Base models to stack (each dict is a per-model spec):
+text_models:
+  - model_name: bluebert
+    max_length: 512
+tabular_models:
+  - model_name: lightgbm
+  - model_name: random_forest
+
+# Constructor-only extras go under init_kwargs:
+init_kwargs:
+  n_folds: 5
+  meta_learners:
+    - model_name: logistic_regression
+
+top_k: 3
+
+# --- data_fusion variant (single long-context model, no spec lists) ---
+# task: data_fusion
+# model: clinicalbigbird
+# optimize: false
+#
+# --- feature_fusion variant (AutoGluon AutoMM) ---
+# task: feature_fusion
+# model: bioclinicalbert
+# init_kwargs: {fusion_strategy: attention, preset: medium_quality}
+# time_limit: 600

@@ -37,6 +37,32 @@ from multimodalva.text.train import _auto_num_workers, _get_dataset_labels, _int
 logger = logging.getLogger(__name__)
 
 
+def _get_dataset_ids(dataset) -> list | None:
+    """Row identifiers carried by a dataset, if it has any."""
+    if getattr(dataset, "ids", None) is not None:
+        return list(dataset.ids)
+    inner = getattr(dataset, "dataset", None)
+    indices = getattr(dataset, "indices", None)
+    if inner is not None and indices is not None:
+        inner_ids = getattr(inner, "ids", None)
+        if inner_ids is not None:
+            return [inner_ids[int(i)] for i in indices]
+    return None
+
+
+def _with_ids(frame: "pd.DataFrame", ids: list | None) -> "pd.DataFrame":
+    """Put an ``id`` column first, when identifiers are available."""
+    if ids is None:
+        return frame
+    if len(ids) != len(frame):
+        raise ValueError(
+            f"Got {len(ids)} ids for {len(frame)} predicted rows. Identifiers "
+            "must come from the same test rows that were scored."
+        )
+    frame.insert(0, "id", list(ids))
+    return frame
+
+
 def predict(
     output_dir: str | Path | None,
     test_dataset: Dataset,
@@ -49,6 +75,7 @@ def predict(
     model: AutoModelForSequenceClassification | None = None,
     tokenizer: AutoTokenizer | None = None,
     id2label: dict | None = None,
+    ids: "list | pd.Series | None" = None,
 ) -> PredictionResult:
     """Load a saved model and predict labels and probabilities on test data.
 
@@ -142,6 +169,8 @@ def predict(
     # Use a TemporaryDirectory when predicting in-memory (the dir is never written to)
     # so it is cleaned up automatically instead of leaking across calls.
     _tmp_dir: tempfile.TemporaryDirectory | None = None
+    row_ids = list(ids) if ids is not None else _get_dataset_ids(test_dataset)
+
     if output_dir is not None:
         args_output_dir = str(output_dir)
     else:
@@ -242,16 +271,16 @@ def predict(
             top1_probs_t, top1_idx_t = torch.topk(probs_tensor, k=1, dim=1)
             top1_idx = top1_idx_t.squeeze(1).numpy()   # shape: (n_samples,)
             top1_probs = top1_probs_t.squeeze(1).numpy()
-            top1_df = pd.DataFrame(
+            top1_df = _with_ids(pd.DataFrame(
                 {
                     "true_label": true_labels,
                     "predicted_label": [id2label[i] for i in top1_idx],
                     "predicted_prob": top1_probs,
                 }
-            )
+            ), row_ids)
 
             prob_cols = {f"prob_{i}": probs[:, i] for i in sorted(id2label)}
-            full_df = pd.DataFrame({"true_label": true_labels, **prob_cols})
+            full_df = _with_ids(pd.DataFrame({"true_label": true_labels, **prob_cols}), row_ids)
 
             k = min(top_k, len(id2label))
             topk_probs_t, topk_idx_t = torch.topk(probs_tensor, k=k, dim=1)
@@ -261,7 +290,7 @@ def predict(
             for rank in range(k):
                 topk_data[f"top{rank + 1}_label"] = [id2label[i] for i in topk_idx[:, rank]]
                 topk_data[f"top{rank + 1}_prob"] = topk_probs[:, rank]
-            topk_df = pd.DataFrame(topk_data)
+            topk_df = _with_ids(pd.DataFrame(topk_data), row_ids)
     else:
         logits = test_predictions.predictions  # shape: (n_samples, n_classes)
 
@@ -282,18 +311,18 @@ def predict(
         top1_probs_t, top1_idx_t = torch.topk(probs_tensor, k=1, dim=1)
         top1_idx = top1_idx_t.squeeze(1).numpy()   # shape: (n_samples,)
         top1_probs = top1_probs_t.squeeze(1).numpy()
-        top1_df = pd.DataFrame(
+        top1_df = _with_ids(pd.DataFrame(
             {
                 "true_label": true_labels,
                 "predicted_label": [id2label[i] for i in top1_idx],
                 "predicted_prob": top1_probs,
             }
-        )
+        ), row_ids)
 
         # --- Output 2: full — probability for every class (columns use integer IDs) ---
         # Integer IDs keep column names short regardless of label length.
         prob_cols = {f"prob_{i}": probs[:, i] for i in sorted(id2label)}
-        full_df = pd.DataFrame({"true_label": true_labels, **prob_cols})
+        full_df = _with_ids(pd.DataFrame({"true_label": true_labels, **prob_cols}), row_ids)
 
         # --- Output 3: topk — top-K classes + probabilities ---
         k = min(top_k, len(id2label))
@@ -304,7 +333,7 @@ def predict(
         for rank in range(k):
             topk_data[f"top{rank + 1}_label"] = [id2label[i] for i in topk_idx[:, rank]]
             topk_data[f"top{rank + 1}_prob"] = topk_probs[:, rank]
-        topk_df = pd.DataFrame(topk_data)
+        topk_df = _with_ids(pd.DataFrame(topk_data), row_ids)
 
     logger.info(
         "Prediction complete: %d samples, %d classes, top-%d output.",

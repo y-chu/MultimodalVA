@@ -23,8 +23,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def _distributed_state() -> tuple[int, int]:
-    """Return the distributed rank/world size from torchrun-style env vars."""
+def distributed_state() -> tuple[int, int]:
+    """Return ``(rank, world_size)`` from the env vars torchrun sets.
+
+    Both default sensibly on a single-process run, so callers can use this to
+    guard rank-0-only work without checking whether they are distributed.
+    """
     try:
         rank = int(os.environ.get("RANK", "0"))
     except ValueError:
@@ -34,6 +38,67 @@ def _distributed_state() -> tuple[int, int]:
     except ValueError:
         world_size = 1
     return rank, max(1, world_size)
+
+
+def resolve_seed(random_state: int, set_seed: int | None) -> int:
+    """Pick the effective seed, letting ``set_seed`` win over ``random_state``.
+
+    ``set_seed`` is the single-value convenience knob on the pipeline wrappers:
+    passing it makes one number drive the split, HPO and training seeds.
+    """
+    if set_seed is None:
+        return int(random_state)
+    resolved = int(set_seed)
+    if resolved != int(random_state):
+        logger.info(
+            "set_seed=%d provided; overriding random_state=%d.",
+            resolved,
+            random_state,
+        )
+    return resolved
+
+
+def is_cuda() -> bool:
+    """True when a CUDA GPU is available."""
+    import torch
+
+    return torch.cuda.is_available()
+
+
+def is_mps() -> bool:
+    """True when Apple Silicon MPS is the accelerator in use.
+
+    CUDA wins when both are somehow present, so this returns False on a CUDA
+    machine even if MPS also reports itself as available.
+    """
+    import torch
+
+    return torch.backends.mps.is_available() and not torch.cuda.is_available()
+
+
+def get_device() -> Any:
+    """Return the best available torch device: CUDA, then MPS, then CPU."""
+    import torch
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def empty_accelerator_cache() -> None:
+    """Release cached GPU or MPS memory.
+
+    Safe to call on any device — the CUDA call is a no-op without a GPU, and the
+    MPS branch only runs on Apple Silicon. Call it between HPO trials, where
+    freed memory is what keeps the next trial from running out.
+    """
+    import torch
+
+    torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def _jsonable(value: Any) -> Any:
@@ -199,7 +264,7 @@ def _capture_nvidia_smi_snapshot(device_index: int | None) -> dict[str, Any]:
 
 def capture_accelerator_snapshot(device: Any = None) -> dict[str, Any]:
     """Capture the current accelerator snapshot for CUDA/MPS/CPU runs."""
-    rank, world_size = _distributed_state()
+    rank, world_size = distributed_state()
     snapshot = {
         "timestamp": _now_iso(),
         "rank": rank,
@@ -229,7 +294,7 @@ def _max(values: list[float]) -> float | None:
 def _ranked_output_path(path: str | Path) -> Path:
     """Apply a rank suffix for multi-process runs to avoid write collisions."""
     out = Path(path)
-    rank, world_size = _distributed_state()
+    rank, world_size = distributed_state()
     if world_size > 1:
         return out.with_name(f"{out.stem}_rank{rank}{out.suffix}")
     return out

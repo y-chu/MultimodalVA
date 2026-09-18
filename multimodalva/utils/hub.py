@@ -31,19 +31,20 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+from .metrics import CV_METRICS
+
 # Metrics summarised on the model card when a top1 predictions CSV is available.
-_CARD_METRICS = [
-    "accuracy",
-    "balanced_accuracy",
-    "f1_macro",
-    "f1_weighted",
-    "csmf_accuracy",
-]
+_CARD_METRICS = list(CV_METRICS)
 
 # Files that should never be pushed — checkpoints, runtime telemetry, HPO logs.
 _IGNORE_PATTERNS = [
     "checkpoint-*/*",
     "checkpoint-*",
+    "optimizer.pt",
+    "scheduler.pt",
+    "trainer_state.json",
+    "training_args.bin",
+    "rng_state.pth",
     "*.log",
     "*_runtime.json",
     "stage_timings.csv",
@@ -133,15 +134,20 @@ def _discover_test_metrics(model_dir: Path) -> dict | None:
     ``run()`` saves the model under ``<root>/final`` and predictions under
     ``<root>/predictions``; for a standalone push of a past run we look there so
     the card carries real held-out test metrics without the caller supplying them.
+    Analysis scripts save ``predictions_top1.csv`` directly in ``<root>/``, so
+    that layout is checked as well.
     """
     import pandas as pd  # noqa: PLC0415
 
     candidates = list((model_dir.parent / "predictions").glob("*_top1.csv"))
+    candidates += list(model_dir.parent.glob("*_top1.csv"))
     candidates += list(model_dir.glob("*_top1.csv"))
     if not candidates:
         return None
     try:
         top1 = pd.read_csv(candidates[0])
+        if "predicted_label" not in top1 and "top1_label" in top1:
+            top1 = top1.rename(columns={"top1_label": "predicted_label"})
         if "true_label" not in top1 or "predicted_label" not in top1:
             return None
         from multimodalva.utils.metrics import score_predictions  # noqa: PLC0415
@@ -155,6 +161,25 @@ def _discover_test_metrics(model_dir: Path) -> dict | None:
 def _metrics_table(metrics: dict) -> str:
     rows = "\n".join(f"| {k} | {v:.4f} |" for k, v in metrics.items())
     return "| Metric | Value |\n|---|---|\n" + rows
+
+
+def _base_model_info(name: str) -> tuple[str | None, str]:
+    """Return ``(hub_id, label)`` for the model a checkpoint was fine-tuned from.
+
+    ``hub_id`` is written to the model card's ``base_model`` field and is
+    ``None`` when the base model is not on the Hugging Face Hub (for example
+    RoBERTa-PM, which is downloaded from its original release, or any local
+    directory). ``label`` is the human-readable name used in the card text.
+    """
+    from multimodalva.text.models import REMOTE_MODELS, SUPPORTED_MODELS
+
+    if name in SUPPORTED_MODELS:
+        return SUPPORTED_MODELS[name], SUPPORTED_MODELS[name]
+    if name in REMOTE_MODELS or "RoBERTa-base-PM-M3-Voc" in name:
+        return None, "RoBERTa-PM (RoBERTa-base-PM-M3-Voc-distill-hf)"
+    if Path(name).expanduser().is_absolute() or Path(name).expanduser().is_dir():
+        return None, Path(name).name
+    return name, name
 
 
 def build_model_card(
@@ -188,6 +213,7 @@ def build_model_card(
     model_dir = Path(model_dir)
     metadata = _load_metadata(model_dir)
     base_model = base_model or metadata.get("model_name", "unknown")
+    base_model_hub_id, base_model_label = _base_model_info(base_model)
     id2label = metadata.get("id2label", {}) or {}
     causes = [id2label[k] for k in sorted(id2label, key=lambda x: int(x))] if id2label else []
     hyperparams = metadata.get("hyperparams", {}) or {}
@@ -210,7 +236,8 @@ def build_model_card(
     parts.append(f"license: {license}")
     parts.append("library_name: transformers")
     parts.append("pipeline_tag: text-classification")
-    parts.append(f"base_model: {base_model}")
+    if base_model_hub_id:
+        parts.append(f"base_model: {base_model_hub_id}")
     parts.append("tags:")
     parts.extend(f"  - {t}" for t in tags)
     parts.append("---\n")
@@ -220,7 +247,7 @@ def build_model_card(
     parts.append(
         "Trained with [MultimodalVA](https://github.com/y-chu/MultimodalVA) — a "
         "package for cause-of-death classification from verbal autopsy data. "
-        f"Fine-tuned from `{base_model}` "
+        f"Fine-tuned from `{base_model_label}` "
         f"over **{len(causes)} cause categories**.\n"
     )
     if is_fusion:

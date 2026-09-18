@@ -129,6 +129,8 @@ from ..utils.numpy_compat import (
     prepare_estimator_for_joblib,
 )
 
+from ..utils.provenance import check_inputs, guard_inputs, record_inputs
+
 logger = logging.getLogger(__name__)
 
 
@@ -200,6 +202,14 @@ class _SubsetDataset:
         way it handles ClassificationDataset and torch.utils.data.Subset.
         """
         return [self._full.labels[int(i)] for i in self._indices]
+
+    @property
+    def ids(self):
+        """Row identifiers for the subset, in subset order (None if unused)."""
+        full_ids = getattr(self._full, "ids", None)
+        if full_ids is None:
+            return None
+        return [full_ids[int(i)] for i in self._indices]
 
     def __len__(self):
         return len(self._indices)
@@ -386,8 +396,8 @@ def _learn_class_voter_weights(
     prob_matrices: list[np.ndarray],
     y_true: np.ndarray,
     id2label: dict,
-    metric: str = "brier",
-    shrinkage: float = 0.5,
+    metric: str = "f1",
+    shrinkage: float = 0.1,
     min_support_for_trust: float = 20.0,
 ) -> np.ndarray:
     """Learn a per-model × per-class weight matrix from OOF probabilities.
@@ -968,7 +978,9 @@ def generate_oof_predictions(
         text_model_specs:     List of text base-model spec dicts.
         tabular_model_specs:  List of tabular base-model spec dicts.
         train_text_dataset:   Pre-tokenised ``ClassificationDataset`` for the
-                              full training set.  Fold subsets are derived via
+                              full training set, or a list of datasets aligned
+                              with ``text_model_specs`` when the base models use
+                              different tokenizers. Fold subsets are derived via
                               ``_SubsetDataset``.
         X_train:              Preprocessed tabular feature matrix (n_train×p).
         y_train:              Integer label array (n_train,).
@@ -1029,6 +1041,17 @@ def generate_oof_predictions(
     n_tabular   = len(tabular_model_specs)
     n_total     = n_text + n_tabular
 
+    if isinstance(train_text_dataset, (list, tuple)):
+        if len(train_text_dataset) != n_text:
+            raise ValueError(
+                "When train_text_dataset is a list/tuple, it must contain one "
+                f"dataset per text model ({n_text}); got {len(train_text_dataset)}."
+            )
+        train_text_datasets = list(train_text_dataset)
+    else:
+        # Backward compatibility for callers whose text models share a tokenizer.
+        train_text_datasets = [train_text_dataset] * n_text
+
     oof_meta_X  = np.zeros((n_train, n_total * n_classes), dtype=float)
     oof_y       = y_train.copy()
 
@@ -1057,8 +1080,9 @@ def generate_oof_predictions(
                 hp         = (text_best_hp[i] if text_best_hp else None) or spec.get("hyperparams") or {}
 
                 logger.info("  [text_%d fold_%d] Training %s ...", i, fold_idx, model_name)
-                fold_train_ds = _SubsetDataset(train_text_dataset, train_idx)
-                fold_val_ds   = _SubsetDataset(train_text_dataset, val_idx)
+                model_text_dataset = train_text_datasets[i]
+                fold_train_ds = _SubsetDataset(model_text_dataset, train_idx)
+                fold_val_ds   = _SubsetDataset(model_text_dataset, val_idx)
 
                 text_train(
                     train_dataset=fold_train_ds,
@@ -1308,6 +1332,14 @@ class StackingClassifier:
     # Internal: load OOF state from disk (for cross-session Stage 2/3)
     # ------------------------------------------------------------------
 
+    def _oof_input_paths(self) -> dict:
+        """The OOF files Stage 2 consumes — fingerprinted to detect staleness."""
+        oof_dir = self.output_dir / "oof"
+        return {
+            "oof_meta_X": oof_dir / "oof_meta_X.npy",
+            "oof_y": oof_dir / "oof_y.npy",
+        }
+
     def _ensure_oof_loaded(self):
         """Load OOF artifacts from disk if not already in memory."""
         if self.oof_meta_X is not None:
@@ -1342,6 +1374,30 @@ class StackingClassifier:
 
         logger.info("OOF state loaded from disk — meta_X shape: %s", self.oof_meta_X.shape)
 
+    def _resolve_final_dir(self, source: dict, inherited_from: str | None) -> Path:
+        """Locate a base model's weights, tolerating a relocated run directory.
+
+        ``model_sources`` records absolute paths resolved at stage-1 time.  A run
+        opened later from a different machine or mount point — a synced folder, a
+        different home, a symlinked root — still carries the original strings, so
+        stage 2 fails to find weights sitting in its own ``final/``.  Re-anchor to
+        this run when the stored path is gone and nothing was inherited from
+        another run (where ``final/`` legitimately does not hold the weights).
+        """
+        stored = Path(source["final_dir"])
+        if stored.exists() or inherited_from is not None:
+            return stored
+
+        local = self.output_dir / "final" / f"{source['type']}_{source['local_index']}"
+        if not local.exists():
+            return stored  # keep the original path in the error the caller raises
+
+        logger.warning(
+            "Recorded final_dir %s does not exist; using %s from this run directory.",
+            stored, local,
+        )
+        return local
+
     # ------------------------------------------------------------------
     # Stage 1: train base models + generate OOF predictions
     # ------------------------------------------------------------------
@@ -1356,6 +1412,7 @@ class StackingClassifier:
         test_size: float = 0.2,
         random_state: int = 42,
         stratify: bool = True,
+        split_col: str | None = None,
         # --- text training ---
         val_size: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -1507,6 +1564,7 @@ class StackingClassifier:
             self.train_df, self.test_df = split(
                 df, label_col=label_col, text_col=text_col,
                 test_size=test_size, random_state=random_state, stratify=stratify,
+                split_col=split_col,
             )
             logger.info("Split: %d train / %d test", len(self.train_df), len(self.test_df))
 
@@ -1514,17 +1572,32 @@ class StackingClassifier:
         self.train_df.to_csv(data_dir / "train_df.csv", index=False)
         self.test_df.to_csv(data_dir  / "test_df.csv",  index=False)
 
-        # --- Step 2: prepare datasets (once, shared label maps) -------------
+        # --- Step 2: prepare one tokenized dataset per tokenizer ------------
         label2id = id2label = None
+        train_text_datasets = []
 
         if self.text_models:
-            first_text_spec = self.text_models[0]
-            train_text_ds, test_text_ds, label2id, id2label = text_prepare(
-                self.train_df, self.test_df,
-                text_col=text_col, label_col=label_col,
-                model_name=first_text_spec["model_name"],
-                max_length=first_text_spec.get("max_length", 512),
-            )
+            dataset_cache = {}
+            for i, spec in enumerate(self.text_models):
+                cache_key = (spec["model_name"], spec.get("max_length", 512))
+                if cache_key not in dataset_cache:
+                    dataset_cache[cache_key] = text_prepare(
+                        self.train_df, self.test_df,
+                        text_col=text_col, label_col=label_col,
+                        model_name=spec["model_name"],
+                        max_length=spec.get("max_length", 512),
+                    )
+                train_text_ds, _test_text_ds, model_label2id, model_id2label = (
+                    dataset_cache[cache_key]
+                )
+                if label2id is None:
+                    label2id, id2label = model_label2id, model_id2label
+                elif model_label2id != label2id or model_id2label != id2label:
+                    raise ValueError(
+                        "Text base models produced inconsistent label maps while "
+                        f"preparing dataset {i} ({spec['model_name']})."
+                    )
+                train_text_datasets.append(train_text_ds)
 
         # Tabular preprocessing
         X_train = X_test = y_train = y_test = None
@@ -1567,7 +1640,7 @@ class StackingClassifier:
             if spec.get("use_optimize", False):
                 logger.info("Text model %d (%s): running HPO ...", i, spec["model_name"])
                 best_hp, _ = text_optimize(
-                    train_dataset=train_text_ds,
+                    train_dataset=train_text_datasets[i],
                     label2id=label2id, id2label=id2label,
                     model_name=spec["model_name"],
                     output_dir=hpo_dir / f"text_{i}",
@@ -1635,7 +1708,7 @@ class StackingClassifier:
             new_oof_X, self.oof_y = generate_oof_predictions(
                 text_model_specs=self.text_models,
                 tabular_model_specs=self.tabular_models,
-                train_text_dataset=train_text_ds if self.text_models else None,
+                train_text_dataset=train_text_datasets if self.text_models else None,
                 X_train=X_train,
                 y_train=y_train if y_train is not None else np.array([]),
                 label2id=label2id,
@@ -1747,7 +1820,7 @@ class StackingClassifier:
             final_val = None if spec.get("use_optimize") else val_size
 
             text_train(
-                train_dataset=train_text_ds,
+                train_dataset=train_text_datasets[i],
                 label2id=label2id, id2label=id2label,
                 model_name=spec["model_name"],
                 output_dir=model_dir,
@@ -2019,6 +2092,9 @@ class StackingClassifier:
             "best_spec":          best_spec,
             "oof_meta_X_shape":   list(self.oof_meta_X.shape),
         }
+        # Fingerprint the OOF matrix this meta-learner was fitted on, so a later
+        # predict_test() can tell whether the base models have been re-run since.
+        record_inputs(meta_metadata, self._oof_input_paths())
         with open(meta_dir / "meta_learner_metadata.json", "w") as fh:
             json.dump(meta_metadata, fh, indent=2, default=str)
 
@@ -2032,8 +2108,8 @@ class StackingClassifier:
 
     def train_class_voter_stage(
         self,
-        metric: str = "brier",
-        shrinkage: float = 0.5,
+        metric: str = "f1",
+        shrinkage: float = 0.1,
         min_support_for_trust: float = 20.0,
         fallback_to_soft: bool = True,
         fallback_metric: str = "f1_macro",
@@ -2127,9 +2203,9 @@ class StackingClassifier:
         combined_oof = _apply_class_voter(prob_matrices, class_weights)
         soft_oof = _uniform_soft_vote(prob_matrices)
 
-        from ..utils.metrics import score_predictions
+        from ..utils.metrics import score_predictions, CV_METRICS
 
-        metric_names = ["accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"]
+        metric_names = list(CV_METRICS)
         true_labels = [self.id2label[int(y)] for y in self.oof_y]
         learned_result = _assemble_prediction_result(combined_oof, true_labels, self.id2label, top_k=3)
         soft_result = _assemble_prediction_result(soft_oof, true_labels, self.id2label, top_k=3)
@@ -2219,6 +2295,9 @@ class StackingClassifier:
             "fallback_cv_report": fallback_report,
             "scores": scores,
         }
+        # Same fingerprint as the meta-learner: these weights are learned from
+        # the OOF matrix and go stale when it changes.
+        record_inputs(metadata, self._oof_input_paths())
         with open(class_voter_dir / "class_voter_metadata.json", "w") as fh:
             json.dump(metadata, fh, indent=2)
 
@@ -2244,6 +2323,7 @@ class StackingClassifier:
         self,
         top_k: int = 3,
         batch_size: int = 32,
+        on_stale: str = "auto",
     ) -> PredictionResult:
         """Stage 3: predict on the held-out test set using the meta-learner.
 
@@ -2278,6 +2358,20 @@ class StackingClassifier:
             self.meta_learner = load_joblib_compat(meta_model_path)
             logger.info("Meta-learner loaded from %s", meta_model_path)
 
+            # The meta-learner was fitted on the OOF matrix. If the base models
+            # have been re-run since, that matrix has changed and this
+            # meta-learner no longer matches it.
+            meta_meta_path = meta_model_path.parent / "meta_learner_metadata.json"
+            if meta_meta_path.exists():
+                with open(meta_meta_path) as fh:
+                    saved_meta = json.load(fh)
+                guard_inputs(
+                    check_inputs(saved_meta, self._oof_input_paths()),
+                    "The saved meta-learner",
+                    "re-run train_meta_learner_stage()",
+                    on_stale=on_stale,
+                )
+
         # Ensure label maps are loaded
         self._ensure_oof_loaded()
 
@@ -2296,10 +2390,12 @@ class StackingClassifier:
         # for runs created before model_sources was introduced.
         _oof_meta_path = self.output_dir / "oof" / "oof_metadata.json"
         model_sources: list[dict] | None = None
+        _inherited_from: str | None = None
         if _oof_meta_path.exists():
             with open(_oof_meta_path) as _f:
                 _oof_meta = json.load(_f)
             model_sources = _oof_meta.get("model_sources")
+            _inherited_from = _oof_meta.get("inherited_from")
 
         if not model_sources:
             # Backward-compat fallback: only current-run models, no inheritance
@@ -2345,7 +2441,7 @@ class StackingClassifier:
 
         # --- Iterate over all model sources (inherited + new) ---------------
         for source in model_sources:
-            model_dir  = Path(source["final_dir"])
+            model_dir  = self._resolve_final_dir(source, _inherited_from)
             spec       = source["spec"]
             col_s      = source["col_start"]
             n_cols     = source["n_cols"]
@@ -2411,8 +2507,19 @@ class StackingClassifier:
         self,
         top_k: int = 3,
         batch_size: int = 32,
+        on_stale: str = "auto",
     ) -> PredictionResult:
-        """Stage 3 alternative: predict test data using saved class-aware weights."""
+        """Stage 3 alternative: predict test data using saved class-aware weights.
+
+        Args:
+            top_k: Number of ranked classes to return.
+            batch_size: Inference batch size for text base models.
+        on_stale: What to do when the saved Stage 2 result was built from an
+            out-of-fold matrix that has since changed (for example because a base
+            model was re-run). ``"auto"``/``"error"`` stop with an explanation,
+            ``"warn"`` continues with a warning, ``"ignore"`` continues silently.
+            Results saved before input tracking existed are not checked.
+        """
         if self.class_voter_weights is None:
             class_voter_dir = self.output_dir / "class_voter"
             weights_path = class_voter_dir / "class_weights.npy"
@@ -2426,6 +2533,14 @@ class StackingClassifier:
             if meta_path.exists():
                 with open(meta_path) as fh:
                     self.class_voter_metadata = json.load(fh)
+                # These weights were learned from the OOF matrix; re-running a
+                # base model changes it and leaves the weights stale.
+                guard_inputs(
+                    check_inputs(self.class_voter_metadata, self._oof_input_paths()),
+                    "The saved class-aware voting weights",
+                    "re-run train_class_voter_stage()",
+                    on_stale=on_stale,
+                )
 
         # Lazy imports
         from ..text.dataset    import prepare_dataset as text_prepare
@@ -2475,7 +2590,7 @@ class StackingClassifier:
 
         prob_matrices = []
         for source in model_sources:
-            model_dir = Path(source["final_dir"])
+            model_dir = self._resolve_final_dir(source, oof_meta.get("inherited_from"))
             spec = source["spec"]
             model_name = spec["model_name"]
 
@@ -2536,6 +2651,7 @@ class StackingClassifier:
         test_size: float = 0.2,
         random_state: int = 42,
         stratify: bool = True,
+        split_col: str | None = None,
         # --- text ---
         val_size: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -2575,6 +2691,7 @@ class StackingClassifier:
             df=df, label_col=label_col,
             text_col=text_col, feature_cols=feature_cols,
             test_size=test_size, random_state=random_state, stratify=stratify,
+            split_col=split_col,
             val_size=val_size,
             gradient_checkpointing=gradient_checkpointing,
             early_stopping_patience=early_stopping_patience,

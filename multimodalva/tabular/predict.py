@@ -34,6 +34,7 @@ def predict(
     *,
     model: Any | None = None,
     id2label: dict | None = None,
+    ids: "list | pd.Series | None" = None,
 ) -> PredictionResult:
     """Load a saved model and predict labels and probabilities on test data.
 
@@ -56,6 +57,11 @@ def predict(
         model:        (keyword-only) Fitted estimator. Skip disk load when provided
                       together with id2label.
         id2label:     (keyword-only) Dict mapping integer IDs → label strings.
+        ids:          (keyword-only) Row identifiers for the test rows, added as
+                      a leading ``id`` column in all three output tables so
+                      predictions can be joined back to the source records.
+                      Must line up with the rows in ``X_test`` — note that
+                      prepare_dataset() drops rows with a missing label.
 
     Returns:
         PredictionResult(top1, full, topk, id2label) — same format as text predict().
@@ -88,18 +94,32 @@ def predict(
     n_classes = len(id2label)
     k = min(top_k, n_classes)
 
+    if ids is not None:
+        ids = list(ids)
+        if len(ids) != len(X_test):
+            raise ValueError(
+                f"Got {len(ids)} ids for {len(X_test)} test rows. Identifiers must "
+                "come from the same rows that were scored — prepare_dataset() "
+                "drops rows with a missing label (see valid_label_mask())."
+            )
+
+    def _with_ids(frame: pd.DataFrame) -> pd.DataFrame:
+        if ids is not None:
+            frame.insert(0, "id", ids)
+        return frame
+
     # --- Output 1: top1 ---
     top1_idx = np.argmax(probs, axis=1)
     top1_probs = probs[np.arange(len(probs)), top1_idx]
-    top1_df = pd.DataFrame({
+    top1_df = _with_ids(pd.DataFrame({
         "true_label": true_labels,
         "predicted_label": [id2label[int(i)] for i in top1_idx],
         "predicted_prob": top1_probs,
-    })
+    }))
 
     # --- Output 2: full --- (integer IDs as column names — matches text pipeline)
     prob_cols = {f"prob_{i}": probs[:, i] for i in sorted(id2label)}
-    full_df = pd.DataFrame({"true_label": true_labels, **prob_cols})
+    full_df = _with_ids(pd.DataFrame({"true_label": true_labels, **prob_cols}))
 
     # --- Output 3: topk ---
     topk_idx = np.argsort(probs, axis=1)[:, ::-1][:, :k]  # descending
@@ -108,7 +128,7 @@ def predict(
     for rank in range(k):
         topk_data[f"top{rank + 1}_label"] = [id2label[int(i)] for i in topk_idx[:, rank]]
         topk_data[f"top{rank + 1}_prob"] = topk_probs[:, rank].tolist()
-    topk_df = pd.DataFrame(topk_data)
+    topk_df = _with_ids(pd.DataFrame(topk_data))
 
     logger.info(
         "Prediction complete: %d samples, %d classes, top-%d output.",

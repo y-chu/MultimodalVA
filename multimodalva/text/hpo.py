@@ -2,7 +2,7 @@
 Step 5: Hyperparameter optimization.
 
 Two backends are provided; both accept the same search_space format and return
-``(best_hyperparams, backend_object)`` so callers can switch seamlessly:
+``(best_hyperparams, backend_object)`` so callers can switch backends without changing call sites:
 
     optimize()      — Optuna (TPE sampler, JournalStorage persistence)
                       Best for single-machine sequential or lightly parallel HPO.
@@ -63,10 +63,16 @@ from multimodalva.utils.metrics import (
     csmf_accuracy,
     score_predictions,
     sample_hyperparams,
+    decode_hyperparams_for_space,
+    decode_trials_dataframe_for_space,
     log_loss_from_full,
     METRIC_DIRECTION,
+    CV_METRICS,
+    HPO_METRICS,
 )
-from multimodalva.utils.runtime import RuntimeTracker
+from multimodalva.utils.runtime import RuntimeTracker, empty_accelerator_cache
+from multimodalva.utils.ray_compat import to_ray_space
+from multimodalva.text.models import resolve_model_name
 from multimodalva.text.train import train, _get_dataset_labels
 from multimodalva.text.predict import predict
 
@@ -80,41 +86,6 @@ from .search_spaces import (  # noqa: E402
     _class_tier,
     get_default_search_space,
 )
-
-
-def _get_ray_trial_dir() -> Path:
-    """Return the current Ray Tune trial directory across Ray 2.x variants."""
-    try:
-        from ray import tune as _ray_tune
-
-        if hasattr(_ray_tune, "get_context"):
-            ctx = _ray_tune.get_context()
-            if ctx is not None:
-                return Path(ctx.get_trial_dir())
-    except Exception:
-        logger.debug("ray.tune.get_context() unavailable; trying legacy APIs.", exc_info=True)
-
-    try:
-        from ray.air import session as _air_session
-
-        trial_dir = _air_session.get_trial_dir()
-        if trial_dir:
-            return Path(trial_dir)
-    except Exception:
-        logger.debug("ray.air.session.get_trial_dir() unavailable.", exc_info=True)
-
-    cwd = Path.cwd()
-    if cwd.exists():
-        logger.warning(
-            "Falling back to current working directory for Ray trial artifacts: %s",
-            cwd,
-        )
-        return cwd
-
-    raise RuntimeError(
-        "Unable to resolve the Ray Tune trial directory. "
-        "Install a supported Ray Tune version or update the compatibility shim."
-    )
 
 
 @contextmanager
@@ -180,7 +151,7 @@ def optimize(
     on opt-eval. The held-out test set from prepare_dataset() is never used here.
 
     Storage: each trial/fold is trained inside a ``tempfile.TemporaryDirectory``
-    that is deleted as soon as its score is computed — no model weights, optimizer
+    that is deleted as soon as its score is computed: no model weights, optimizer
     state, or checkpoints survive per trial (the historical bloat: 500+ trial dirs
     × ~hundreds of MB each).  Only the *scores* persist, via the JournalStorage
     ``hpo_<model>.log`` (also drives resume) and the trials CSV.  best_hyperparams
@@ -286,11 +257,14 @@ def optimize(
             "Install with:  pip install 'optuna>=3.4'"
         ) from exc
 
-    _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
+    _VALID_METRICS = HPO_METRICS
     if metric not in _VALID_METRICS:
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
         )
+
+    # Resolve once so every trial loads the same checkpoint without re-downloading.
+    model_name = resolve_model_name(model_name)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -348,7 +322,10 @@ def optimize(
     # default backend.  It tolerates cloud-sync folders (Dropbox, iCloud) and
     # network filesystems where SQLite's page-lock protocol tends to break.
     if storage_path is None:
-        safe_name = model_name.replace("/", "_")
+        # A local checkpoint directory would otherwise produce a file name made
+        # of the whole path, which also breaks resume if the directory moves.
+        safe_name = Path(model_name).name if "/" in model_name and Path(model_name).is_dir() \
+            else model_name.replace("/", "_")
         storage_path = str(output_dir.resolve() / f"hpo_{safe_name}.log")
     else:
         # Normalize legacy sqlite:/// URLs and auto-redirect .db → .log.
@@ -423,7 +400,7 @@ def optimize(
                 # comparable.  load_best_model_at_end is inactive without a val split,
                 # so the final epoch checkpoint is used — acceptable for HPO scoring.
                 _fold_scores: dict[str, list[float]] = {
-                    m: [] for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                    m: [] for m in CV_METRICS
                 }
                 _fold_log_losses: list[float] = []
 
@@ -453,7 +430,7 @@ def optimize(
                             random_state=random_state,
                         )
                         fold_result = predict(fold_dir, fold_val, use_fast=use_fast)
-                        for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy"):
+                        for m in CV_METRICS:
                             _fold_scores[m].append(score_predictions(fold_result.top1, m))
                         _fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
 
@@ -468,9 +445,7 @@ def optimize(
                         if trial.should_prune():
                             raise optuna.exceptions.TrialPruned()
 
-                    torch.cuda.empty_cache()
-                    if torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
+                    empty_accelerator_cache()
 
                 all_scores = {m: float(np.mean(_fold_scores[m])) for m in _fold_scores}
                 all_scores["log_loss"] = float(np.mean(_fold_log_losses))
@@ -502,7 +477,7 @@ def optimize(
                     result = predict(tdir, opt_val, use_fast=use_fast)
                     all_scores = {
                         m: score_predictions(result.top1, m)
-                        for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                        for m in CV_METRICS
                     }
                     all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
 
@@ -537,9 +512,7 @@ def optimize(
                 ),
             )
             # Release GPU/MPS memory after each trial to avoid OOM on subsequent trials.
-            torch.cuda.empty_cache()
-            if torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+            empty_accelerator_cache()
 
     # --- Create / resume study ---
     pruner = (
@@ -621,7 +594,7 @@ def optimize(
             f"Trial artifacts are in: {output_dir}"
         )
 
-    best_hyperparams = study.best_params
+    best_hyperparams = decode_hyperparams_for_space(study.best_params, active_space)
 
     # --- Copy best trial artifacts (opt-in) ---
     # Default path: trials ran in tempdirs, so there is nothing to copy — the
@@ -651,7 +624,9 @@ def optimize(
     # --- Save all trial results as CSV ---
     if save_trials_csv:
         trials_csv_path = output_dir / "hpo_trials.csv"
-        study.trials_dataframe().to_csv(trials_csv_path, index=False)
+        decode_trials_dataframe_for_space(
+            study.trials_dataframe(), active_space
+        ).to_csv(trials_csv_path, index=False)
         logger.info("Saved trial results to %s", trials_csv_path)
 
     # --- Remove per-trial directories (only present when export_best_trial=True) ---
@@ -692,56 +667,6 @@ def optimize(
 # ---------------------------------------------------------------------------
 # Ray Tune — distributed HPO across multiple GPUs / cluster nodes
 # ---------------------------------------------------------------------------
-
-def _to_ray_space(search_space: dict) -> dict:
-    """Convert our ``(type, *args)`` search space format to Ray Tune's format.
-
-    Mapping::
-
-        ("float_log", low, high)  →  tune.loguniform(low, high)
-        ("float",     low, high)  →  tune.uniform(low, high)
-        ("int",       low, high)  →  tune.randint(low, high)
-        ("categorical", [vals])   →  tune.choice([vals])
-
-    Raises:
-        ImportError: If ``ray[tune]`` is not installed.
-        ValueError:  If an unknown type string is encountered.
-    """
-    try:
-        from ray import tune
-    except ImportError as exc:
-        raise ImportError(
-            "Ray Tune is required for optimize_ray(). "
-            "Install with: pip install 'ray[tune]'"
-        ) from exc
-
-    ray_space: dict = {}
-    for key, spec in search_space.items():
-        if not isinstance(spec, (tuple, list)) or not spec:
-            raise ValueError(
-                f"Search space entry {key!r} has an invalid spec {spec!r}. "
-                "Each entry must be a non-empty tuple: "
-                "('float_log', low, high), ('float', low, high), "
-                "('int', low, high), or ('categorical', [values]). "
-                f"Got type {type(spec).__name__!r}."
-            )
-        kind, *args = spec
-        if kind == "float_log":
-            ray_space[key] = tune.loguniform(args[0], args[1])
-        elif kind == "float":
-            ray_space[key] = tune.uniform(args[0], args[1])
-        elif kind == "int":
-            ray_space[key] = tune.randint(args[0], args[1])
-        elif kind == "categorical":
-            ray_space[key] = tune.choice(args[0])
-        else:
-            raise ValueError(
-                f"Search space entry {key!r} has unknown type {kind!r} "
-                f"(full spec: {spec!r}). "
-                "Valid types: 'float_log', 'float', 'int', 'categorical'. "
-                "Example: ('categorical', [8, 16, 32]) or ('float_log', 1e-5, 1e-4)."
-            )
-    return ray_space
 
 # -----------------------
 # Ray Trainable: Single trial
@@ -787,9 +712,10 @@ def _ray_trial_fn(
     from multimodalva.text.train import train as _train
     from multimodalva.text.predict import predict as _predict
     from multimodalva.utils.metrics import score_predictions, log_loss_from_full
+    from multimodalva.utils.ray_compat import get_ray_trial_dir
 
     # --- Trial artifact directory (Ray Tune API compatibility shim) ---
-    trial_dir = _get_ray_trial_dir()
+    trial_dir = get_ray_trial_dir()
     _trial_logger.info("Resolved Ray trial artifact directory: %s", trial_dir)
     trial_dir.mkdir(parents=True, exist_ok=True)
 
@@ -832,7 +758,7 @@ def _ray_trial_fn(
         all_scores.update(
             {
                 m: score_predictions(result.top1, m)
-                for m in ("accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy")
+                for m in CV_METRICS
             }
         )
         all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
@@ -845,9 +771,7 @@ def _ray_trial_fn(
 
     finally:
         # Free GPU / MPS memory before the next trial.
-        torch.cuda.empty_cache()
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
+        empty_accelerator_cache()
 
     # Return the metrics dict — Ray Tune treats the return value of a function
     # trainable as the trial's final reported result.  This avoids calling
@@ -928,7 +852,7 @@ def optimize_ray(
                          completed trial scores rather than within-trial early
                          stopping.
     """
-    _VALID_METRICS = {"accuracy", "balanced_accuracy", "f1_macro", "f1_weighted", "csmf_accuracy", "log_loss"}
+    _VALID_METRICS = HPO_METRICS
     if metric not in _VALID_METRICS:
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
@@ -949,6 +873,9 @@ def optimize_ray(
     # --- Resolve n_trials default (depends on use_asha) ---
     if n_trials is None:
         n_trials = 60 if use_asha else 30
+
+    # Resolve once so every Ray worker loads the same checkpoint without re-downloading.
+    model_name = resolve_model_name(model_name)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1048,7 +975,7 @@ def optimize_ray(
                 model_name, _cfg_cls.__name__,
             )
 
-    ray_space = _to_ray_space(active_space)
+    ray_space = to_ray_space(active_space)
 
     # --- Stratified split ---
     all_labels = _get_dataset_labels(train_dataset)

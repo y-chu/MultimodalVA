@@ -403,6 +403,7 @@ class SoftVotingClassifier:
         test_size: float = 0.2,
         random_state: int = 42,
         stratify: bool = True,
+        split_col: str | None = None,
         # --- text training options (global defaults; override per-model in spec) ---
         val_size: float = 0.1,
         gradient_checkpointing: bool = False,
@@ -502,6 +503,7 @@ class SoftVotingClassifier:
             test_size=test_size,
             random_state=random_state,
             stratify=stratify,
+            split_col=split_col,
         )
         logger.info(
             "Split: %d train / %d test samples",

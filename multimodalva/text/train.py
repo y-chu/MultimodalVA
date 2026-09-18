@@ -14,10 +14,7 @@ import logging
 import os
 import random
 import shutil
-import tarfile
-import tempfile
 import time
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +30,20 @@ from transformers import (
     TrainingArguments,
 )
 
-from multimodalva.utils.runtime import RuntimeTracker
+from multimodalva.utils.runtime import (
+    RuntimeTracker,
+    get_device as _get_device,
+    is_cuda,
+    is_mps,
+)
+from multimodalva.text.models import (  # noqa: F401  (re-exported for existing imports)
+    REMOTE_MODELS,
+    SUPPORTED_MODELS,
+    _find_extracted_model_dir,
+    _looks_like_model_dir,
+    download_model,
+    resolve_model_name,
+)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -128,145 +138,6 @@ LORA_DEFAULTS: dict = {
     "lora_alpha": 64,    # scaling factor; typically 2–4× lora_r; higher = stronger adaptation
     "lora_dropout": 0.1, # dropout on LoRA layers; 0.05–0.1; increase for small datasets
 }
-
-# Reference map of well-known model families to canonical HuggingFace model IDs.
-# model_name in train() / predict() / prepare_dataset() accepts any of:
-#   - A value from this dict  (e.g. SUPPORTED_MODELS["biobert"])
-#   - Any HuggingFace Hub ID  (e.g. "username/my-finetuned-bert")
-#   - A local path to a saved model directory  (e.g. "/data/models/my_checkpoint")
-# Architecture groups natively supported by freeze_model_layers():
-#   BERT-family : bert, biobert, bioclinicalbert, bluebert, biomedbert, clinicalbert
-#   RoBERTa     : biomedroberta
-#   ELECTRA     : bioelectra
-#   Long-range  : longformer, clinicallongformer, bigbird, clinicalbigbird
-SUPPORTED_MODELS: dict[str, str] = {
-    "bert":            "bert-base-uncased",
-    "biobert":         "dmis-lab/biobert-base-cased-v1.2", #dmis-lab/biobert-v1.1
-    "bioclinicalbert": "emilyalsentzer/Bio_ClinicalBERT",
-    "bluebert":        "bionlp/bluebert_pubmed_mimic_uncased_L-12_H-768_A-12",
-    "biomedbert":      "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
-    "clinicalbert":    "medicalai/ClinicalBERT",
-    "biomedroberta":   "allenai/biomed_roberta_base",
-    "bioelectra":      "kamalkraj/bioelectra-base-discriminator-pubmed",
-    "longformer":      "allenai/longformer-base-4096",
-    "clinicallongformer":      "yikuan8/Clinical-Longformer",
-    "bigbird":         "google/bigbird-roberta-base",
-    "clinicalbigbird":         "yikuan8/Clinical-BigBird",
-}
-
-# Models not on the HuggingFace Hub — must be fetched via download_model(key).
-# download_model() extracts the archive to a temp directory and returns the
-# local path, which can then be passed directly as model_name.
-REMOTE_MODELS: dict[str, str] = {
-    "roberta-pm": (
-        "https://dl.fbaipublicfiles.com/biolm/"
-        "RoBERTa-base-PM-M3-Voc-distill-hf.tar.gz"
-    ),
-}
-
-
-def _looks_like_model_dir(path: Path) -> bool:
-    """Return True when ``path`` looks like a HF-style local model directory."""
-    if not path.is_dir():
-        return False
-
-    has_config = (path / "config.json").exists()
-    has_weights = any(
-        (path / filename).exists()
-        for filename in (
-            "pytorch_model.bin",
-            "model.safetensors",
-            "tf_model.h5",
-            "model.ckpt.index",
-            "flax_model.msgpack",
-        )
-    )
-    return has_config and has_weights
-
-
-def _find_extracted_model_dir(root: Path) -> Path | None:
-    """Find the actual extracted model directory under ``root``.
-
-    Some archives unpack directly into a single model directory, while others
-    add an extra wrapper directory and place the HuggingFace files one level
-    deeper. We return the shallowest directory that contains both
-    ``config.json`` and model weights.
-    """
-    if _looks_like_model_dir(root):
-        return root
-
-    candidates = sorted(
-        (
-            path for path in root.rglob("*")
-            if _looks_like_model_dir(path)
-        ),
-        key=lambda p: (len(p.relative_to(root).parts), str(p)),
-    )
-    return candidates[0] if candidates else None
-
-
-def download_model(key: str, cache_dir: str | Path | None = None) -> str:
-    """Download and extract a remote model checkpoint from REMOTE_MODELS.
-
-    Downloads the archive to a temporary directory (or cache_dir), extracts
-    it, removes the archive, and returns the local model directory path for
-    use as model_name in train(), predict(), and prepare_dataset().
-
-    Args:
-        key: Key in REMOTE_MODELS (e.g. "roberta-pm").
-        cache_dir: Directory to extract the model into.
-                   Defaults to a new system temp directory (deleted on reboot).
-
-    Returns:
-        Absolute path to the extracted model directory.
-
-    Raises:
-        ValueError: If key is not in REMOTE_MODELS.
-
-    Example:
-        model_path = download_model("roberta-pm")
-        train(..., model_name=model_path)
-    """
-    if key not in REMOTE_MODELS:
-        raise ValueError(
-            f"Unknown remote model key: '{key}'. "
-            f"Available keys: {list(REMOTE_MODELS)}"
-        )
-
-    url = REMOTE_MODELS[key]
-    archive_name = url.rsplit("/", 1)[-1]  # e.g. RoBERTa-base-PM-M3-Voc-distill-hf.tar.gz
-
-    if cache_dir is None:
-        cache_dir = Path(tempfile.mkdtemp(prefix="multimodalva_"))
-    else:
-        cache_dir = Path(cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-    existing_model_dir = _find_extracted_model_dir(cache_dir)
-    if existing_model_dir is not None:
-        logger.info("Reusing cached model at: %s", existing_model_dir)
-        return str(existing_model_dir)
-
-    archive_path = cache_dir / archive_name
-
-    logger.info("Downloading %s ...", url)
-    urllib.request.urlretrieve(url, archive_path)
-    logger.info("Saved archive to %s", archive_path)
-
-    logger.info("Extracting %s ...", archive_path)
-    with tarfile.open(archive_path, "r:gz") as tar:
-        tar.extractall(cache_dir)
-    archive_path.unlink()  # remove archive after extraction
-
-    model_dir = _find_extracted_model_dir(cache_dir)
-    if model_dir is None:
-        raise FileNotFoundError(
-            "Downloaded archive extracted successfully, but no HuggingFace-style "
-            f"model directory was found under {cache_dir}."
-        )
-
-    logger.info("Model ready at: %s", model_dir)
-    return str(model_dir)
 
 
 def _get_dataset_labels(dataset) -> list[int]:
@@ -367,12 +238,12 @@ def _remove_checkpoint_dirs(output_dir: Path) -> int:
 
 
 def get_device() -> torch.device:
-    """Return the best available device: CUDA, MPS, CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    """Return the best available device: CUDA, MPS, CPU.
+
+    Kept here so existing ``from multimodalva.text.train import get_device``
+    imports keep working; the implementation lives in ``utils.runtime``.
+    """
+    return _get_device()
 
 
 def freeze_model_layers(model, freeze_layers: int):
@@ -684,6 +555,10 @@ def train(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Map aliases and remote keys (e.g. "biomedroberta", "roberta-pm") to a loadable model.
+    requested_model_name = model_name
+    model_name = resolve_model_name(model_name)
+
     # Merge hyperparams over defaults
     hp = {**DEFAULT_HYPERPARAMS}
     if use_lora:
@@ -787,7 +662,7 @@ def train(
     # --- MPS architecture compatibility ---
     # Detect MPS early (before _is_mps is set further below) so we can configure
     # model kwargs at load time.
-    _mps_at_load = torch.backends.mps.is_available() and not torch.cuda.is_available()
+    _mps_at_load = is_mps()
     if _mps_at_load:
         _model_lower = model_name.lower()
         if "longformer" in _model_lower:
@@ -907,8 +782,8 @@ def train(
             logger.warning("Layer freezing skipped (unsupported architecture): %s", e)
 
     # --- Device capability flags ---
-    _is_cuda = torch.cuda.is_available()
-    _is_mps  = torch.backends.mps.is_available() and not _is_cuda
+    _is_cuda = is_cuda()
+    _is_mps  = is_mps()
     _world_size = max(1, _int_env("WORLD_SIZE", 1) or 1)
     _rank = _int_env("RANK", 0) or 0
 
@@ -1237,6 +1112,8 @@ def train(
         "runtime_report": str(runtime_tracker.report_path),
         "runtime_stage_csv": str(runtime_tracker.stage_csv_path),
     }
+    if requested_model_name != model_name:
+        metadata["requested_model_name"] = requested_model_name
     if is_world_zero:
         with open(output_dir / "training_metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)

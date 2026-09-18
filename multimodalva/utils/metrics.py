@@ -10,14 +10,51 @@ Public API:
     sample_hyperparams(trial, search_space) — Optuna trial → hyperparameter dict
 
 Constants:
+    CV_METRICS        — the metrics recorded for every cross-validation fold
+    REPORT_METRICS    — the fuller set used for leaderboards and bootstrap CIs
+    HPO_METRICS       — metric names accepted as an HPO objective
     METRIC_DIRECTION  — maps metric name → "minimize" | "maximize" for study creation
 """
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import numpy as np
 import optuna
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+
+# Recorded for every cross-validation fold, so a run can be scored on any of
+# them afterwards without retraining.  Defined once here: the HPO modules and
+# the stacking meta-learner all report this same set.
+CV_METRICS: tuple[str, ...] = (
+    "accuracy",
+    "balanced_accuracy",
+    "f1_macro",
+    "f1_weighted",
+    "csmf_accuracy",
+)
+
+# The fuller set reported when summarising finished runs — every CV metric plus
+# per-class precision/recall averages and the chance-corrected CSMF variant.
+# Used for leaderboards and bootstrap confidence intervals.
+REPORT_METRICS: tuple[str, ...] = (
+    "accuracy",
+    "balanced_accuracy",
+    "f1_macro",
+    "f1_weighted",
+    "precision_macro",
+    "precision_weighted",
+    "recall_macro",
+    "recall_weighted",
+    "csmf_accuracy",
+    "cccsmf_accuracy",
+)
+
+# Metric names accepted as an HPO objective.  Everything recorded per fold, plus
+# log_loss, which needs probabilities rather than predicted labels.
+HPO_METRICS: frozenset[str] = frozenset(CV_METRICS) | {"log_loss"}
 
 # Metrics where lower is better.  All others default to "maximize".
 # Used by text/hpo.py and tabular/hpo.py when creating Optuna studies and
@@ -194,6 +231,67 @@ def log_loss_from_full(full_df: "pd.DataFrame", id2label: dict) -> float:
     return float(log_loss(y_true, y_proba, labels=labels))
 
 
+_COMPLEX_CHOICE_PREFIX = "__multimodalva_json_choice__:"
+
+
+def _optuna_storage_safe_choice(value: Any) -> bool:
+    """Return whether Optuna can persist this categorical choice directly."""
+    return value is None or isinstance(value, (bool, int, float, str))
+
+
+def _encode_complex_choice(value: Any) -> Any:
+    """Encode non-primitive categorical choices for Optuna persistent storage."""
+    if _optuna_storage_safe_choice(value):
+        return value
+
+    if isinstance(value, tuple):
+        payload = {"type": "tuple", "value": list(value)}
+    elif isinstance(value, list):
+        payload = {"type": "list", "value": value}
+    elif isinstance(value, dict):
+        payload = {"type": "dict", "value": value}
+    else:
+        payload = {"type": "repr", "value": repr(value)}
+
+    return _COMPLEX_CHOICE_PREFIX + json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _decode_complex_choice(value: Any) -> Any:
+    """Decode values produced by _encode_complex_choice()."""
+    if not isinstance(value, str) or not value.startswith(_COMPLEX_CHOICE_PREFIX):
+        return value
+
+    payload = json.loads(value[len(_COMPLEX_CHOICE_PREFIX):])
+    kind = payload.get("type")
+    decoded = payload.get("value")
+    if kind == "tuple":
+        return tuple(decoded)
+    if kind in {"list", "dict"}:
+        return decoded
+    return decoded
+
+
+def decode_hyperparams_for_space(params: dict, search_space: dict) -> dict:
+    """Decode Optuna-stored categorical choices back to training values."""
+    decoded = dict(params)
+    for name, spec in search_space.items():
+        if name in decoded and spec[0] == "categorical":
+            decoded[name] = _decode_complex_choice(decoded[name])
+    return decoded
+
+
+def decode_trials_dataframe_for_space(trials_df: "pd.DataFrame", search_space: dict) -> "pd.DataFrame":
+    """Decode Optuna categorical parameter columns in a trials DataFrame."""
+    decoded = trials_df.copy()
+    for name, spec in search_space.items():
+        column = f"params_{name}"
+        if column in decoded.columns and spec[0] == "categorical":
+            decoded[column] = decoded[column].map(_decode_complex_choice)
+    return decoded
+
+
 def sample_hyperparams(trial: optuna.Trial, search_space: dict) -> dict:
     """Sample one set of hyperparameters from the search space for a given trial.
 
@@ -223,7 +321,10 @@ def sample_hyperparams(trial: optuna.Trial, search_space: dict) -> dict:
         elif kind == "int":
             hp[name] = trial.suggest_int(name, spec[1], spec[2])
         elif kind == "categorical":
-            hp[name] = trial.suggest_categorical(name, list(spec[1]))
+            choices = [_encode_complex_choice(choice) for choice in list(spec[1])]
+            hp[name] = _decode_complex_choice(
+                trial.suggest_categorical(name, choices)
+            )
         else:
             raise ValueError(f"Unknown search space type '{kind}' for parameter '{name}'.")
     return hp

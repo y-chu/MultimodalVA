@@ -34,6 +34,7 @@ class ClassificationDataset(Dataset):
         labels: list[int],
         tokenizer: AutoTokenizer,
         max_length: int | None = 512,
+        ids: list | None = None,
     ):
         """
         Args:
@@ -45,8 +46,13 @@ class ClassificationDataset(Dataset):
                 - None → use the model's built-in maximum
                   (e.g. 512 for BERT, 4096 for Longformer).
                 - int → truncate to exactly that many tokens.
+            ids: Optional row identifiers, one per text, carried through to the
+                prediction tables so results can be joined back to the source
+                data. Captured after invalid rows are dropped, so it stays
+                aligned with the rows that are actually scored.
         """
         self.labels = labels
+        self.ids = list(ids) if ids is not None else None
 
         # No padding here — DataCollatorWithPadding in the Trainer pads each
         # batch to its own longest sequence, so train and test are handled
@@ -134,6 +140,7 @@ def prepare_dataset(
     model_name: str,
     max_length: int | None = 512,
     use_fast: bool = True,
+    id_col: str | None = None,
 ) -> tuple[ClassificationDataset, ClassificationDataset, dict, dict]:
     """Tokenize text and encode labels, returning ClassificationDataset objects.
 
@@ -148,7 +155,9 @@ def prepare_dataset(
         test_df: Test DataFrame from split().
         text_col: Name of the text column.
         label_col: Name of the label column.
-        model_name: HuggingFace model name or local path for the tokenizer.
+        model_name: Package alias (e.g. "bluebert"), remote key
+            (e.g. "roberta-pm"), Hugging Face Hub ID, or local model directory.
+            See :mod:`multimodalva.text.models`.
         max_length: Maximum number of tokens before truncation.
             - 512 (default) → truncate to 512 tokens (BERT's maximum).
             - None → use the model's built-in maximum (e.g. 4096 for Longformer).
@@ -156,6 +165,10 @@ def prepare_dataset(
         use_fast: Use the HuggingFace fast (Rust) tokenizer. Default True.
                   Set False for models that lack a fast tokenizer
                   (e.g. BlueBERT, BioELECTRA) to avoid a falling-back warning.
+        id_col: Optional column holding a row identifier (e.g. a record ID).
+                When given, the identifiers travel with the datasets and appear
+                as an ``id`` column in the prediction tables, so predictions can
+                be joined back to the source records.
 
     Returns:
         train_dataset: Tokenized ClassificationDataset for training.
@@ -168,7 +181,9 @@ def prepare_dataset(
     train_df = _drop_invalid_rows(train_df, text_col, label_col, split="train")
     test_df = _drop_invalid_rows(test_df, text_col, label_col, split="test")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=use_fast)
+    from multimodalva.text.models import resolve_model_name
+
+    tokenizer = AutoTokenizer.from_pretrained(resolve_model_name(model_name), use_fast=use_fast)
 
     # Build label maps from the union of both splits to avoid missing keys
     label_list = sorted(set(train_df[label_col]).union(test_df[label_col]))
@@ -178,11 +193,24 @@ def prepare_dataset(
     train_labels = train_df[label_col].map(label2id).tolist()
     test_labels = test_df[label_col].map(label2id).tolist()
 
+    # Captured after the invalid-row drop above, so ids line up with the rows
+    # that are actually tokenized.
+    if id_col is not None:
+        for name, frame in (("train_df", train_df), ("test_df", test_df)):
+            if id_col not in frame.columns:
+                raise ValueError(f"id_col {id_col!r} not found in {name}.")
+        train_ids = train_df[id_col].tolist()
+        test_ids = test_df[id_col].tolist()
+    else:
+        train_ids = test_ids = None
+
     train_dataset = ClassificationDataset(
-        train_df[text_col].tolist(), train_labels, tokenizer, max_length
+        train_df[text_col].tolist(), train_labels, tokenizer, max_length,
+        ids=train_ids,
     )
     test_dataset = ClassificationDataset(
-        test_df[text_col].tolist(), test_labels, tokenizer, max_length
+        test_df[text_col].tolist(), test_labels, tokenizer, max_length,
+        ids=test_ids,
     )
 
     logger.info(
