@@ -33,7 +33,7 @@ def _demo_df(n=160, seed=0, missing_labels=0):
     })
     if missing_labels:
         # Empty strings, not NaN: split() rejects NaN labels up front, so the
-        # rows that actually reach prepare_dataset()'s drop look like this.
+        # rows that actually reach prepare_text_dataset()'s drop look like this.
         df.loc[df.index[:missing_labels], "cause"] = ""
     return df
 

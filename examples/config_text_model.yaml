@@ -1,0 +1,37 @@
+# A transformer fine-tuned on the free-text narrative.
+# Run with:  multimodalva run examples/config_text_model.yaml
+#
+# Every tag below says how much attention the line needs:
+#   [CHANGE]  no default can be right for your data — set it before you run
+#   [KEEP]    a sensible default; it will work as-is
+#   [TUNE]    works as-is, but the value is worth revisiting for your data
+# Every key here is an argument of multimodalva.run(). A CLI flag given on the
+# same command line overrides the value set here.
+
+task: text                            # [KEEP]   this file's pipeline
+data: demo                            # [CHANGE] "demo" = built-in synthetic data; use your own CSV/Parquet path
+label_col: cause_of_death             # [CHANGE] the column holding the cause of death
+text_col: narrative                   # [CHANGE] the column holding the free-text narrative
+output_dir: runs/yaml/text_bluebert   # [CHANGE] where models, predictions and logs are written
+
+model: bluebert                       # [TUNE]   alias / HF id / local dir; `multimodalva list-models` shows all
+
+hyperparams:                          # [TUNE]   see config_tabular_model.yaml for the three forms
+  optimize:
+    metric: f1_macro                  #          what the search maximises
+    n_trials: 20                      #          more trials = better search, longer run
+    cv: true                          #          score each trial by cross-validation
+    cv_folds: 3
+
+test_size: 0.2                        # [KEEP]   fraction held out for testing
+split_seed: 42                        # [KEEP]   which deaths land in the test set; vary to measure sampling uncertainty
+train_seed: 42                        # [KEEP]   model initialisation/search; vary (hyperparams fixed) to measure model noise
+top_k: 3                              # [KEEP]   how many ranked causes to record per death
+
+# Passed straight through to TextClassifier.run():
+use_lora: false                       # [KEEP]   low-rank adapters: cheaper training, usually slightly weaker
+
+# Publish the trained model to the Hugging Face Hub (needs `huggingface-cli login`):
+# push_to_hub: true                   # [TUNE]
+# hub_repo_id: your-username/va-text-bluebert
+# hub_private: true

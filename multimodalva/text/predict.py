@@ -1,15 +1,16 @@
 """
 Step 4: Predict cause of death labels and probability distributions.
 
-Input:  (A) output_dir from train() — loads model, tokenizer, id2label from disk
-        (B) model + tokenizer + id2label in memory — skips disk I/O after train()
-        test_dataset from prepare_dataset()
+Input:  (A) output_dir from train_text() — loads model, tokenizer, id2label from disk
+        (B) model + tokenizer + id2label in memory — skips disk I/O after train_text()
+        test_dataset from prepare_text_dataset()
 Output: PredictionResult(top1, full, topk) — three DataFrames described below
 """
 
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import logging
 import tempfile
 import time
@@ -27,11 +28,12 @@ from transformers import (
 )
 
 # from ..utils.types import PredictionResult
-# from .train import _get_dataset_labels, get_device
+# from .train import _get_dataset_labels
 
 from multimodalva.utils.types import PredictionResult
-from multimodalva.utils.runtime import RuntimeTracker
-from multimodalva.text.train import _auto_num_workers, _get_dataset_labels, _int_env, get_device
+from multimodalva.utils.predictions import assemble_predictions, save_predictions
+from multimodalva.utils.runtime import RuntimeTracker, get_device
+from multimodalva.text.train import _auto_num_workers, _get_dataset_labels, _int_env
 
 
 logger = logging.getLogger(__name__)
@@ -50,20 +52,7 @@ def _get_dataset_ids(dataset) -> list | None:
     return None
 
 
-def _with_ids(frame: "pd.DataFrame", ids: list | None) -> "pd.DataFrame":
-    """Put an ``id`` column first, when identifiers are available."""
-    if ids is None:
-        return frame
-    if len(ids) != len(frame):
-        raise ValueError(
-            f"Got {len(ids)} ids for {len(frame)} predicted rows. Identifiers "
-            "must come from the same test rows that were scored."
-        )
-    frame.insert(0, "id", list(ids))
-    return frame
-
-
-def predict(
+def predict_text(
     output_dir: str | Path | None,
     test_dataset: Dataset,
     batch_size: int = 32,
@@ -82,14 +71,14 @@ def predict(
     Supports two modes:
       - Disk mode (default): loads model, tokenizer, and id2label from output_dir.
       - In-memory mode: pass model, tokenizer, and id2label directly to skip disk I/O.
-        Useful for immediate prediction after train() without reloading from disk.
+        Useful for immediate prediction after train_text() without reloading from disk.
         Pass output_dir=None when using in-memory mode.
 
     Args:
-        output_dir: Path to directory saved by train() — must contain the model,
+        output_dir: Path to directory saved by train_text() — must contain the model,
                     tokenizer, and id2label.json. May be None when model, tokenizer,
                     and id2label are all provided directly.
-        test_dataset: Tokenized ClassificationDataset (or Subset) from prepare_dataset().
+        test_dataset: Tokenized ClassificationDataset (or Subset) from prepare_text_dataset().
         batch_size: Number of samples per inference batch. Default 32.
         top_k: Number of top classes to include in the topk output. Default 3.
                Capped at the total number of classes if top_k exceeds it.
@@ -101,12 +90,12 @@ def predict(
                          <save_dir>/<save_prefix>_full.csv
                          <save_dir>/<save_prefix>_topk.csv
         use_fast: Use the HuggingFace fast (Rust) tokenizer. Default True.
-                  Must match the value used in prepare_dataset() / train().
+                  Must match the value used in prepare_text_dataset() / train_text().
         model: (keyword-only) Fine-tuned model in memory. When all three of model,
                tokenizer, and id2label are provided, disk loading is skipped entirely.
         tokenizer: (keyword-only) Tokenizer in memory.
         id2label: (keyword-only) Dict mapping integer or string IDs to class label strings
-                  (as returned by train() or loaded from id2label.json).
+                  (as returned by train_text() or loaded from id2label.json).
 
     Returns:
         PredictionResult with three DataFrames (one row per test sample each):
@@ -139,7 +128,7 @@ def predict(
     id2label = {int(k): v for k, v in id2label.items()}
 
     # Unwrap DataParallel / DistributedDataParallel if present.
-    # trainer.model from a multi-GPU train() call may be wrapped; passing a wrapped
+    # trainer.model from a multi-GPU train_text() call may be wrapped; passing a wrapped
     # model to a new Trainer causes device and forward-pass errors.
     if hasattr(model, "module"):
         model = model.module
@@ -239,7 +228,7 @@ def predict(
             started = time.perf_counter()
             test_predictions = trainer.predict(test_dataset)
             logger.info(
-                "predict(): inference completed in %.2fs on %d examples.",
+                "predict_text(): inference completed in %.2fs on %d examples.",
                 time.perf_counter() - started,
                 len(test_dataset),
             )
@@ -247,122 +236,49 @@ def predict(
         if _tmp_dir is not None:
             _tmp_dir.cleanup()
 
-    if runtime_tracker is not None:
-        with runtime_tracker.stage(
-            "format_outputs",
-            details={"examples": len(test_dataset)},
-        ):
-            logits = test_predictions.predictions  # shape: (n_samples, n_classes)
-
-            # Softmax probabilities (float32 cast avoids nan/inf on MPS with float16 logits).
-            # torch.as_tensor() shares memory with the numpy array when dtype matches
-            # (HuggingFace Trainer returns float32 predictions) — avoids an extra copy.
-            # Keep as tensor so torch.topk can be used directly for Output 3.
-            probs_tensor = torch.nn.functional.softmax(
-                torch.as_tensor(logits).float(), dim=-1
-            )  # (n_samples, n_classes)
-            probs = probs_tensor.numpy()
-
-            # True labels from the dataset (works for both ClassificationDataset and Subset)
-            true_int_labels = _get_dataset_labels(test_dataset)
-            true_labels = [id2label[i] for i in true_int_labels]
-
-            # --- Output 1: top1 — predicted class + probability ---
-            top1_probs_t, top1_idx_t = torch.topk(probs_tensor, k=1, dim=1)
-            top1_idx = top1_idx_t.squeeze(1).numpy()   # shape: (n_samples,)
-            top1_probs = top1_probs_t.squeeze(1).numpy()
-            top1_df = _with_ids(pd.DataFrame(
-                {
-                    "true_label": true_labels,
-                    "predicted_label": [id2label[i] for i in top1_idx],
-                    "predicted_prob": top1_probs,
-                }
-            ), row_ids)
-
-            prob_cols = {f"prob_{i}": probs[:, i] for i in sorted(id2label)}
-            full_df = _with_ids(pd.DataFrame({"true_label": true_labels, **prob_cols}), row_ids)
-
-            k = min(top_k, len(id2label))
-            topk_probs_t, topk_idx_t = torch.topk(probs_tensor, k=k, dim=1)
-            topk_probs = topk_probs_t.numpy()   # shape: (n_samples, k)
-            topk_idx = topk_idx_t.numpy()       # shape: (n_samples, k)
-            topk_data: dict[str, list] = {"true_label": true_labels}
-            for rank in range(k):
-                topk_data[f"top{rank + 1}_label"] = [id2label[i] for i in topk_idx[:, rank]]
-                topk_data[f"top{rank + 1}_prob"] = topk_probs[:, rank]
-            topk_df = _with_ids(pd.DataFrame(topk_data), row_ids)
-    else:
+    # Formatting the outputs is identical work whether or not it is being timed,
+    # so the tracker wraps it instead of the block being written out twice.
+    k = min(top_k, len(id2label))
+    format_stage = (
+        runtime_tracker.stage("format_outputs", details={"examples": len(test_dataset)})
+        if runtime_tracker is not None
+        else nullcontext()
+    )
+    with format_stage:
+        # Softmax probabilities (float32 cast avoids nan/inf on MPS with float16
+        # logits). torch.as_tensor() shares memory with the numpy array when the
+        # dtype matches (HuggingFace Trainer returns float32) — avoids a copy.
         logits = test_predictions.predictions  # shape: (n_samples, n_classes)
-
-        # Softmax probabilities (float32 cast avoids nan/inf on MPS with float16 logits).
-        # torch.as_tensor() shares memory with the numpy array when dtype matches
-        # (HuggingFace Trainer returns float32 predictions) — avoids an extra copy.
-        # Keep as tensor so torch.topk can be used directly for Output 3.
-        probs_tensor = torch.nn.functional.softmax(
+        probs = torch.nn.functional.softmax(
             torch.as_tensor(logits).float(), dim=-1
-        )  # (n_samples, n_classes)
-        probs = probs_tensor.numpy()
+        ).numpy()
 
-        # True labels from the dataset (works for both ClassificationDataset and Subset)
-        true_int_labels = _get_dataset_labels(test_dataset)
-        true_labels = [id2label[i] for i in true_int_labels]
+        # True labels from the dataset (works for ClassificationDataset and Subset)
+        true_labels = [id2label[i] for i in _get_dataset_labels(test_dataset)]
 
-        # --- Output 1: top1 — predicted class + probability ---
-        top1_probs_t, top1_idx_t = torch.topk(probs_tensor, k=1, dim=1)
-        top1_idx = top1_idx_t.squeeze(1).numpy()   # shape: (n_samples,)
-        top1_probs = top1_probs_t.squeeze(1).numpy()
-        top1_df = _with_ids(pd.DataFrame(
-            {
-                "true_label": true_labels,
-                "predicted_label": [id2label[i] for i in top1_idx],
-                "predicted_prob": top1_probs,
-            }
-        ), row_ids)
-
-        # --- Output 2: full — probability for every class (columns use integer IDs) ---
-        # Integer IDs keep column names short regardless of label length.
-        prob_cols = {f"prob_{i}": probs[:, i] for i in sorted(id2label)}
-        full_df = _with_ids(pd.DataFrame({"true_label": true_labels, **prob_cols}), row_ids)
-
-        # --- Output 3: topk — top-K classes + probabilities ---
-        k = min(top_k, len(id2label))
-        topk_probs_t, topk_idx_t = torch.topk(probs_tensor, k=k, dim=1)
-        topk_probs = topk_probs_t.numpy()   # shape: (n_samples, k)
-        topk_idx = topk_idx_t.numpy()       # shape: (n_samples, k)
-        topk_data: dict[str, list] = {"true_label": true_labels}
-        for rank in range(k):
-            topk_data[f"top{rank + 1}_label"] = [id2label[i] for i in topk_idx[:, rank]]
-            topk_data[f"top{rank + 1}_prob"] = topk_probs[:, rank]
-        topk_df = _with_ids(pd.DataFrame(topk_data), row_ids)
+        result = assemble_predictions(
+            probs, id2label, true_labels=true_labels, ids=row_ids, top_k=k
+        )
 
     logger.info(
         "Prediction complete: %d samples, %d classes, top-%d output.",
-        len(top1_df), len(id2label), k,
+        len(result.top1), len(id2label), k,
     )
-
-    result = PredictionResult(top1=top1_df, full=full_df, topk=topk_df, id2label=id2label)
 
     # --- Save to CSV if save_dir is specified ---
     if save_dir is not None:
         save_dir = Path(save_dir)
-        if runtime_tracker is not None:
-            with runtime_tracker.stage(
+        save_stage = (
+            runtime_tracker.stage(
                 "save_predictions",
                 details={"save_prefix": save_prefix, "save_dir": str(save_dir)},
-            ):
-                save_dir.mkdir(parents=True, exist_ok=True)
-                result.top1.to_csv(save_dir / f"{save_prefix}_top1.csv", index=False)
-                result.full.to_csv(save_dir / f"{save_prefix}_full.csv", index=False)
-                result.topk.to_csv(save_dir / f"{save_prefix}_topk.csv", index=False)
-        else:
-            save_dir.mkdir(parents=True, exist_ok=True)
-            result.top1.to_csv(save_dir / f"{save_prefix}_top1.csv", index=False)
-            result.full.to_csv(save_dir / f"{save_prefix}_full.csv", index=False)
-            result.topk.to_csv(save_dir / f"{save_prefix}_topk.csv", index=False)
-        logger.info(
-            "Saved CSVs to %s: %s_top1.csv, %s_full.csv, %s_topk.csv",
-            save_dir, save_prefix, save_prefix, save_prefix,
+            )
+            if runtime_tracker is not None
+            else nullcontext()
         )
+        with save_stage:
+            save_predictions(result, save_dir, save_prefix)
+
     if runtime_tracker is not None:
         runtime_tracker.update_metadata(
             save_dir=str(save_dir) if save_dir is not None else None,

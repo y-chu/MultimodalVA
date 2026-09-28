@@ -1,7 +1,7 @@
 """
 Step 3: Fine-tune a BERT-family model for multiclass cause of death classification.
 
-Input:  train_dataset, label2id, id2label  from prepare_dataset()
+Input:  train_dataset, label2id, id2label  from prepare_text_dataset()
         hyperparams dict
 Output: (model, tokenizer, metadata) — model and tokenizer ready for immediate
         prediction; all artifacts also saved to output_dir for later reuse
@@ -19,7 +19,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.model_selection import train_test_split as _sklearn_val_split
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import Dataset, Subset
 from transformers import (
@@ -32,13 +31,13 @@ from transformers import (
 
 from multimodalva.utils.runtime import (
     RuntimeTracker,
-    get_device as _get_device,
     is_cuda,
     is_mps,
 )
+from multimodalva.utils.split import stratified_indices
 from multimodalva.text.models import (  # noqa: F401  (re-exported for existing imports)
     REMOTE_MODELS,
-    SUPPORTED_MODELS,
+    TEXT_MODELS,
     _find_extracted_model_dir,
     _looks_like_model_dir,
     download_model,
@@ -104,8 +103,17 @@ def _auto_num_workers() -> int:
     return min(max_workers, derived)
 
 
+def _resolve_dataloader_workers(value: int | None) -> int:
+    """The worker count to use now: an explicit value, or the automatic one.
+
+    Resolved when training starts, not at import, so a
+    ``MULTIMODALVA_DATALOADER_WORKERS`` set by the run (``n_jobs=``) is honoured.
+    """
+    return _auto_num_workers() if value is None else int(value)
+
+
 # Default training hyperparameters (keys match TrainingArguments where applicable)
-DEFAULT_HYPERPARAMS: dict = {
+TEXT_DEFAULT_HYPERPARAMS: dict = {
     "learning_rate": 2e-5,             # AdamW LR; BERT fine-tuning: 1e-5–5e-5; larger models → lower end
     "batch_size": 16,                  # per-device; 8–32 typical; reduce if GPU OOM
     "epochs": 3,                       # 3–10; pair with early_stopping_patience for small datasets
@@ -116,7 +124,11 @@ DEFAULT_HYPERPARAMS: dict = {
     "label_smoothing": 0.0,            # set 0.05–0.1 to reduce overconfidence; set 0.0 when using focal loss
     "max_grad_norm": 1.0,              # gradient clipping; lower to 0.5 if loss spikes on small data
     # Data loading — auto-scales to SLURM allocation on HPC; falls back to os.cpu_count()
-    "dataloader_num_workers": _auto_num_workers(),  # parallel CPU workers per GPU
+    # None = decide when training starts (_auto_num_workers). Computing it here,
+    # at import, froze the value before a run could set
+    # MULTIMODALVA_DATALOADER_WORKERS — so n_jobs=0 disabled the Apple Silicon
+    # override yet kept the import-time count, and started a dozen workers.
+    "dataloader_num_workers": None,  # parallel CPU workers per GPU
     "dataloader_prefetch_factor": 4,  # batches queued per worker (only when num_workers > 0)
     # Layer freezing — active by default for supported architectures (bert, roberta, longformer, bigbird, electra)
     # Skipped with a warning for unsupported architectures; set 0 to disable entirely
@@ -179,19 +191,22 @@ def _best_model_metric_name(has_eval: bool) -> str | None:
     return "eval_macro_f1"
 
 
-def _val_split(dataset, val_size: float, random_state: int = 42) -> tuple[Subset, Subset]:
+def _val_split(
+    dataset, val_size: float, random_state: int = 42, id2label: dict | None = None,
+) -> tuple[Subset, Subset]:
     """Carve a stratified validation subset from dataset, returning (train_subset, val_subset).
 
     Uses stratified splitting so class proportions are preserved in both subsets.
-    The original dataset is not modified.
+    The original dataset is not modified. ``id2label`` only lets the small-sample
+    warning name causes instead of label ids.
     """
-    labels = _get_dataset_labels(dataset)
-    indices = list(range(len(dataset)))
-    train_idx, val_idx = _sklearn_val_split(
-        indices,
-        test_size=val_size,
-        random_state=random_state,
-        stratify=labels,
+    train_idx, val_idx = stratified_indices(
+        _get_dataset_labels(dataset),
+        val_size,
+        random_state,
+        what="validation",
+        label_names=id2label,
+        log=logger,
     )
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
@@ -237,20 +252,12 @@ def _remove_checkpoint_dirs(output_dir: Path) -> int:
     return removed
 
 
-def get_device() -> torch.device:
-    """Return the best available device: CUDA, MPS, CPU.
-
-    Kept here so existing ``from multimodalva.text.train import get_device``
-    imports keep working; the implementation lives in ``utils.runtime``.
-    """
-    return _get_device()
-
 
 def freeze_model_layers(model, freeze_layers: int):
     """Freeze the embedding layer and the first N encoder layers.
 
     Supports BERT, RoBERTa, Longformer, BigBird, and ELECTRA architectures,
-    covering all models in SUPPORTED_MODELS.
+    covering all models in TEXT_MODELS.
 
     Args:
         model: A loaded HuggingFace sequence classification model.
@@ -335,7 +342,7 @@ class WeightedTrainer(Trainer):
 
     Also re-applies label_smoothing_factor from TrainingArguments so that
     both class_weights and label_smoothing work correctly together.
-    Used automatically by train() when hp["class_weights"] is set and
+    Used automatically by train_text() when hp["class_weights"] is set and
     hp["loss_type"] is not "focal".
     """
 
@@ -384,7 +391,7 @@ class FocalLossTrainer(Trainer):
         hp["label_smoothing"] = 0.0        # do not combine with focal loss
         optimize_metric       = "f1_macro" # or "balanced_accuracy" / "csmf_accuracy"
 
-    Used automatically by train() when hp["loss_type"] == "focal".
+    Used automatically by train_text() when hp["loss_type"] == "focal".
     """
 
     def __init__(
@@ -438,7 +445,7 @@ class FocalLossTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
-def train(
+def train_text(
     train_dataset: Dataset,
     label2id: dict,
     id2label: dict,
@@ -456,6 +463,7 @@ def train(
     use_fast: bool = True,
     eval_batch_size: int = 32,
     random_state: int = 42,
+    split_seed: int | None = None,
     use_compile: bool = False,
 ) -> tuple[Trainer, AutoTokenizer, dict]:
     """Fine-tune a BERT-family model for multiclass classification.
@@ -468,16 +476,16 @@ def train(
         - training_metadata.json  (full log history + eval metrics)
 
     When use_lora=True, LoRA weights are merged into the base model before
-    saving so that predict() can reload the model with the standard
+    saving so that predict_text() can reload the model with the standard
     AutoModelForSequenceClassification.from_pretrained() call.
 
     Args:
-        train_dataset: Tokenized ClassificationDataset (or Subset) from prepare_dataset().
-        label2id: Label-to-integer mapping from prepare_dataset().
-        id2label: Integer-to-label mapping from prepare_dataset().
+        train_dataset: Tokenized ClassificationDataset (or Subset) from prepare_text_dataset().
+        label2id: Label-to-integer mapping from prepare_text_dataset().
+        id2label: Integer-to-label mapping from prepare_text_dataset().
         model_name: HuggingFace model name or local path (e.g. "bert-base-uncased").
         output_dir: Directory where all outputs are saved.
-        hyperparams: Training hyperparameters. Merged over DEFAULT_HYPERPARAMS.
+        hyperparams: Training hyperparameters. Merged over TEXT_DEFAULT_HYPERPARAMS.
                      Core keys: learning_rate, batch_size, epochs, weight_decay,
                        warmup_ratio, gradient_accumulation_steps.
                      Regularisation: label_smoothing (0.0–0.1), max_grad_norm.
@@ -506,7 +514,7 @@ def train(
                              sizes; up to ``save_total_limit`` are kept during a run).
                              The final model weights saved directly in output_dir
                              (``model.safetensors`` + config + tokenizer + label maps)
-                             are unaffected and reload cleanly via ``predict()``.
+                             are unaffected and reload cleanly via ``predict_text()``.
                              Cleanup happens only AFTER a successful run, so the latest
                              checkpoint is always available to resume from mid-run.
                              Default True; set False to retain checkpoints for inspection.
@@ -535,6 +543,11 @@ def train(
                          Only relevant when val_size > 0.
         random_state: Lightweight seed used for RNG initialization plus
                       Hugging Face Trainer `seed` / `data_seed` settings.
+        split_seed:   Seed for the row partitioning this function does
+                      internally — the early-stopping validation slice. ``None`` (the default) reuses
+                      ``random_state``, so existing callers are unaffected.
+                      Pass it separately to hold the partition fixed while
+                      ``random_state`` reseeds the model.
                       Default 42.
         use_compile: Apply torch.compile() to the model before training.
                      Uses the "reduce-overhead" mode with backend="aot_eager" on MPS
@@ -560,7 +573,7 @@ def train(
     model_name = resolve_model_name(model_name)
 
     # Merge hyperparams over defaults
-    hp = {**DEFAULT_HYPERPARAMS}
+    hp = {**TEXT_DEFAULT_HYPERPARAMS}
     if use_lora:
         hp.update(LORA_DEFAULTS)
     if hyperparams:
@@ -585,12 +598,13 @@ def train(
     num_labels = len(label2id)
 
     # --- Carve out validation split from training data ---
-    # Test data must never enter train(); it is reserved exclusively for predict().
+    # Test data must never enter train_text(); it is reserved exclusively for predict_text().
     if val_size is not None and val_size > 0.0:
         train_dataset, val_dataset = _val_split(
             train_dataset,
             val_size,
-            random_state=random_state,
+            random_state=split_seed if split_seed is not None else random_state,
+            id2label=id2label,
         )
         has_eval = True
         logger.info(
@@ -787,16 +801,23 @@ def train(
     _world_size = max(1, _int_env("WORLD_SIZE", 1) or 1)
     _rank = _int_env("RANK", 0) or 0
 
-    # --- CUDA performance flags (no-ops on CPU / MPS) ---
-    if _is_cuda:
+    # --- Precision / speed flags ---
+    # set_determinism() is the single source of truth for whether this run wants
+    # bit-for-bit repeatability, and it records that in torch's own global flag.
+    # Ask it rather than overwriting it: these lines used to switch TF32 back on
+    # unconditionally, so on a CUDA machine deterministic=True was silently
+    # undone the moment training started.
+    _want_determinism = torch.are_deterministic_algorithms_enabled()
+    if _is_cuda and not _want_determinism:
         # TF32 cuts matmul latency ~2–3× on Ampere+ (A100, RTX 30xx) with negligible
         # accuracy loss.  Both flags must be set: one for matmuls, one for cuDNN convs.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # Use higher matmul precision kernels where available (CUDA + MPS).
+    # "high" lets float32 matmul use TF32 (CUDA) or reduced-precision kernels
+    # (MPS) — a second route to the same nondeterminism, so it is gated too.
     try:
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("highest" if _want_determinism else "high")
     except Exception:
         pass
 
@@ -893,7 +914,7 @@ def train(
     #   checkpointing (PyTorch ≥ 2.1) does not require any input to have requires_grad,
     #   eliminating the "Gradients will be None" warning with frozen layers.
     metric_for_best_model = _best_model_metric_name(has_eval)
-    num_workers = int(hp["dataloader_num_workers"])
+    num_workers = _resolve_dataloader_workers(hp.get("dataloader_num_workers"))
     # On MPS (Apple Silicon), multiple DataLoader workers hurt rather than help:
     # (1) macOS uses the "spawn" start method — each worker costs ~0.5 s to start.
     # (2) Unified memory means batches don't need to be copied from CPU RAM to GPU;
@@ -1059,7 +1080,7 @@ def train(
 
     # Release any MPS memory that the Metal runtime is holding but no longer
     # needs.  Without an explicit cache flush, fragmented memory from the forward
-    # + backward passes can accumulate across multiple train() calls (e.g. HPO
+    # + backward passes can accumulate across multiple train_text() calls (e.g. HPO
     # trials), eventually causing OOM on machines with limited unified memory.
     if _is_mps:
         try:

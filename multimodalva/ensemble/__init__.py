@@ -15,6 +15,11 @@ __all__ = [
     "SoftVotingClassifier",
     "StackingClassifier",
     "qdesc_feature_overlap",
+    # Voting over results that already exist — the no-training path. Exported
+    # here because it is a first-class way to use the package, not an internal
+    # detail of the voting module.
+    "vote_from_results",
+    "soft_vote",
 ]
 
 
@@ -25,6 +30,8 @@ _EXPORTS = {
     "SoftVotingClassifier": ("multimodalva.ensemble.voting", "SoftVotingClassifier"),
     "StackingClassifier": ("multimodalva.ensemble.stacking", "StackingClassifier"),
     "qdesc_feature_overlap": ("multimodalva.ensemble.data_fusion", "qdesc_feature_overlap"),
+    "vote_from_results": ("multimodalva.ensemble.voting", "vote_from_results"),
+    "soft_vote": ("multimodalva.ensemble.voting", "soft_vote"),
 }
 
 

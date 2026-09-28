@@ -10,11 +10,19 @@ Spec format (used by both Optuna and Ray Tune backends in hpo.py):
     ("float",     low, high)   — uniform float
     ("int",       low, high)   — uniform int
     ("categorical", [values])  — discrete choices
+
+Precedence, lowest to highest: TABULAR_DEFAULT_SEARCH_SPACES[model_name] →
+get_tabular_default_search_space(model_name, X_train, ..., n_classes) → the
+caller's ``search_space=``, which overrides per key. The run log records which
+keys the caller replaced. See FAQ.md, "Which search space did my run actually
+use?".
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+from ..utils.hpo_defaults import get_class_tier
 
 # ---------------------------------------------------------------------------
 # Baseline search spaces per model alias.
@@ -24,11 +32,11 @@ import numpy as np
 #   ("int",       low, high)   — uniform int
 #   ("categorical", [values])  — discrete choices
 #
-# These serve as a balanced middle-ground profile. `get_default_search_space()`
+# These serve as a balanced middle-ground profile. `get_tabular_default_search_space()`
 # adapts them for small / wide / large tabular problems using X_train.shape.
 # ---------------------------------------------------------------------------
 
-DEFAULT_SEARCH_SPACES: dict[str, dict] = {
+TABULAR_DEFAULT_SEARCH_SPACES: dict[str, dict] = {
     "catboost": {
         "iterations":    ("int",         100, 1000),    # number of trees; more = higher capacity but slower training
         "learning_rate": ("float_log",   1e-3, 0.3),   # shrinkage per tree; lower = better generalization but needs more iterations
@@ -128,20 +136,6 @@ def _categorical_spec(values: list) -> tuple[str, list]:
 # ---------------------------------------------------------------------------
 # Class-count tier
 # ---------------------------------------------------------------------------
-
-def _class_tier(n_classes: int) -> str:
-    """Coarse tier from number of target classes (calibrated for 5–100 VA causes).
-
-    few      ≤ 14  — compact output; standard tree depth and leaf settings
-    moderate  15–39  — moderate multi-class complexity
-    many     ≥ 40  — large output; needs more trees, leaves, and MLP width
-    """
-    if n_classes <= 14:
-        return "few"
-    if n_classes <= 39:
-        return "moderate"
-    return "many"
-
 
 # ---------------------------------------------------------------------------
 # Class-count adjustments applied on top of the profile space
@@ -297,7 +291,7 @@ def _build_profile_space(
 ) -> dict:
     """Build a sample/feature-count-aware search space (no class-count adjustments).
 
-    Internal helper — call ``get_default_search_space()`` from outside code.
+    Internal helper — call ``get_tabular_default_search_space()`` from outside code.
     """
     profile = _resolve_search_space_profile(X_train, search_space_profile)
     n_samples, n_features = X_train.shape
@@ -428,7 +422,7 @@ def _build_profile_space(
                 "l2_leaf_reg": _float_log_spec(1e-2, 30.0),
                 "boosting_type": _categorical_spec(["Ordered", "Plain"]),
             }
-        return dict(DEFAULT_SEARCH_SPACES["catboost"])
+        return dict(TABULAR_DEFAULT_SEARCH_SPACES["catboost"])
 
     if model_name == "gbdt":
         if profile == "small":
@@ -536,14 +530,14 @@ def _build_profile_space(
             "gamma": _categorical_spec(["scale", "auto"]),
         }
 
-    return dict(DEFAULT_SEARCH_SPACES.get(model_name, {}))
+    return dict(TABULAR_DEFAULT_SEARCH_SPACES.get(model_name, {}))
 
 
 # ---------------------------------------------------------------------------
 # Public entry point  (n_samples × n_features × n_classes)
 # ---------------------------------------------------------------------------
 
-def get_default_search_space(
+def get_tabular_default_search_space(
     model_name: str,
     X_train: np.ndarray,
     search_space_profile: str = "auto",
@@ -559,5 +553,7 @@ def get_default_search_space(
     overrides on top — caller values always win.
     """
     space = _build_profile_space(model_name, X_train, search_space_profile)
-    ct = _class_tier(n_classes)
+    # few: standard tree depth and leaf settings.
+    # many: needs more trees, more leaves and a wider MLP.
+    ct = get_class_tier(n_classes)
     return _apply_nclasses_adjustments(space, model_name, n_classes, ct)

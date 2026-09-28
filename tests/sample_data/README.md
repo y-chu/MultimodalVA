@@ -30,6 +30,8 @@ Note the `n_per_class=6` — the default is 4, which gives a smaller file.
 | `va_sample_text_only.csv` | 66 | none — id, label, narrative | (text pipeline) |
 | `va_who2016_sample.csv` | 400 | WHO 2016 ODK `Id10xxx` (`yes`/`no`) | `multimodalva/utils/qdesc_who2016.csv` |
 
-Cause labels are at the `broad cause grouping` level.
+Cause labels are a broad grouping — eleven causes — rather than a fine-grained
+cause list, which is what keeps a file this small usable: every cause still has
+enough rows to appear on both sides of a stratified split.
 
 To see every dataset the package ships, run `multimodalva list-datasets`.

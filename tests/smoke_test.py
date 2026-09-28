@@ -90,7 +90,7 @@ def _sample_df(n_per_class: int = 30):
 def check_tabular(workdir: Path) -> str:
     from multimodalva import run
     out = workdir / "tab"
-    res = run(task="tabular", data=_sample_df(), label="cause_of_death",
+    res = run(task="tabular", data=_sample_df(), label_col="cause_of_death",
               model="random_forest", output_dir=out, features=r"re:^i\d{3}")
     top1 = out / "predictions" / "predictions_top1.csv"
     assert top1.exists(), "predictions_top1.csv not written"
@@ -104,7 +104,7 @@ def check_external_split(workdir: Path) -> str:
     df = _sample_df()
     ids = df["id"].tolist()
     spec = {"train_ids": ids[:250], "test_ids": ids[250:]}
-    res = run(task="tabular", data=df, label="cause_of_death",
+    res = run(task="tabular", data=df, label_col="cause_of_death",
               model="random_forest", output_dir=workdir / "split",
               features=r"re:^i\d{3}", split=spec, id_col="id")
     got = len(res["predictions"].top1)
@@ -119,7 +119,7 @@ def check_cli(workdir: Path, csv_path: Path) -> str:
     subprocess.run(
         [sys.executable, "-m", "multimodalva.cli", "run",
          "--task", "tabular", "--data", str(csv_path),
-         "--label", "cause_of_death", "--model", "random_forest",
+         "--label-col", "cause_of_death", "--model", "random_forest",
          "--output-dir", str(out), "--features", r"re:^i\d{3}"],
         check=True, capture_output=True, text=True,
     )
@@ -137,7 +137,7 @@ def check_yaml(workdir: Path, csv_path: Path) -> str:
     cfg.write_text(
         "task: tabular\n"
         f"data: {csv_path}\n"
-        "label: cause_of_death\n"
+        "label_col: cause_of_death\n"
         "model: random_forest\n"
         f"output_dir: {out}\n"
         'features: "re:^i\\\\d{3}"\n'
@@ -153,7 +153,7 @@ def check_yaml(workdir: Path, csv_path: Path) -> str:
 def check_text(workdir: Path) -> str:
     from multimodalva import run
     try:
-        res = run(task="text", data=_sample_df(20), label="cause_of_death",
+        res = run(task="text", data=_sample_df(20), label_col="cause_of_death",
                   text_col="narrative", model="prajjwal1/bert-tiny",
                   output_dir=workdir / "text", use_lora=False, use_cv=False,
                   hyperparams={"epochs": 1, "batch_size": 16})

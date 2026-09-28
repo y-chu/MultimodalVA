@@ -1,7 +1,9 @@
 [build-system]
 # setuptools>=68 bundles its own distutils, required for Python 3.12+
 # (stdlib distutils was removed in Python 3.12).
-requires = ["setuptools>=68", "wheel"]
+# >=77 is what understands the PEP 639 `license = "MIT"` SPDX expression below;
+# an older setuptools would silently fall back to the deprecated License field.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +12,8 @@ version = "0.1.0"
 description = "Cause of death classification using text and tabular data from verbal autopsies"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     {name = "Yue Chu", email = "ychu612@gmail.com"},
 ]
@@ -29,7 +32,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Healthcare Industry",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
@@ -74,29 +76,17 @@ dependencies = [
     "scipy>=1.14; python_version>='3.13'",
     # optuna 3.4: first release with Python 3.12 classifiers (Nov 2023).
     "optuna>=3.4",
-    # ray 2.9: first release with official Python 3.12 support.
-    # ray[tune] is required for optimize_ray() in text/hpo.py and tabular/hpo.py.
-    "ray[tune]>=2.9",
-    # opentelemetry packages: transitive deps of ray[tune]. On some HPC clusters
-    # ray is pre-installed without its [tune] extras, leaving these missing and
-    # causing ImportError at tune startup. Listed explicitly to guarantee install.
-    # >=1.1.0: minimum version known to be compatible with ray[tune]>=2.9.
-    "opentelemetry-api>=1.1.0",
-    "opentelemetry-sdk>=1.1.0",
-    "opentelemetry-exporter-otlp>=1.1.0",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.1.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.1.0",
-    "opentelemetry-instrumentation>=0.22b0",
-    # grpcio: required by opentelemetry-exporter-otlp-proto-grpc and ray.
-    # >=1.42.0: minimum for Python 3.10+ (covers 3.12).
-    "grpcio>=1.42.0",
-    # protobuf: required by grpcio and ray serialisation.
-    # >=3.20.3: minimum declared by ray 2.9+; <5 avoids untested major bump.
-    "protobuf>=3.20.3,<5",
-    # optuna-integration 3.4: required by Ray Tune's OptunaSearch backend.
-    "optuna-integration>=3.4",
+    # Ray Tune, and the three packages that were only ever here for it, moved to
+    # the [ray] extra on 2026-09-27 — see that extra for the reasoning and the
+    # measurements. Nothing in the package imports ray, grpcio or protobuf at
+    # module level, so a Ray-less install is fully functional on the Optuna
+    # backend and `Optimize(backend="auto")` resolves to Optuna when ray is absent.
     # joblib 1.3: pure Python, compatible with 3.12.
     "joblib>=1.3",
+    # PyYAML: the CLI reads YAML config files (`multimodalva run experiment.yaml`),
+    # a documented entry point, so it is declared rather than relied on as a
+    # transitive dependency of transformers / datasets / optuna / accelerate.
+    "pyyaml>=5.1",
     # matplotlib 3.8: first release to drop distutils (removed in 3.12) and
     # officially support Python 3.12 (Sep 2023). 3.7 fails on 3.12.
     "matplotlib>=3.8",
@@ -115,9 +105,22 @@ dependencies = [
     # be wanted; unlike AutoGluon they add no constraint on torch/transformers.
     # lightgbm 4.1: first release with Python 3.12 wheels (Oct 2023).
     "lightgbm>=4.1",
-    # xgboost 2.0: released Oct 2023 alongside Python 3.12, includes 3.12 wheels.
-    # 2.1+ added NumPy 2.x support and is backward-compatible with numpy<2.
-    "xgboost>=2.0",
+    # xgboost 3.0: NumPy 2.x support, Python 3.12/3.13 wheels, and the first
+    # release whose saved boosters load in every later 3.x — which matters here
+    # because `predict_from_pretrained()` loads artifacts trained elsewhere.
+    #
+    # No upper bound, deliberately. xgboost's tree construction is not bit-stable
+    # across minor releases: with subsample or colsample_bytree below 1 — the
+    # regime a tuned model usually lands in — the same data, folds, seed and
+    # hyperparameters fitted by 3.0.2 and by 3.1.3 were measured to differ by up
+    # to 0.30 in predicted probability, enough to move 6% of top-1 labels. That is
+    # a property of xgboost, not something a dependency range can fix: any range
+    # wide enough to install permits some drift, and a range narrow enough to
+    # prevent it makes the package uninstallable as soon as the next release
+    # lands. Reproducing a specific saved run is an environment question — record
+    # the versions (`pip freeze`) alongside the run and reinstall them — and the
+    # FAQ says so under "How do I make a run reproducible?".
+    "xgboost>=3.0",
     # catboost 1.2.2: first release with Python 3.12 wheels (Dec 2023);
     # compiled against NumPy 1.x, compatible with the numpy<2 cap above.
     "catboost>=1.2.2",
@@ -145,15 +148,70 @@ feature_fusion = [
     "accelerate>=0.34,<2.0",
 ]
 
+# --- Distributed / parallel hyperparameter search ---
+# Install with: pip install multimodalva[ray]
+#
+# Only needed to run a search with Optimize(backend="ray"), which trains trials
+# in parallel across the CPUs, GPUs or cluster nodes Ray can see. Without this
+# extra the package is complete: every pipeline runs, and a search runs on the
+# Optuna backend (which is what produced every result in the paper).
+# `Optimize(backend="auto")` checks whether ray is importable and resolves to
+# Optuna when it is not, warning if the machine looks like one where Ray would
+# have paid off (a CUDA GPU or a SLURM allocation).
+#
+# Why an extra rather than core (measured 2026-09-27, ray 2.44.1):
+#   - 363 MB installed, more than torch (330 MB): ray 192 MB, pyarrow 131 MB,
+#     grpcio 34 MB. Every user paid that for a backend most never run.
+#   - It takes the `protobuf<5` ceiling out of the core dependency set. That pin
+#     is this project's, not Ray's (ray asks only for protobuf>=3.15.3), and it
+#     is the most conflict-prone line here — it is what made the install
+#     unresolvable when the opentelemetry-* pins were present.
+#   - ray is a core dependency no longer able to break `pip install multimodalva`
+#     for users who never search with it.
+# What this extra does NOT save: `[feature_fusion]` pulls ray in regardless, via
+# autogluon.multimodal -> autogluon.core[raytune] -> ray[default,tune].
+#
+# Version window: the floor is unchanged from when this was core (2.9, the first
+# release with official Python 3.12 support). The <2.53 ceiling matches
+# autogluon.core[raytune]'s own `ray[default,tune]>=2.43,<2.53`, so [ray] and
+# [feature_fusion] resolve together instead of pip having to backtrack — and it
+# keeps Ray inside the 2.x API surface that utils/ray_compat.py shims.
+ray = [
+    "ray[tune]>=2.9,<2.53",
+    # Required by Ray Tune's OptunaSearch, which is the search algorithm the Ray
+    # backend drives. Plain optuna does not need it.
+    "optuna-integration>=3.4",
+    # grpcio is NOT declared by ray (checked against 2.44.1) and nothing in this
+    # package imports it; Ray's gRPC use is through its bundled C++ core, and a
+    # too-old system grpcio has broken Ray clusters before. >=1.42.0 is the
+    # Python 3.10+ minimum. Drop it only after a clean-install test of a real
+    # Ray run.
+    "grpcio>=1.42.0",
+    # Required by grpcio and by ray serialisation. >=3.20.3 is ray 2.9+'s own
+    # minimum; <5 avoids an untested major bump. Kept here rather than in core so
+    # this ceiling only constrains environments that actually run Ray.
+    "protobuf>=3.20.3,<5",
+]
+
 # --- Everything optional, in one install ---
 # pip install "multimodalva[all]"
 # The recommended install when disk and environment constraints allow: it adds
-# LoRA and AutoGluon feature fusion on top of the core pipelines.
-# Note: InSilicoVA is not included. `pyinsilicova` requires Python <3.10 while
-# this package requires >=3.12, so it cannot be installed here at all; the
-# stacking code keeps the `model_name="insilicova"` hook for a future release.
+# LoRA, the Ray search backend and AutoGluon feature fusion on top of the core
+# pipelines.
+# Note: InSilicoVA is not included, and is not supported yet (a v1 item).
+# `pyinsilicova` does not install on the Python this package requires (>=3.12),
+# and it cannot train a probbase against a study's own cause list — native
+# causes only. Run InSilicoVA separately and evaluate its predictions through
+# `results`; the `model_name="insilicova"` hook in the stacking code is
+# unfinished scaffolding, not a feature.
 all = [
     "peft>=0.7",
+    # The [ray] extra, inlined (PEP 621 has no way to reference another extra).
+    # Keep in step with [ray] above.
+    "ray[tune]>=2.9,<2.53",
+    "optuna-integration>=3.4",
+    "grpcio>=1.42.0",
+    "protobuf>=3.20.3,<5",
     "autogluon.multimodal>=1.5,<1.6",
     "numpy<2.4",
     "torch>=2.6,<2.10",
@@ -173,7 +231,9 @@ multimodalva = "multimodalva.cli:main"
 [project.urls]
 Homepage = "https://github.com/y-chu/MultimodalVA"
 Repository = "https://github.com/y-chu/MultimodalVA"
-Documentation = "https://github.com/y-chu/MultimodalVA/blob/main/docs/index.html"
+# The FAQ is the entry point that renders on GitHub; docs/index.html is the
+# generated API reference, which GitHub serves as source rather than as a page.
+Documentation = "https://github.com/y-chu/MultimodalVA/blob/main/FAQ.md"
 
 [tool.setuptools.packages.find]
 where = ["."]

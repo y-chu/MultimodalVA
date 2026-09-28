@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
-# Interface 2 of 3 — the `multimodalva` command-line tool.
+# Template 2 of 3 — the `multimodalva` command-line tool.
 #
-# Best for SLURM/sbatch jobs and non-coders: one line, no Python authoring.
-# Installed as a console script by `pip install multimodalva`. If not installed,
-# every `multimodalva` below can be replaced with `python -m multimodalva.cli`.
+# Copy this file and edit it. Use it when you do not want to write Python at
+# all, and for cluster jobs (SLURM/sbatch), where one command per job is the
+# natural unit. `multimodalva` is installed alongside the package; if it is not
+# on your PATH, replace every `multimodalva` below with
+# `python -m multimodalva.cli`.
 #
-# Each flag maps 1:1 to a `multimodalva.run()` argument, so the CLI, the Python
-# function, and a YAML config all drive the same pipeline and write the same
-# outputs (final/ , predictions/ , hpo/ , diagnostics).
+# Each flag is one `multimodalva.run()` argument, so this file, the Python
+# template and a config file drive the same pipeline and write the same outputs
+# (final/ , predictions/ , hpo/ , diagnostics).
 #
-# The examples use a CSV exported from the built-in synthetic dataset so they
-# run with no external data. Swap in your own CSV, --label, --text-col and
-# --features. `set -e` stops at the first error.
+# To run it on your own data, change four things in each command below:
+#
+#   --data        the path to your CSV
+#   --label-col   your cause-of-death column
+#   --text-col    your narrative column
+#   --features    your indicator columns: a regex, or a comma-separated list
+#
+# Everything else already has a working default. `set -e` stops at the first
+# error.
 
 set -euo pipefail
 
@@ -29,11 +37,11 @@ multimodalva list-models
 multimodalva run \
   --task text \
   --data "${DATA}" \
-  --label cause_of_death \
+  --label-col cause_of_death \
   --text-col narrative \
   --model bluebert \
   --output-dir runs/cli/text_bluebert \
-  --optimize --n-trials 20 --metric f1_macro
+  --optimize --n-trials 20 --optimize-metric f1_macro
 
 # ---------------------------------------------------------------------------
 # 2. Unimodal tabular
@@ -41,11 +49,11 @@ multimodalva run \
 multimodalva run \
   --task tabular \
   --data "${DATA}" \
-  --label cause_of_death \
+  --label-col cause_of_death \
   --features 're:^i\d{3}[a-zA-Z]$' \
   --model lightgbm \
   --output-dir runs/cli/tabular_lightgbm \
-  --optimize --n-trials 40 --metric f1_macro
+  --optimize --n-trials 40 --optimize-metric f1_macro
 
 # Row filtering (e.g. adults only) and a fixed external split both work from the
 # CLI too:
@@ -58,14 +66,14 @@ multimodalva run \
 multimodalva run \
   --task data_fusion \
   --data "${DATA}" \
-  --label cause_of_death \
+  --label-col cause_of_death \
   --text-col narrative \
   --features 're:^i\d{3}[a-zA-Z]$' \
   --model clinicalbigbird \
   --output-dir runs/cli/data_fusion
-# NOTE: voting and stacking need per-model spec lists (text_models / tabular_models).
-#       Those are lists of dicts — express them in a YAML config (see
-#       example_config_*.yaml) rather than on the command line.
+# NOTE: voting and stacking each combine a list of models, and a list of models
+#       is awkward to type on a command line. Use a config file for those —
+#       see config_ensemble_stacking.yaml.
 
 # ---------------------------------------------------------------------------
 # 4. Train a text model and publish it to the Hugging Face Hub
@@ -74,7 +82,7 @@ multimodalva run \
 multimodalva run \
   --task text \
   --data "${DATA}" \
-  --label cause_of_death \
+  --label-col cause_of_death \
   --text-col narrative \
   --model bluebert \
   --output-dir runs/cli/text_for_hub \

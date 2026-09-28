@@ -9,7 +9,7 @@ model training (no torch/transformers compute needed beyond import):
   - _find_latest_checkpoint() still resolves the latest checkpoint (resume needs it
     to survive DURING a run — cleanup happens only after completion).
   - HPO trials leave no weights: _trial_workdir(None) is a tempdir deleted on exit;
-    _trial_workdir(path) persists. optimize()/optimize_ray() default
+    _trial_workdir(path) persists. optimize_text()/optimize_text_ray() default
     export_best_trial=False, cleanup_trials=True.
   - data() example loaders work and reproduce committed sample CSVs.
 
@@ -51,9 +51,9 @@ def _make_fake_run_dir(root: Path) -> Path:
 
 # --- train.py defaults -----------------------------------------------------
 def test_train_storage_defaults():
-    from multimodalva.text.train import train
+    from multimodalva.text.train import train_text
 
-    params = inspect.signature(train).parameters
+    params = inspect.signature(train_text).parameters
     assert params["cleanup_checkpoints"].default is True
     assert params["save_total_limit"].default == 2
     assert params["report_to"].default == "none"
@@ -119,12 +119,12 @@ def test_trial_workdir_persistent_is_kept(tmp_path):
 
 # --- HPO signature defaults ------------------------------------------------
 def test_optimize_storage_defaults():
-    from multimodalva.text.hpo import optimize, optimize_ray
+    from multimodalva.text.hpo import optimize_text, optimize_text_ray
 
-    op = inspect.signature(optimize).parameters
+    op = inspect.signature(optimize_text).parameters
     assert op["export_best_trial"].default is False
     assert op["cleanup_trials"].default is True
-    rp = inspect.signature(optimize_ray).parameters
+    rp = inspect.signature(optimize_text_ray).parameters
     assert rp["export_best_trial"].default is False
     assert rp["cleanup_trials"].default is True
 
@@ -156,7 +156,8 @@ def test_data_loader_reproduces_committed_csv():
     if not committed_path.exists():
         pytest.skip("committed va_sample.csv not present")
     committed = pd.read_csv(committed_path)
-    # committed CSV is generated with n_per_class=6 (see demo_hub sample-data default)
+    # The committed CSV was generated with n_per_class=6; keep the two in step, or
+    # regenerate the CSV. Absent from the sdist by design, hence the skip above.
     regenerated = data("va_sample", n_per_class=6)
     pd.testing.assert_frame_equal(committed, regenerated)
 

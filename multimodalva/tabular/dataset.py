@@ -93,7 +93,7 @@ def valid_label_mask(df: pd.DataFrame, label_col: str) -> pd.Series:
     return ~(df[label_col].isna() | (df[label_col].astype(str).str.strip() == ""))
 
 
-def prepare_dataset(
+def prepare_tabular_dataset(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     feature_cols: list[str],
@@ -135,7 +135,7 @@ def prepare_dataset(
         y_train:      Integer label array for training.
         y_test:       Integer label array for evaluation.
         preprocessor: Fitted ColumnTransformer, or None if no transformation was applied.
-                      Bundled into model.joblib by train() for inference on new data.
+                      Bundled into model.joblib by train_tabular() for inference on new data.
         label2id:     Dict mapping label strings → integer IDs.
         id2label:     Dict mapping integer IDs → label strings.
         feature_names: Post-transformation feature names for SHAP and visualization.

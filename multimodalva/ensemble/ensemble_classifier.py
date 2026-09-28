@@ -66,6 +66,15 @@ Stage-wise stacking (cross-session)::
     )
     predictions = clf.predict_test()
 
+    # Stage 2/3 alternatives on the same Stage 1 output
+    clf.compare_combiners_stage(n_combiner_folds=5) # nested-CV table of combiners
+    clf.train_ensemble_selection_stage(ensemble_size=100)
+    predictions = clf.predict_test_ensemble_selection()
+
+    # Or end-to-end: several combiners from one Stage 1, the first is the main one
+    clf.run(df=df, ..., combiner=["meta_learner", "ensemble_selection"])
+    clf.run(df=df, ..., combiner="best")   # chosen on training data only
+
 Accessing strategy-specific attributes::
 
     clf.classifier        # underlying strategy instance
@@ -118,7 +127,10 @@ class EnsembleClassifier:
     | "data_fusion"    | tabular→text concat + LM fine-tuning      |
     | "feature_fusion" | AutoGluon AutoMM text+tabular             |
     | "soft_voting"    | independent base models + soft vote       |
-    | "stacking"       | OOF k-fold + meta-learner (super learner) |
+    | "stacking"       | OOF k-fold + Stage 2 combiner: meta-      |
+    |                  | learner, class-aware voter or ensemble    |
+    |                  | selection, simple average (``combiner=``, |
+    |                  | a list, or ``"best"``)                    |
     +------------------+-------------------------------------------+
     """
 
@@ -232,17 +244,21 @@ class EnsembleClassifier:
 
         Common args (accepted by all strategies):
             test_size      (float) — test fraction; default 0.2
-            random_state   (int)   — seed; default 42
+            split_seed     (int)   — row-partitioning seed; default 42
+            train_seed     (int)   — model-stochasticity seed; default 42
+            deterministic  (bool)  — bit-for-bit kernels; default False
             stratify       (bool)  — stratified split; default True
             top_k          (int)   — top-K classes in topk output; default 3
 
         Strategy-specific args (examples):
-            data_fusion:    max_length, use_lora, use_optimize, hyperparams, ...
-            feature_fusion: time_limit, hyperparameters, use_hpo, ...
+            data_fusion:    max_length, use_lora, hyperparams, ...
+            feature_fusion: time_limit, hyperparams, hpo_scheduler, ...
             soft_voting:    n_jobs, use_gpu, batch_size, weights, ...
             stacking:       n_jobs, use_gpu, encode_categoricals,
                             save_fold_models, cleanup_fold_files,
-                            meta_cv_folds, ...
+                            meta_cv_folds, combiner (str, list or
+                            "best"), n_combiner_folds, oof_from,
+                            class_voter_kwargs, ensemble_selection_kwargs, ...
 
         Args:
             df:           Input DataFrame.
@@ -302,7 +318,8 @@ class EnsembleClassifier:
             **kwargs:     Forwarded to
                           :meth:`~multimodalva.ensemble.stacking.StackingClassifier.train_base_models`.
                           Key options:
-                          test_size (float), random_state (int), val_size (float),
+                          test_size (float), split_seed (int), train_seed (int),
+                          val_size (float),
                           n_jobs (int), use_gpu (bool | None),
                           encode_categoricals (str | None), scale_numeric (bool),
                           save_fold_models (bool), cleanup_fold_files (bool).
@@ -338,7 +355,9 @@ class EnsembleClassifier:
                       Key options:
                       meta_learners (list[dict] | dict | None),
                       metric (str | None), meta_cv_folds (int),
-                      random_state (int), n_jobs (int).
+                      split_seed (int | None), train_seed (int | None) —
+                      ``None`` inherits the seeds stage 1 ran with —
+                      n_jobs (int).
 
         Returns:
             dict with ``meta_learner``, ``meta_scores``, ``best_meta_name``,
@@ -363,7 +382,8 @@ class EnsembleClassifier:
             **kwargs: Forwarded to
                       :meth:`~multimodalva.ensemble.stacking.StackingClassifier.train_class_voter_stage`.
                       Key options:
-                      metric (str), alpha (float), shrinkage (float).
+                      metric (str), shrinkage (float),
+                      min_support_for_trust (float).
 
         Returns:
             dict with class-voter artifacts and metadata.
@@ -429,6 +449,97 @@ class EnsembleClassifier:
         result = self.classifier.predict_test_class_voter(**kwargs)
         self.predictions = result
         return result
+
+    def train_ensemble_selection_stage(self, **kwargs) -> dict:
+        """Stage 2 alternative for stacking: greedy ensemble selection.
+
+        Requires ``method="stacking"``. Delegates to
+        :meth:`~multimodalva.ensemble.stacking.StackingClassifier.train_ensemble_selection_stage`.
+
+        Learns one non-negative weight per base model (summing to 1) from the
+        Stage 1 OOF predictions (Caruana et al. 2004).
+
+        Args:
+            **kwargs: Forwarded. Key options: metric (str), ensemble_size (int),
+                      use_best_in_trajectory (bool), sorted_init (int),
+                      n_bags (int), bag_fraction (float), train_seed (int | None —
+                      None inherits stage 1's).
+
+        Returns:
+            dict with ``weights`` (per model), ``scores``, ``oof_score``,
+            ``best_single_score``, ``simple_average_score``, ``output_dir``.
+
+        Raises:
+            ValueError: If ``method`` is not ``"stacking"``.
+        """
+        self._require_method("stacking", "train_ensemble_selection_stage")
+        return self.classifier.train_ensemble_selection_stage(**kwargs)
+
+    def predict_test_ensemble_selection(self, **kwargs):
+        """Stage 3 alternative for stacking: combine test probabilities with the
+        saved ensemble-selection weights.
+
+        Requires ``method="stacking"``. Delegates to
+        :meth:`~multimodalva.ensemble.stacking.StackingClassifier.predict_test_ensemble_selection`.
+
+        Args:
+            **kwargs: Forwarded. Key options: top_k (int), batch_size (int).
+
+        Returns:
+            :class:`~multimodalva.utils.types.PredictionResult`.
+
+        Raises:
+            ValueError: If ``method`` is not ``"stacking"``.
+        """
+        self._require_method("stacking", "predict_test_ensemble_selection")
+        result = self.classifier.predict_test_ensemble_selection(**kwargs)
+        self.predictions = result
+        return result
+
+    def predict_test_simple_average(self, **kwargs):
+        """Stage 3 for stacking: equal-weight average of the final base models.
+
+        Requires ``method="stacking"``. Delegates to
+        :meth:`~multimodalva.ensemble.stacking.StackingClassifier.predict_test_simple_average`.
+        Nothing is trained, so there is no Stage 2 for this combiner.
+
+        Args:
+            **kwargs: Forwarded. Key options: top_k (int), batch_size (int).
+
+        Returns:
+            :class:`~multimodalva.utils.types.PredictionResult`.
+
+        Raises:
+            ValueError: If ``method`` is not ``"stacking"``.
+        """
+        self._require_method("stacking", "predict_test_simple_average")
+        result = self.classifier.predict_test_simple_average(**kwargs)
+        self.predictions = result
+        return result
+
+    def compare_combiners_stage(self, **kwargs):
+        """Compare the Stage 2 combiners by nested CV over the OOF rows.
+
+        Requires ``method="stacking"``. Delegates to
+        :meth:`~multimodalva.ensemble.stacking.StackingClassifier.compare_combiners_stage`.
+        Uses training data only; ``run(combiner="best")`` chooses with it.
+
+        Args:
+            **kwargs: Forwarded. Key options: metric (str), n_combiner_folds (int),
+                      split_seed / train_seed (int | None — None inherits stage 1's),
+                      meta_learners (list[dict]), class_voter_kwargs (dict),
+                      ensemble_selection_kwargs (dict).
+
+        Returns:
+            DataFrame with one row per combiner (``simple_average``,
+            ``class_aware_voting``, ``ensemble_selection``, then one per
+            meta-learner, named by its ``model_name``).
+
+        Raises:
+            ValueError: If ``method`` is not ``"stacking"``.
+        """
+        self._require_method("stacking", "compare_combiners_stage")
+        return self.classifier.compare_combiners_stage(**kwargs)
 
     # ------------------------------------------------------------------
     # Internal helpers

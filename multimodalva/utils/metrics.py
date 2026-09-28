@@ -23,6 +23,7 @@ from typing import Any
 
 import numpy as np
 import optuna
+import pandas as pd                   # noqa: F401 — resolves the "pd.DataFrame" annotations below
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 
 # Recorded for every cross-validation fold, so a run can be scored on any of
@@ -140,7 +141,7 @@ def score_predictions(top1_df, metric: str) -> float:
     """Compute a scalar score from a top1 predictions DataFrame.
 
     Works with the `top1` attribute of PredictionResult from either
-    text.predict() or tabular.predict().
+    predict_text() or predict_tabular().
 
     Args:
         top1_df: DataFrame with columns ``true_label`` and ``predicted_label``.
@@ -228,7 +229,17 @@ def log_loss_from_full(full_df: "pd.DataFrame", id2label: dict) -> float:
             )
         labels.append(label)
 
-    return float(log_loss(y_true, y_proba, labels=labels))
+    # sklearn's log_loss aligns the columns of y_proba to *lexicographically
+    # sorted* labels, whatever order `labels=` is given in — it only warns. Our
+    # columns are in class-id order, so unless the ids happen to be alphabetical
+    # the two disagree and the number comes out silently wrong (measured: 2.455
+    # where the answer is 0.031). Reorder the columns to match what sklearn
+    # assumes. Runs whose ids are already alphabetical — every run this package
+    # produces, since the label encoders sort — are unaffected.
+    order = sorted(range(len(labels)), key=lambda i: labels[i])
+    return float(log_loss(
+        y_true, y_proba[:, order], labels=[labels[i] for i in order],
+    ))
 
 
 _COMPLEX_CHOICE_PREFIX = "__multimodalva_json_choice__:"

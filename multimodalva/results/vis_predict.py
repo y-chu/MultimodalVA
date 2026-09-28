@@ -54,7 +54,7 @@ import numpy as np
 import pandas as pd
 
 from ..utils.metrics import log_loss_from_full, REPORT_METRICS
-from .palettes import _TOPK_BAR_COLORS, HEATMAP_SEQ, HEATMAP_DIV, HEATMAP_CLINICAL
+from .palettes import TOPK_BAR_COLORS, HEATMAP_SEQ, HEATMAP_DIV, HEATMAP_CLINICAL
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,6 @@ def _make_metric_registry() -> dict:
         "cccsmf_accuracy":    cccsmf_accuracy,
     }
 
-
-_DEFAULT_METRICS = list(REPORT_METRICS)
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +130,7 @@ def performance_leaderboard(
         }
         board = performance_leaderboard(
             df, "true_label",
-            metrics=[*_DEFAULT_METRICS, "log_loss"],
+            metrics=[*REPORT_METRICS, "log_loss"],
             prob_dfs=prob_dfs,
             id2label=bert_result.id2label,
             sort_by="log_loss", ascending=True,
@@ -207,7 +205,7 @@ def performance_leaderboard(
     if not model_cols:
         raise ValueError("No model columns found.  Pass model_cols explicitly.")
 
-    metrics = metrics or _DEFAULT_METRICS
+    metrics = metrics or list(REPORT_METRICS)
     registry = _make_metric_registry()
 
     label_metrics = [m for m in metrics if m not in _PROB_METRICS]
@@ -521,7 +519,7 @@ def _csmf_dataframe(
 # ---------------------------------------------------------------------------
 
 # Palettes imported from palettes.py — edit that file to adjust colours.
-# _TOPK_BAR_COLORS is used as the default categorical palette here.
+# TOPK_BAR_COLORS is used as the default categorical palette here.
 
 
 def plot_topk_accuracy(
@@ -624,7 +622,7 @@ def plot_topk_accuracy(
     import matplotlib.pyplot as plt
     from pathlib import Path
 
-    palette = colors or _TOPK_BAR_COLORS
+    palette = colors or TOPK_BAR_COLORS
 
     # ------------------------------------------------------------------ #
     # Single-model path
@@ -1476,6 +1474,8 @@ def cause_accuracy_heatmap(
         )
     if top_k < 1:
         raise ValueError(f"top_k must be ≥ 1, got {top_k}.")
+    if group_boundaries is not None and group_sizes is not None:
+        raise ValueError("Pass only one of group_boundaries or group_sizes, not both.")
 
     # ------------------------------------------------------------------
     # Steps 1–3: compute per-cause accuracy for each model
@@ -1514,6 +1514,9 @@ def cause_accuracy_heatmap(
         display_df = display_df.rename(index=cause_rename)
     if model_rename:
         display_df = display_df.rename(columns=model_rename)
+
+    if group_sizes is not None:
+        group_boundaries = _group_boundaries_from_sizes(group_sizes, len(display_df.columns))
 
     # ------------------------------------------------------------------
     # Step 6: colormap
@@ -2021,8 +2024,3 @@ def confusion_heatmap(
         logger.info("Heatmap saved to %s", save_path)
 
     return fig, ax
-    if group_boundaries is not None and group_sizes is not None:
-        raise ValueError("Pass only one of group_boundaries or group_sizes, not both.")
-
-    if group_sizes is not None:
-        group_boundaries = _group_boundaries_from_sizes(group_sizes, len(display_df.columns))

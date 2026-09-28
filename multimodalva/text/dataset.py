@@ -3,7 +3,7 @@ Step 2: Prepare tokenized datasets for transformer pipeline input.
 
 Input:  train_df, test_df from split()
 Output: train_dataset, test_dataset, label2id, id2label
-        — passed directly into train(), predict(), and optimize()
+        — passed directly into train_text(), predict_text(), and optimize_text()
 """
 
 import logging
@@ -21,7 +21,7 @@ class ClassificationDataset(Dataset):
     """PyTorch Dataset for sequence classification.
 
     Stores tokenized encodings and integer labels. The ``labels`` attribute
-    is intentionally public so that split() and optimize() can access it
+    is intentionally public so that split() and optimize_text() can access it
     for stratified sub-sampling without needing to decode items one by one.
 
     Sequences are stored without padding. DataCollatorWithPadding in the
@@ -132,7 +132,7 @@ def _drop_invalid_rows(
     return df[~mask_invalid].reset_index(drop=True)
 
 
-def prepare_dataset(
+def prepare_text_dataset(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     text_col: str,
@@ -214,7 +214,7 @@ def prepare_dataset(
     )
 
     logger.info(
-        "prepare_dataset(): completed in %.2fs — model=%s, use_fast=%s, max_length=%s, "
+        "prepare_text_dataset(): completed in %.2fs — model=%s, use_fast=%s, max_length=%s, "
         "%d train / %d test rows, %d classes.",
         time.perf_counter() - started,
         model_name,

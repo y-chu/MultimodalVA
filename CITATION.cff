@@ -14,7 +14,8 @@ abstract: >-
   A Python package for cause-of-death classification from verbal autopsy data.
   It provides a single interface over text-only, tabular-only and multimodal
   workflows, covering transformer fine-tuning, scikit-learn tabular models,
-  hyperparameter search, four ensemble strategies, and evaluation utilities
+  hyperparameter search, four ensemble methods spanning data-, feature- and
+  decision-level fusion, and evaluation utilities
   including CSMF accuracy and probability calibration.
 keywords:
   - verbal autopsy
@@ -25,6 +26,10 @@ keywords:
   - global health
 license: MIT
 version: 0.1.0
+# Keep in step with the git tag and with CHANGELOG.md's [0.1.0] heading.
+date-released: "2026-09-27"
+# After archiving the tagged release (e.g. on Zenodo), add its DOI here as:
+# doi: "10.5281/zenodo.XXXXXXX"
 references:
   - type: article
     title: >-

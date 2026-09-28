@@ -1,10 +1,10 @@
 """
 Step 4 (tabular pipeline): Predict class labels and probability distributions.
 
-Input:  (A) output_dir from train() — loads model bundle from model.joblib
-        (B) model + id2label in memory — skips disk I/O after train()
-        X_test, y_test from prepare_dataset()
-Output: PredictionResult(top1, full, topk, id2label) — identical format to text predict()
+Input:  (A) output_dir from train_tabular() — loads model bundle from model.joblib
+        (B) model + id2label in memory — skips disk I/O after train_tabular()
+        X_test, y_test from prepare_tabular_dataset()
+Output: PredictionResult(top1, full, topk, id2label) — identical format to predict_text()
 """
 
 from __future__ import annotations
@@ -19,12 +19,13 @@ import numpy as np
 import pandas as pd
 
 from ..utils.types import PredictionResult
+from ..utils.predictions import assemble_predictions, save_predictions
 from ..utils.numpy_compat import load_joblib_compat
 
 logger = logging.getLogger(__name__)
 
 
-def predict(
+def predict_tabular(
     output_dir: str | Path | None,
     X_test: np.ndarray,
     y_test: np.ndarray,
@@ -42,14 +43,14 @@ def predict(
       - Disk mode (default): loads model bundle and id2label from output_dir.
       - In-memory mode: pass model and id2label directly; set output_dir=None.
 
-    X_test must be a preprocessed numpy array from prepare_dataset() — the
+    X_test must be a preprocessed numpy array from prepare_tabular_dataset() — the
     preprocessor is NOT applied inside this function.
 
     Args:
-        output_dir:   Path saved by train(). Contains model.joblib and id2label.json.
+        output_dir:   Path saved by train_tabular(). Contains model.joblib and id2label.json.
                       Pass None when using in-memory mode.
-        X_test:       Preprocessed feature matrix from prepare_dataset().
-        y_test:       Integer label array from prepare_dataset().
+        X_test:       Preprocessed feature matrix from prepare_tabular_dataset().
+        y_test:       Integer label array from prepare_tabular_dataset().
         top_k:        Number of top classes in topk output. Default 3.
         save_dir:     Directory to write CSV outputs. None = no files written.
         save_prefix:  Filename stem for saved CSVs. Default "predictions".
@@ -61,10 +62,10 @@ def predict(
                       a leading ``id`` column in all three output tables so
                       predictions can be joined back to the source records.
                       Must line up with the rows in ``X_test`` — note that
-                      prepare_dataset() drops rows with a missing label.
+                      prepare_tabular_dataset() drops rows with a missing label.
 
     Returns:
-        PredictionResult(top1, full, topk, id2label) — same format as text predict().
+        PredictionResult(top1, full, topk, id2label) — same format as predict_text().
             top1: true_label, predicted_label, predicted_prob
             full: true_label, prob_0, prob_1, ...  (integer class IDs as column names)
             topk: true_label, top1_label, top1_prob, ..., topK_label, topK_prob
@@ -99,53 +100,20 @@ def predict(
         if len(ids) != len(X_test):
             raise ValueError(
                 f"Got {len(ids)} ids for {len(X_test)} test rows. Identifiers must "
-                "come from the same rows that were scored — prepare_dataset() "
+                "come from the same rows that were scored — prepare_tabular_dataset() "
                 "drops rows with a missing label (see valid_label_mask())."
             )
 
-    def _with_ids(frame: pd.DataFrame) -> pd.DataFrame:
-        if ids is not None:
-            frame.insert(0, "id", ids)
-        return frame
-
-    # --- Output 1: top1 ---
-    top1_idx = np.argmax(probs, axis=1)
-    top1_probs = probs[np.arange(len(probs)), top1_idx]
-    top1_df = _with_ids(pd.DataFrame({
-        "true_label": true_labels,
-        "predicted_label": [id2label[int(i)] for i in top1_idx],
-        "predicted_prob": top1_probs,
-    }))
-
-    # --- Output 2: full --- (integer IDs as column names — matches text pipeline)
-    prob_cols = {f"prob_{i}": probs[:, i] for i in sorted(id2label)}
-    full_df = _with_ids(pd.DataFrame({"true_label": true_labels, **prob_cols}))
-
-    # --- Output 3: topk ---
-    topk_idx = np.argsort(probs, axis=1)[:, ::-1][:, :k]  # descending
-    topk_probs = probs[np.arange(len(probs))[:, None], topk_idx]
-    topk_data: dict[str, list] = {"true_label": true_labels}
-    for rank in range(k):
-        topk_data[f"top{rank + 1}_label"] = [id2label[int(i)] for i in topk_idx[:, rank]]
-        topk_data[f"top{rank + 1}_prob"] = topk_probs[:, rank].tolist()
-    topk_df = _with_ids(pd.DataFrame(topk_data))
+    result = assemble_predictions(
+        probs, id2label, true_labels=true_labels, ids=ids, top_k=k
+    )
 
     logger.info(
         "Prediction complete: %d samples, %d classes, top-%d output.",
-        len(top1_df), n_classes, k,
+        len(result.top1), n_classes, k,
     )
 
-    result = PredictionResult(top1=top1_df, full=full_df, topk=topk_df, id2label=id2label)
-
     if save_dir is not None:
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        result.top1.to_csv(save_dir / f"{save_prefix}_top1.csv", index=False)
-        result.full.to_csv(save_dir / f"{save_prefix}_full.csv", index=False)
-        result.topk.to_csv(save_dir / f"{save_prefix}_topk.csv", index=False)
-        logger.info(
-            "Saved CSVs to %s: %s_top1.csv, %s_full.csv, %s_topk.csv",
-            save_dir, save_prefix, save_prefix, save_prefix,
-        )
+        save_predictions(result, save_dir, save_prefix)
 
     return result

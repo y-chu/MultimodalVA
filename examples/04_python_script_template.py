@@ -1,31 +1,38 @@
 #!/usr/bin/env python3
 r"""
-Interface 1 of 3 — the Python function ``multimodalva.run``.
+Template 1 of 3 — a Python script calling ``multimodalva.run``.
 
-Best for coders / statisticians working in a notebook or script: you already
-have a DataFrame (or a CSV path) and want defaults for everything you don't
-care about, with any single parameter overridable.
+Copy this file and edit it. Use it when you want the pipeline inside a script
+of your own: your data may need cleaning in pandas first, and ``run`` takes the
+DataFrame directly.
 
-Every example below is one call. ``data`` accepts a path OR an in-memory
-DataFrame, so preprocess however you like first, then hand the frame to ``run``.
+Run it as-is on the built-in synthetic data:
+    python examples/04_python_script_template.py tabular
+    python examples/04_python_script_template.py text
+    python examples/04_python_script_template.py ensemble
+    python examples/04_python_script_template.py hub   # needs a Hugging Face login
+    python examples/04_python_script_template.py all   # default; skips 'hub'
 
-Run a single example:
-    python examples/example_python_api.py tabular
-    python examples/example_python_api.py text
-    python examples/example_python_api.py ensemble
-    python examples/example_python_api.py all       # default
+To run it on your own data, change four things in any example below:
 
-The examples use the built-in synthetic dataset so they run with no external
-data. Swap ``data("va_sample")`` for your own ``pd.read_csv("clean.csv")`` (or
-just ``data="clean.csv"``) and set ``label`` / ``text_col`` / ``features`` to
-your columns.
+    data=data("va_sample", ...)  ->  data=pd.read_csv("my_data.csv")
+                                     (or simply data="my_data.csv")
+    label_col="cause_of_death"   ->  your cause-of-death column
+    text_col="narrative"         ->  your narrative column
+    features=...                 ->  your indicator columns: a list of names,
+                                     a regex as "re:...", or "auto" for every
+                                     column that is not the label / text /
+                                     filter / split column
+
+Everything else already has a working default. ``model`` and the ``Optimize(...)`` settings are what is most worth revisiting once a first run has
+finished; see examples/README.md for what each one changes.
 """
 
 from __future__ import annotations
 
 import sys
 
-from multimodalva import data, run
+from multimodalva import Optimize, data, run
 
 OUT = "examples/_runs"
 
@@ -38,13 +45,11 @@ def example_text() -> None:
     run(
         task="text",
         data=df,                      # or data="clean.csv"
-        label="cause_of_death",
+        label_col="cause_of_death",
         text_col="narrative",
         model="bluebert",             # any alias from `multimodalva list-models`, a HF id, or a local dir
         output_dir=f"{OUT}/text_bluebert",
-        optimize=True,                # Optuna HPO before the final fit
-        n_trials=20,
-        metric="f1_macro",
+        hyperparams=Optimize(n_trials=20, metric="f1_macro"),  # search before the final fit
         # advanced knobs pass straight through to TextClassifier.run():
         use_lora=False,
         use_cv=True, n_cv_folds=3,
@@ -59,13 +64,13 @@ def example_tabular() -> None:
     run(
         task="tabular",
         data=df,
-        label="cause_of_death",
+        label_col="cause_of_death",
         # feature selection: an explicit list, a regex ("re:..."), or "auto"
         # (every column except label / text / filter / split columns).
         features=r"re:^i\d{3}[a-zA-Z]$",
         model="lightgbm",             # catboost | lightgbm | xgboost | random_forest | mlp | svm | knn | ...
         output_dir=f"{OUT}/tabular_lightgbm",
-        optimize=True, n_trials=40, metric="f1_macro",
+        hyperparams=Optimize(n_trials=40, metric="f1_macro"),
         encode_categoricals="ordinal",
     )
 
@@ -82,12 +87,11 @@ def example_ensemble() -> None:
     run(
         task="data_fusion",
         data=df,
-        label="cause_of_death",
+        label_col="cause_of_death",
         text_col="narrative",
         features=features,
         model="clinicalbigbird",      # long-context; BigBird runs natively on Apple Silicon
         output_dir=f"{OUT}/data_fusion",
-        optimize=False,
     )
 
     # 3b. Feature fusion — AutoGluon AutoMM jointly over text + tabular.
@@ -95,7 +99,7 @@ def example_ensemble() -> None:
     run(
         task="feature_fusion",
         data=df,
-        label="cause_of_death",
+        label_col="cause_of_death",
         text_col="narrative",
         features=features,
         model="bioclinicalbert",
@@ -108,7 +112,7 @@ def example_ensemble() -> None:
     run(
         task="voting",
         data=df,
-        label="cause_of_death",
+        label_col="cause_of_death",
         text_col="narrative",
         features=features,
         output_dir=f"{OUT}/voting",
@@ -120,7 +124,7 @@ def example_ensemble() -> None:
     run(
         task="stacking",
         data=df,
-        label="cause_of_death",
+        label_col="cause_of_death",
         text_col="narrative",
         features=features,
         output_dir=f"{OUT}/stacking",
@@ -139,7 +143,7 @@ def example_hub() -> None:
     run(
         task="text",
         data=df,
-        label="cause_of_death",
+        label_col="cause_of_death",
         text_col="narrative",
         model="bluebert",
         output_dir=f"{OUT}/text_for_hub",

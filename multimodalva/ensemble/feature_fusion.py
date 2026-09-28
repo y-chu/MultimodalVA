@@ -11,7 +11,7 @@ DataFrame
   → split()                        — stratified train/test split
   → MultiModalPredictor.fit()      — joint text+tabular training
   → MultiModalPredictor.predict_proba() — probability predictions
-  → _assemble_prediction_result()  — same PredictionResult as text/tabular
+  → assemble_predictions()         — same PredictionResult as text/tabular
 
 Fusion strategies (``fusion_strategy``)
 ---------------------------------------
@@ -60,8 +60,7 @@ Dependencies
 Public API
 ----------
     FUSION_STRATEGIES         — registry of supported strategy names
-    DEFAULT_HPO_SPACE         — default search space for use_hpo=True (tuple format)
-    TEXT_BACKBONE_MODELS      — shorthand → HuggingFace ID map (from text pipeline)
+    DEFAULT_HPO_SPACE         — default search space for hyperparams=Optimize() (tuple format)
     FeatureFusionClassifier   — end-to-end wrapper
 """
 
@@ -78,10 +77,21 @@ import numpy as np
 import pandas as pd
 
 from ..utils.split import split
+from ..utils.predictions import (
+    assemble_predictions, resolve_test_ids, save_predictions,
+)
 from ..utils.types import PredictionResult
-from ..text.models import SUPPORTED_MODELS as TEXT_BACKBONE_MODELS, resolve_model_name
+from ..utils.runtime import track_run
+from ..utils.seeds import seed_everything, set_determinism
+from ..text.models import resolve_model_name
 
 logger = logging.getLogger(__name__)
+
+from ..utils.optimize_config import (  # noqa: E402
+    Optimize,
+    _log_fixed_or_default,
+    resolve_hyperparams,
+)
 
 
 def _patch_automm_gpu_logging() -> None:
@@ -146,9 +156,9 @@ FUSION_STRATEGIES: dict[str, list[str] | None] = {
     "tabular_only": ["numerical_mlp", "categorical_mlp", "fusion_mlp"],
 }
 
-#: Default HPO search space for ``use_hpo=True``.
+#: Default HPO search space for ``hyperparams=Optimize(...)``.
 #: Uses the same ``(type, *args)`` tuple format as the text and tabular pipelines.
-#: Pass ``hpo_search_space`` to ``run()`` to override or extend individual keys.
+#: ``hyperparams=Optimize(space={...})`` overrides or extends individual keys.
 DEFAULT_HPO_SPACE: dict = {
     # Learning rate — most impactful; log-scale between 1e-5 and 1e-3.
     "optimization.learning_rate":        ("float_log", 1e-5, 1e-3),
@@ -255,22 +265,19 @@ def _to_ag_space(search_space: dict) -> dict:
     return result
 
 
-def _assemble_prediction_result(
-    proba_df: pd.DataFrame,
-    true_labels: list,
-    id2label: dict,
-    top_k: int,
-) -> PredictionResult:
-    """Build a PredictionResult from AutoGluon ``predict_proba()`` output.
+def _align_automm_proba(proba_df: pd.DataFrame, id2label: dict) -> np.ndarray:
+    """Reorder AutoGluon ``predict_proba()`` output into class-ID column order.
+
+    AutoGluon names its probability columns by label string, and their order
+    need not match ``id2label``. A class that AutoGluon did not return is filled
+    with 0 and logged.
 
     Args:
-        proba_df:    DataFrame (rows=samples, columns=class label strings).
-        true_labels: Ground-truth label strings, one per row.
-        id2label:    Integer ID → label string mapping.
-        top_k:       Number of top classes for the topk DataFrame.
+        proba_df: One row per sample, one column per class label string.
+        id2label: Integer class ID → label string mapping.
 
     Returns:
-        PredictionResult(top1, full, topk, id2label)
+        ``(n_samples, n_classes)`` array whose column *i* is class ID *i*.
     """
     n_classes = len(id2label)
 
@@ -289,34 +296,7 @@ def _assemble_prediction_result(
             )
             prob_cols.append(np.zeros(len(proba_df), dtype=float))
 
-    prob_matrix = np.column_stack(prob_cols)  # shape: (n_samples, n_classes)
-
-    # ---- top1 ---------------------------------------------------------------
-    top1_idx   = np.argmax(prob_matrix, axis=1)
-    top1_probs = prob_matrix[np.arange(len(prob_matrix)), top1_idx]
-    top1_df = pd.DataFrame({
-        "true_label":      true_labels,
-        "predicted_label": [id2label[i] for i in top1_idx],
-        "predicted_prob":  top1_probs,
-    })
-
-    # ---- full ---------------------------------------------------------------
-    full_data: dict = {"true_label": true_labels}
-    for i in range(n_classes):
-        full_data[f"prob_{i}"] = prob_matrix[:, i]
-    full_df = pd.DataFrame(full_data)
-
-    # ---- topk ---------------------------------------------------------------
-    k = min(top_k, n_classes)
-    top_indices = np.argsort(prob_matrix, axis=1)[:, ::-1][:, :k]
-    topk_data: dict = {"true_label": true_labels}
-    for j in range(k):
-        col_idx = top_indices[:, j]
-        topk_data[f"top{j + 1}_label"] = [id2label[i] for i in col_idx]
-        topk_data[f"top{j + 1}_prob"]  = prob_matrix[np.arange(len(prob_matrix)), col_idx]
-    topk_df = pd.DataFrame(topk_data)
-
-    return PredictionResult(top1=top1_df, full=full_df, topk=topk_df, id2label=id2label)
+    return np.column_stack(prob_cols)  # shape: (n_samples, n_classes)
 
 
 # ---------------------------------------------------------------------------
@@ -370,16 +350,29 @@ def _ensure_nltk_deps() -> None:
             nltk.download(name, quiet=True)
 
 
+def _predictions_dir(output_dir: Path) -> Path:
+    """Where this run's prediction CSVs live.
+
+    ``predictions/`` is where every pipeline writes them. Runs produced before
+    that was true kept them in the run root, so those are still resumable.
+    """
+    if (output_dir / "predictions" / "predictions_top1.csv").is_file():
+        return output_dir / "predictions"
+    if (output_dir / "predictions_top1.csv").is_file():
+        return output_dir
+    return output_dir / "predictions"
+
+
 def _load_saved_prediction_result(output_dir: Path) -> PredictionResult:
     """Load saved prediction artifacts from ``output_dir``.
 
-    Expects the standard files written by :meth:`FeatureFusionClassifier.run`:
-    ``predictions_top1.csv``, ``predictions_full.csv``, ``predictions_topk.csv``,
-    and ``id2label.json``.
+    Expects the files written by :meth:`FeatureFusionClassifier.run`:
+    ``predictions/predictions_{top1,full,topk}.csv`` and ``id2label.json``.
     """
-    top1 = pd.read_csv(output_dir / "predictions_top1.csv")
-    full = pd.read_csv(output_dir / "predictions_full.csv")
-    topk = pd.read_csv(output_dir / "predictions_topk.csv")
+    pred_dir = _predictions_dir(output_dir)
+    top1 = pd.read_csv(pred_dir / "predictions_top1.csv")
+    full = pd.read_csv(pred_dir / "predictions_full.csv")
+    topk = pd.read_csv(pred_dir / "predictions_topk.csv")
     with open(output_dir / "id2label.json") as fh:
         raw_id2label = json.load(fh)
     id2label = {int(k): v for k, v in raw_id2label.items()}
@@ -470,7 +463,7 @@ class FeatureFusionClassifier:
     id2label :         Integer ID → label mapping.
     predictions :      ``PredictionResult`` from the test set.
     best_hpo_config :  Best hyperparameter config found during HPO
-                       (``None`` when ``use_hpo=False``).
+                       (``None`` when no search ran).
     """
 
     def __init__(
@@ -530,6 +523,7 @@ class FeatureFusionClassifier:
 
     # ------------------------------------------------------------------
 
+    @track_run("feature_fusion", monitor_gpu=True)
     def run(
         self,
         df: pd.DataFrame,
@@ -538,22 +532,22 @@ class FeatureFusionClassifier:
         label_col: str,
         # --- split ---
         test_size: float = 0.2,
-        random_state: int = 42,
-        automm_seed: int | None = None,
+        split_seed: int = 42,
+        train_seed: int = 42,
+        deterministic: bool = False,
         stratify: bool = True,
         split_col: str | None = None,
         # --- AutoMM training ---
         time_limit: int = 3600,
-        hyperparameters: dict | None = None,
-        # --- built-in HPO ---
-        use_hpo: bool = False,
-        n_hpo_trials: int = 10,
-        hpo_search_space: dict | None = None,
+        val_size: float | None = None,
+        hyperparams: "dict | str | Optimize | None" = None,
+        # --- AutoMM's built-in HPO backend ---
         hpo_scheduler: str = "local",
         hpo_searcher: str = "bayes",
         resume: bool = True,
         # --- inference ---
         top_k: int = 3,
+        id_col: str | None = None,
     ) -> dict:
         """Run the full feature-level fusion pipeline.
 
@@ -576,14 +570,39 @@ class FeatureFusionClassifier:
                              object/str → text or categorical, numeric → numerical.
             label_col:       Column containing cause-of-death labels.
             test_size:       Fraction held out for testing.  Default 0.2.
-            random_state:    Split seed.  Default 42.
-            automm_seed:     AutoMM trainer seed passed to fit(); None uses
-                             AutoMM's default (0). Varies training only.
+            split_seed:      Seed for the train/test split. Vary it to measure
+                             sampling uncertainty. Default 42.
+            train_seed:      Seed passed to AutoMM's ``fit(seed=)``, including
+                             the search. Default 42; AutoMM's own default is 0.
+                             This replaces ``automm_seed``, which defaulted to
+                             ``None`` and so left AutoMM on its own internal
+                             seed — the run's seed never reached training.
+                             **In this pipeline it also decides AutoMM's
+                             validation rows**: AutoMM splits its holdout with
+                             the same seed it trains with
+                             (``split_train_tuning_data(random_state=seed)``),
+                             so the two-seed separation is partial here. That is
+                             AutoMM's design, and the package leaves it alone.
+            deterministic:   Demand bit-for-bit repeatable kernels, at a cost
+                             in speed and robustness. Default False.
             stratify:        Stratified split.  Default True.
+            val_size:        Share of the training rows AutoMM holds out for
+                             validation (checkpoint choice and early stopping),
+                             passed through as its ``holdout_frac``. ``None``
+                             (default) leaves the size to AutoMM's own rule —
+                             for under 5,000 rows, between 10% and 20%. Either
+                             way **AutoMM does the splitting**, with its own
+                             stratification and its own seed; the package does
+                             not carve this holdout (see
+                             ``_package_reviews/archive_automm_tuning_split_2026-09-24.md``
+                             for the version that did, and why it was dropped).
             time_limit:      Training time budget in seconds.  Default 3 600
                              (1 hour).  Increase to 3–6 hours for
                              ``"best_quality"`` or large datasets.
-            hyperparameters: AutoMM hyperparameters merged over the resolved
+            hyperparams:     Where the hyperparameters come from: a dict of
+                             AutoMM settings to use as-is, ``Optimize(...)`` to
+                             run AutoMM's built-in search, or ``"default"``.
+                             A dict is merged over the resolved
                              backbone + fusion settings.  Scalar values only
                              (fixed training run).  A
                              ``"model.hf_text.checkpoint_name"`` entry replaces
@@ -597,28 +616,18 @@ class FeatureFusionClassifier:
                                   "optimization.max_epochs": 10}
 
                              ``None`` = resolved defaults only.
-                             Ignored for keys that ``hpo_search_space`` overrides
-                             when ``use_hpo=True``.
-            use_hpo:         Run AutoMM's built-in HPO (Ray Tune + Bayes by
-                             default) over ``DEFAULT_HPO_SPACE``.
-                             ``False`` (default) = single fixed training run.
-            n_hpo_trials:    Number of HPO trials.  Default 10.  Only used
-                             when ``use_hpo=True``.
-            hpo_search_space: Override or extend ``DEFAULT_HPO_SPACE`` with
-                             additional keys.  Uses the same tuple format::
-
-                                 {"optimization.max_epochs": ("int", 5, 20),
-                                  "env.batch_size": ("categorical", [8, 16])}
-
-                             Merged over ``DEFAULT_HPO_SPACE``; caller's keys win.
-                             ``None`` = use ``DEFAULT_HPO_SPACE`` unchanged.
-                             Only used when ``use_hpo=True``.
+                             Ignored for keys that ``Optimize(space=...)`` overrides
+                             when a search runs.
             hpo_scheduler:   Ray Tune scheduler.  ``"local"`` (default, single
                              machine) or ``"ray"`` (distributed cluster).
-                             Only used when ``use_hpo=True``.
+                             Only used when a search runs.
             hpo_searcher:    Search algorithm.  ``"bayes"`` (default, Bayesian
                              optimisation), ``"random"``, or ``"grid"``.
-                             Only used when ``use_hpo=True``.
+                             Only used when a search runs.
+            id_col:          Optional column holding a row identifier. When given,
+                             predictions carry a leading ``id`` column so they
+                             can be joined back to the source records and
+                             matched against other pipelines' predictions.
             resume:          If ``True`` (default), reuse an existing completed
                              AutoMM run in ``output_dir`` when the saved
                              predictions match the current deterministic split.
@@ -639,9 +648,9 @@ class FeatureFusionClassifier:
                 Integer ID → label mapping.
             ``"output_dir"``
                 :class:`pathlib.Path` to the root output directory.
-            ``"best_hpo_config"``
+            ``"best_hyperparams"``
                 Best hyperparameter config from HPO (``None`` when
-                ``use_hpo=False``).
+                no search ran).
 
         Raises:
             ImportError: If ``autogluon.multimodal`` is not installed.
@@ -649,12 +658,15 @@ class FeatureFusionClassifier:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         model_dir = self.output_dir / "automm_model"
 
+        set_determinism(deterministic)
+        seed_everything(train_seed)
+
         # --- Step 1: split -----------------------------------------------
         self.train_df, self.test_df = split(
             df,
             label_col=label_col,
             test_size=test_size,
-            random_state=random_state,
+            random_state=split_seed,
             stratify=stratify,
             split_col=split_col,
         )
@@ -686,6 +698,17 @@ class FeatureFusionClassifier:
         input_test  = self.test_df[ordered_cols + [label_col]].copy()
 
         # --- Step 4: build AutoMM hyperparameters ------------------------
+        # hyperparams= says whether these are fixed values or a search; AutoMM's
+        # own dict is the fixed case, and a search layers its space on top.
+        hp_kind, hp_fixed, hp_search = resolve_hyperparams(hyperparams)
+        if hp_kind == "search":
+            hp_search = hp_search.with_defaults(n_trials=10)
+            logger.info("Hyperparameters FROM SEARCH — %s.", hp_search.describe())
+        else:
+            _log_fixed_or_default(logger, self.model_name, hp_fixed)
+
+        hyperparameters = hp_fixed
+
         # An explicit model.hf_text.checkpoint_name takes precedence over
         # model_name, and model_name is then not resolved (nor downloaded).
         explicit_checkpoint = (hyperparameters or {}).get("model.hf_text.checkpoint_name")
@@ -711,9 +734,10 @@ class FeatureFusionClassifier:
         )
         logger.debug("AutoMM hyperparameters: %s", automm_hp)
 
-        saved_top1_path = self.output_dir / "predictions_top1.csv"
-        saved_full_path = self.output_dir / "predictions_full.csv"
-        saved_topk_path = self.output_dir / "predictions_topk.csv"
+        _saved_dir = _predictions_dir(self.output_dir)
+        saved_top1_path = _saved_dir / "predictions_top1.csv"
+        saved_full_path = _saved_dir / "predictions_full.csv"
+        saved_topk_path = _saved_dir / "predictions_topk.csv"
         saved_id2label_path = self.output_dir / "id2label.json"
         metadata_path = self.output_dir / "training_metadata.json"
         has_saved_predictions = all(
@@ -733,7 +757,7 @@ class FeatureFusionClassifier:
                     if metadata_path.exists():
                         with open(metadata_path) as fh:
                             saved_meta = json.load(fh)
-                        self.best_hpo_config = saved_meta.get("best_hpo_config")
+                        self.best_hpo_config = saved_meta.get("best_hyperparams", saved_meta.get("best_hpo_config"))
                     logger.info(
                         "Existing completed AutoMM run detected at %s — "
                         "reusing saved predictions and skipping fit().",
@@ -744,7 +768,7 @@ class FeatureFusionClassifier:
                         "label2id": self.label2id,
                         "id2label": self.id2label,
                         "output_dir": self.output_dir,
-                        "best_hpo_config": self.best_hpo_config,
+                        "best_hyperparams": self.best_hpo_config,
                     }
                 logger.warning(
                     "Existing predictions found at %s, but their true-label order "
@@ -804,11 +828,11 @@ class FeatureFusionClassifier:
                 path=str(model_dir),
             )
 
-            if use_hpo:
+            if hp_kind == "search":
                 # Build search space: DEFAULT_HPO_SPACE merged with caller overrides.
                 space: dict = {**DEFAULT_HPO_SPACE}
-                if hpo_search_space:
-                    space.update(hpo_search_space)
+                if hp_search.space:
+                    space.update(hp_search.space)
                 ag_space = _to_ag_space(space)
                 # Merge ag.space objects into the fixed hyperparameters dict;
                 # search distributions take precedence over fixed scalars for the
@@ -817,7 +841,7 @@ class FeatureFusionClassifier:
                 logger.info(
                     "HPO enabled — %d trials, scheduler=%s, searcher=%s, "
                     "search keys: %s",
-                    n_hpo_trials, hpo_scheduler, hpo_searcher,
+                    hp_search.n_trials, hpo_scheduler, hpo_searcher,
                     list(ag_space),
                 )
                 predictor.fit(
@@ -825,11 +849,13 @@ class FeatureFusionClassifier:
                     hyperparameters=automm_hp,
                     presets=self.preset,
                     time_limit=time_limit,
+                    **({"holdout_frac": val_size} if val_size is not None else {}),
                     hyperparameter_tune_kwargs={
-                        "num_trials": n_hpo_trials,
+                        "num_trials": hp_search.n_trials,
                         "scheduler":  hpo_scheduler,
                         "searcher":   hpo_searcher,
                     },
+                    seed=train_seed,
                 )
                 # Retrieve best config from fit summary; not all AutoMM versions
                 # expose this, so we fall back gracefully.
@@ -839,10 +865,12 @@ class FeatureFusionClassifier:
                 except Exception:  # noqa: BLE001
                     self.best_hpo_config = None
                 if self.best_hpo_config:
-                    _hpo_cfg_path = self.output_dir / "best_hpo_config.json"
+                    # Same file name and place as every other pipeline's search.
+                    _hpo_cfg_path = self.output_dir / "hpo" / "best_hyperparams.json"
+                    _hpo_cfg_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(_hpo_cfg_path, "w") as fh:
                         json.dump(self.best_hpo_config, fh, indent=2, default=str)
-                    logger.info("Best HPO config saved to %s", _hpo_cfg_path)
+                    logger.info("Best hyperparameters saved to %s", _hpo_cfg_path)
                 else:
                     logger.info(
                         "Best HPO config not available via fit_summary(); "
@@ -854,13 +882,14 @@ class FeatureFusionClassifier:
                     hyperparameters=automm_hp,
                     presets=self.preset,
                     time_limit=time_limit,
-                    **({"seed": automm_seed} if automm_seed is not None else {}),
+                    **({"holdout_frac": val_size} if val_size is not None else {}),
+                    seed=train_seed,
                 )
                 self.best_hpo_config = None
         elif metadata_path.exists():
             with open(metadata_path) as fh:
                 saved_meta = json.load(fh)
-            self.best_hpo_config = saved_meta.get("best_hpo_config")
+            self.best_hpo_config = saved_meta.get("best_hyperparams", saved_meta.get("best_hpo_config"))
         else:
             self.best_hpo_config = None
 
@@ -877,11 +906,18 @@ class FeatureFusionClassifier:
         # with a feature (safe even if AutoGluon would ignore it automatically).
         proba_df = predictor.predict_proba(input_test.drop(columns=[label_col]))
 
-        self.predictions = _assemble_prediction_result(
-            proba_df, true_labels, id2label, top_k
+        self.predictions = assemble_predictions(
+            _align_automm_proba(proba_df, id2label), id2label,
+            true_labels=true_labels, top_k=top_k,
+            # input_test is self.test_df restricted to columns, never rows, so
+            # the identifiers line up with the scored rows one to one.
+            ids=resolve_test_ids(self.test_df, id_col),
         )
 
-        # --- Step 7: save metadata ---------------------------------------
+        # --- Step 7: save predictions and metadata ------------------------
+        # Same layout as every other pipeline:
+        # <output_dir>/predictions/predictions_{top1,full,topk}.csv
+        save_predictions(self.predictions, self.output_dir / "predictions")
         with open(self.output_dir / "label2id.json", "w") as fh:
             json.dump(label2id, fh, indent=2)
         with open(self.output_dir / "id2label.json", "w") as fh:
@@ -895,11 +931,11 @@ class FeatureFusionClassifier:
             "preset":           self.preset,
             "eval_metric":      self.eval_metric,
             "time_limit":       time_limit,
-            "use_hpo":          use_hpo,
-            "n_hpo_trials":     n_hpo_trials if use_hpo else None,
-            "hpo_scheduler":    hpo_scheduler if use_hpo else None,
-            "hpo_searcher":     hpo_searcher  if use_hpo else None,
-            "best_hpo_config":  self.best_hpo_config,
+            "hyperparams_from": hp_kind,
+            "n_trials":         hp_search.n_trials if hp_kind == "search" else None,
+            "hpo_scheduler":    hpo_scheduler if hp_kind == "search" else None,
+            "hpo_searcher":     hpo_searcher  if hp_kind == "search" else None,
+            "best_hyperparams": self.best_hpo_config,
             "label2id":         label2id,
             "id2label":         {str(k): v for k, v in id2label.items()},
             "n_train":          len(self.train_df),
@@ -917,5 +953,5 @@ class FeatureFusionClassifier:
             "label2id":       label2id,
             "id2label":       id2label,
             "output_dir":     self.output_dir,
-            "best_hpo_config": self.best_hpo_config,
+            "best_hyperparams": self.best_hpo_config,
         }

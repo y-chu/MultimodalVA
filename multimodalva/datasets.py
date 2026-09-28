@@ -94,7 +94,15 @@ def _build_va_row(cause: str, rng: np.random.Generator) -> dict:
 
 
 def make_demo_va_df(n_samples: int = 120, seed: int = 7) -> pd.DataFrame:
-    """Create a small multimodal verbal-autopsy-like DataFrame."""
+    """Create a small multimodal verbal-autopsy-like DataFrame.
+
+    Args:
+        n_samples: Total number of rows.
+        seed: Seed for the generated values; the same seed gives the same table.
+
+    Returns:
+        A DataFrame with the columns described above.
+    """
     rng = np.random.default_rng(seed)
     labels = rng.choice(CAUSES, size=n_samples, p=[0.35, 0.25, 0.20, 0.20])
     return pd.DataFrame([_build_va_row(cause, rng) for cause in labels])
@@ -197,6 +205,13 @@ def make_sample_va_df(n_per_class: int = 4, seed: int = 11) -> pd.DataFrame:
     Columns: ``id``, ``cause_of_death``, ``narrative``, then i-code
     demographics (``i019a/b`` sex, ``i022x`` age band) and clinical indicators.
     Fully synthetic — narratives are generated from original templates.
+
+    Args:
+        n_per_class: Rows generated per cause.
+        seed: Seed for the generated values; the same seed gives the same table.
+
+    Returns:
+        A DataFrame with the columns described above.
     """
     rng = np.random.default_rng(seed)
     causes = list(_ISAMPLE_PROFILES)
@@ -350,6 +365,13 @@ def make_who2016_va_df(n_samples: int = 400, seed: int = 2016) -> pd.DataFrame:
     Columns: ``id``, ``cause_of_death``, ``narrative``, ``sex``, ``age_group``,
     then WHO 2016 ODK indicator columns (``Id10xxx``) with ``"yes"``/``"no"``
     values — pairs with ``multimodalva/utils/qdesc_who2016.csv``.
+
+    Args:
+        n_per_class: Rows generated per cause.
+        seed: Seed for the generated values; the same seed gives the same table.
+
+    Returns:
+        A DataFrame with the columns described above.
     """
     rng = np.random.default_rng(seed)
     causes = list(_WHO2016_PROFILES)

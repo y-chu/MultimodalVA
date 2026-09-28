@@ -4,15 +4,15 @@ Step 5: Hyperparameter optimization.
 Two backends are provided; both accept the same search_space format and return
 ``(best_hyperparams, backend_object)`` so callers can switch backends without changing call sites:
 
-    optimize()      — Optuna (TPE sampler, JournalStorage persistence)
+    optimize_text()      — Optuna (TPE sampler, JournalStorage persistence)
                       Best for single-machine sequential or lightly parallel HPO.
 
-    optimize_ray()  — Ray Tune (OptunaSearch / TPE, distributed runtime)
+    optimize_text_ray()  — Ray Tune (OptunaSearch / TPE, distributed runtime)
                       Best for multi-GPU machines or multi-node clusters.
                       Runs N trials concurrently, one GPU per trial (configurable).
 
-Uses train() and predict() internally.
-Input:  train_dataset, label2id, id2label  from prepare_dataset()
+Uses train_text() and predict_text() internally.
+Input:  train_dataset, label2id, id2label  from prepare_text_dataset()
 Output: best_hyperparams dict and backend study / ResultGrid object
 """
 
@@ -33,8 +33,10 @@ if TYPE_CHECKING:
     import optuna
     import ray
 
+    from ..utils.optimize_config import Optimize
+
 import numpy as np
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import Subset
 
 # from ..utils.metrics import (  # noqa: F401
@@ -71,26 +73,35 @@ from multimodalva.utils.metrics import (
     HPO_METRICS,
 )
 from multimodalva.utils.runtime import RuntimeTracker, empty_accelerator_cache
+from multimodalva.utils.split import stratified_indices
 from multimodalva.utils.ray_compat import to_ray_space
 from multimodalva.text.models import resolve_model_name
-from multimodalva.text.train import train, _get_dataset_labels
-from multimodalva.text.predict import predict
+from multimodalva.text.train import train_text, _get_dataset_labels
+from multimodalva.text.predict import predict_text
 
 logger = logging.getLogger(__name__)
 
 from .search_spaces import (  # noqa: E402
-    DEFAULT_SEARCH_SPACE,
+    TEXT_DEFAULT_SEARCH_SPACE,
     FOCAL_SEARCH_SPACE,
     LORA_SEARCH_SPACE,
     _sample_tier,
-    _class_tier,
-    get_default_search_space,
+    get_text_default_search_space,
 )
+from ..utils.hpo_defaults import get_class_tier, merge_search_space  # noqa: E402
+
+
+#: ``enable_pruning``'s default for this family, named so that
+#: ``Optimize(pruning=None)`` ("whatever text normally does") resolves to the
+#: same value the low-level function defaults to. A text trial costs minutes, so
+#: stopping a hopeless configuration early is worth the risk of stopping a slow
+#: starter.
+TEXT_PRUNING_DEFAULT = True
 
 
 @contextmanager
 def _trial_workdir(persistent: Path | None):
-    """Yield a directory for one trial/fold's train()+predict() artifacts.
+    """Yield a directory for one trial/fold's train_text()+predict_text() artifacts.
 
     HPO trials only need the resulting *score* — never the model weights.  When
     ``persistent`` is None (the default path), training runs inside a
@@ -108,7 +119,7 @@ def _trial_workdir(persistent: Path | None):
             yield Path(td)
 
 
-def optimize(
+def optimize_text(
     train_dataset,
     label2id: dict,
     id2label: dict,
@@ -124,18 +135,19 @@ def optimize(
     # TPE needs ~15–20 random-exploration trials before it can exploit correlations,
     # so the minimum meaningful budget is 20 trials regardless of CV or LoRA.
     n_trials: int = 30,
-    metric: str = "accuracy",
+    metric: str = "f1_macro",
     search_space: dict | None = None,
     val_size: float = 0.2,
     random_state: int = 42,
+    split_seed: int | None = None,
     study_name: str = "text_hpo",
-    use_lora: bool = True,
+    use_lora: bool = False,
     use_focal: bool = False,
     gradient_checkpointing: bool = False,
     early_stopping_patience: int | None = 4,
     storage_path: str | None = None,
     load_if_exists: bool = True,
-    enable_pruning: bool = True,
+    enable_pruning: bool = TEXT_PRUNING_DEFAULT,
     save_trials_csv: bool = True,
     cleanup_trials: bool = True,
     export_best_trial: bool = False,
@@ -144,11 +156,11 @@ def optimize(
     use_cv: bool = True,
     n_cv_folds: int = 3,
 ) -> tuple[dict, optuna.Study]:
-    """Run Optuna hyperparameter search using train() and predict().
+    """Run Optuna hyperparameter search using train_text() and predict_text().
 
     Internally splits train_dataset into an (1 - val_size) / val_size
     opt-train / opt-eval split. Each trial trains on opt-train and is scored
-    on opt-eval. The held-out test set from prepare_dataset() is never used here.
+    on opt-eval. The held-out test set from prepare_text_dataset() is never used here.
 
     Storage: each trial/fold is trained inside a ``tempfile.TemporaryDirectory``
     that is deleted as soon as its score is computed: no model weights, optimizer
@@ -162,20 +174,26 @@ def optimize(
     reloadable copy of the best trial's model in output_dir/best_trial/.
 
     Args:
-        train_dataset: Tokenized ClassificationDataset from prepare_dataset().
-        label2id: Label-to-integer mapping from prepare_dataset().
-        id2label: Integer-to-label mapping from prepare_dataset().
+        train_dataset: Tokenized ClassificationDataset from prepare_text_dataset().
+        label2id: Label-to-integer mapping from prepare_text_dataset().
+        id2label: Integer-to-label mapping from prepare_text_dataset().
         model_name: HuggingFace model name or local path.
         output_dir: Root directory for all trial outputs.
         n_trials: Total number of Optuna trials to run. Default 20.
         metric: Metric to maximise — "accuracy", "balanced_accuracy",
-                "f1_macro", "f1_weighted", "csmf_accuracy". Default "accuracy".
+                "f1_macro", "f1_weighted", "csmf_accuracy". Default "f1_macro".
                 Use "balanced_accuracy", "csmf_accuracy", or "f1_macro" for imbalanced VA data.
-        search_space: Dict defining parameter ranges. Defaults to DEFAULT_SEARCH_SPACE
-                      (plus LORA_SEARCH_SPACE when use_lora=True, plus
-                      FOCAL_SEARCH_SPACE when use_focal=True).
+        search_space: Parameter ranges. Overrides the default per key; keys you
+                      omit keep their default. ``None`` uses
+                      get_text_default_search_space(n_samples, n_classes), plus
+                      LORA_SEARCH_SPACE / FOCAL_SEARCH_SPACE when enabled.
         val_size: Fraction of train_dataset held out for trial evaluation. Default 0.2.
-        random_state: Seed for the internal stratified split and Optuna sampler.
+        random_state: Seed for the Optuna sampler and for model training.
+        split_seed:   Seed for the row partitioning this function does
+                      internally — the cross-validation folds and the internal validation split. ``None`` (the default) reuses
+                      ``random_state``, so existing callers are unaffected.
+                      Pass it separately to hold the partition fixed while
+                      ``random_state`` reseeds the model.
                       Default 42.
         study_name: Name for the Optuna study. Default "text_hpo".
         use_lora: Apply LoRA adapters during each trial. Default False.
@@ -185,7 +203,7 @@ def optimize(
                    Recommended for severe class imbalance; pair with
                    metric="f1_macro" or "balanced_accuracy". Default False.
         gradient_checkpointing: Enable gradient checkpointing per trial. Default False.
-        early_stopping_patience: Early stopping patience passed to each trial's train().
+        early_stopping_patience: Early stopping patience passed to each trial's train_text().
                                   Set to None to disable. Default 3.
         storage_path: Path to the JournalStorage log file for persisting the study
                       (enables resume across sessions).
@@ -253,7 +271,7 @@ def optimize(
         from optuna.samplers import TPESampler
     except ImportError as exc:
         raise ImportError(
-            "optuna is required for optimize(). "
+            "optuna is required for optimize_text(). "
             "Install with:  pip install 'optuna>=3.4'"
         ) from exc
 
@@ -290,18 +308,17 @@ def optimize(
     # Build effective search space: data-adaptive base → LoRA/focal merges → caller overrides
     n_samples = len(train_dataset)
     n_classes = len(id2label)
-    active_space = get_default_search_space(n_samples, n_classes)
+    active_space = get_text_default_search_space(n_samples, n_classes)
     logger.info(
         "Text HPO adaptive search space: sample_tier=%s, class_tier=%s "
         "(n_samples=%d, n_classes=%d).",
-        _sample_tier(n_samples), _class_tier(n_classes), n_samples, n_classes,
+        _sample_tier(n_samples), get_class_tier(n_classes), n_samples, n_classes,
     )
     if use_lora:
         active_space.update(LORA_SEARCH_SPACE)
     if use_focal:
         active_space.update(FOCAL_SEARCH_SPACE)
-    if search_space:
-        active_space.update(search_space)
+    merge_search_space(active_space, search_space, logger)
 
     # Drop hyperparameters not supported by this model architecture.
     # classifier_dropout: only BERT/RoBERTa/BigBird/ELECTRA configs accept it;
@@ -352,12 +369,18 @@ def optimize(
     # --- Data split setup (fixed split only needed for use_cv=False) ---
     _all_labels = _get_dataset_labels(train_dataset)
     _indices = list(range(len(train_dataset)))
+    _split_seed = split_seed if split_seed is not None else random_state
     if not use_cv:
-        opt_train_idx, opt_val_idx = train_test_split(
-            _indices,
-            test_size=val_size,
-            stratify=_all_labels,
-            random_state=random_state,
+        # Same resilience as train_text()'s internal split: on very small data a
+        # val_size share can be thinner than the number of classes, and an
+        # unguarded stratified split then fails every trial.
+        opt_train_idx, opt_val_idx = stratified_indices(
+            _all_labels,
+            val_size,
+            _split_seed,
+            what="validation",
+            label_names=id2label,
+            log=logger,
         )
         opt_train = Subset(train_dataset, opt_train_idx)
         opt_val = Subset(train_dataset, opt_val_idx)
@@ -366,7 +389,7 @@ def optimize(
     # This removes fold-assignment variance from the HPO signal — trial differences
     # reflect hyperparameters only, not different random fold draws.
     if use_cv:
-        _skf = StratifiedKFold(n_splits=n_cv_folds, shuffle=True, random_state=random_state)
+        _skf = StratifiedKFold(n_splits=n_cv_folds, shuffle=True, random_state=_split_seed)
         _cv_splits = [
             (train_idx.tolist(), val_idx.tolist())
             for train_idx, val_idx in _skf.split(_indices, _all_labels)
@@ -412,7 +435,7 @@ def optimize(
                     # Train + score inside the workdir; weights are discarded as soon
                     # as the fold score is read (only the score is needed for HPO).
                     with _trial_workdir(fold_persistent) as fold_dir:
-                        train(
+                        train_text(
                             train_dataset=fold_train,
                             label2id=label2id,
                             id2label=id2label,
@@ -429,7 +452,7 @@ def optimize(
                             use_fast=use_fast,
                             random_state=random_state,
                         )
-                        fold_result = predict(fold_dir, fold_val, use_fast=use_fast)
+                        fold_result = predict_text(fold_dir, fold_val, use_fast=use_fast)
                         for m in CV_METRICS:
                             _fold_scores[m].append(score_predictions(fold_result.top1, m))
                         _fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
@@ -454,10 +477,10 @@ def optimize(
 
             else:
                 # ── Single fixed-split path (original behaviour) ────────────
-                # val_size=0.1: train() carves an internal eval split from opt_train
+                # val_size=0.1: train_text() carves an internal eval split from opt_train
                 # for early stopping / best-checkpoint selection; separate from opt_val.
                 with _trial_workdir(trial_dir) as tdir:
-                    train(
+                    train_text(
                         train_dataset=opt_train,
                         label2id=label2id,
                         id2label=id2label,
@@ -474,7 +497,7 @@ def optimize(
                         use_fast=use_fast,
                         random_state=random_state,
                     )
-                    result = predict(tdir, opt_val, use_fast=use_fast)
+                    result = predict_text(tdir, opt_val, use_fast=use_fast)
                     all_scores = {
                         m: score_predictions(result.top1, m)
                         for m in CV_METRICS
@@ -674,8 +697,6 @@ def optimize(
 def _ray_trial_fn(
     config: dict,
     *,
-    opt_train,
-    opt_val,
     label2id: dict,
     id2label: dict,
     model_name: str,
@@ -685,6 +706,11 @@ def _ray_trial_fn(
     early_stopping_patience: int | None,
     random_state: int,
     use_fast: bool = True,
+    opt_train=None,
+    opt_val=None,
+    train_dataset=None,
+    cv_splits: "list[tuple[list[int], list[int]]] | None" = None,
+    metric_key: str = "f1_macro",
 ) -> dict:
     """Single trial for Ray Tune — fully compatible with Ray 2.x / Python 3.13.
 
@@ -693,6 +719,23 @@ def _ray_trial_fn(
     trainable — it works across all Ray 2.x versions without requiring a
     Ray Train session (``ray.train.report()`` is the Train API and raises /
     hangs when called outside a proper Train context such as TorchTrainer).
+
+    Two scoring modes, bound by :func:`optimize_text_ray` through
+    ``tune.with_parameters()`` — the same two modes
+    :func:`_tabular_ray_trial_fn` supports:
+
+    - **fixed holdout** (``opt_train``, ``opt_val``): one training run per trial.
+    - **k-fold CV** (``train_dataset``, ``cv_splits``): one training run per fold,
+      the trial's score being the mean across folds. Per-fold scores and the
+      across-fold standard deviation are returned as extra keys so they reach
+      the trials CSV, matching the columns the Optuna backend writes.
+
+    Unlike the Optuna CV path there is **no inter-fold pruning** here. Reporting
+    an intermediate result per fold would mean calling ``ray.train.report()``,
+    which raises or hangs outside a Ray Train session (see the note above), and
+    a hang on a cluster costs the whole allocation rather than one trial. Use
+    ``use_asha=True`` for early termination across trials instead;
+    ``optimize_tabular_ray``'s CV path makes the same trade.
 
     Imports of ``multimodalva`` sub-modules are deferred to function body so
     that Ray worker processes resolve them correctly regardless of how the
@@ -709,10 +752,23 @@ def _ray_trial_fn(
     if _project_root not in _sys.path:
         _sys.path.insert(0, _project_root)
 
-    from multimodalva.text.train import train as _train
-    from multimodalva.text.predict import predict as _predict
+    from torch.utils.data import Subset
+
+    from multimodalva.text.train import train_text
+    from multimodalva.text.predict import predict_text
+    from multimodalva.text.hpo import _trial_workdir
     from multimodalva.utils.metrics import score_predictions, log_loss_from_full
     from multimodalva.utils.ray_compat import get_ray_trial_dir
+
+    use_cv_mode = bool(cv_splits)
+    if use_cv_mode:
+        if train_dataset is None:
+            raise ValueError("cv_splits mode requires train_dataset.")
+    elif opt_train is None or opt_val is None:
+        raise ValueError(
+            "Holdout mode requires opt_train and opt_val; pass cv_splits + "
+            "train_dataset for k-fold scoring."
+        )
 
     # --- Trial artifact directory (Ray Tune API compatibility shim) ---
     trial_dir = get_ray_trial_dir()
@@ -734,34 +790,90 @@ def _ray_trial_fn(
     trial_failed = False
 
     try:
-        # --- Train ---
-        _train(
-            train_dataset=opt_train,
-            label2id=label2id,
-            id2label=id2label,
-            model_name=model_name,
-            output_dir=trial_dir,
-            hyperparams=config,
-            val_size=0.1,
-            use_lora=use_lora,
-            gradient_checkpointing=gradient_checkpointing,
-            early_stopping_patience=early_stopping_patience,
-            resume=False,
-            cleanup_checkpoints=True,  # trials only need a score, not checkpoints
-            save_total_limit=1,        # minimise per-trial disk under ray_experiment/
-            use_fast=use_fast,
-            random_state=random_state,
-        )
+        if use_cv_mode:
+            # ── k-fold CV path ──────────────────────────────────────────────
+            # Each fold trains a fresh model; no state carries across folds.
+            # val_size=None + early_stopping_patience=None: train the full
+            # sampled epoch count so the `epochs` HP is meaningful and folds are
+            # comparable.  Identical to the Optuna CV path, minus the inter-fold
+            # pruning (see the docstring).
+            _fold_scores: dict[str, list[float]] = {m: [] for m in CV_METRICS}
+            _fold_log_losses: list[float] = []
 
-        # --- Evaluate ---
-        result = _predict(trial_dir, opt_val, use_fast=use_fast)
-        all_scores.update(
-            {
-                m: score_predictions(result.top1, m)
-                for m in CV_METRICS
-            }
-        )
-        all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
+            for fold_idx, (cv_train_idx, cv_val_idx) in enumerate(cv_splits):
+                fold_train = Subset(train_dataset, cv_train_idx)
+                fold_val   = Subset(train_dataset, cv_val_idx)
+
+                # Train into an auto-deleted tempdir: only the score is needed,
+                # and k model copies per trial under ray_experiment/ would dwarf
+                # everything else on disk.
+                with _trial_workdir(None) as fold_dir:
+                    train_text(
+                        train_dataset=fold_train,
+                        label2id=label2id,
+                        id2label=id2label,
+                        model_name=model_name,
+                        output_dir=fold_dir,
+                        hyperparams=config,
+                        val_size=None,                 # full fold-train; no internal split
+                        use_lora=use_lora,
+                        gradient_checkpointing=gradient_checkpointing,
+                        early_stopping_patience=None,  # no early stopping within a fold
+                        resume=False,
+                        cleanup_checkpoints=True,
+                        save_total_limit=1,
+                        use_fast=use_fast,
+                        random_state=random_state,
+                    )
+                    fold_result = predict_text(fold_dir, fold_val, use_fast=use_fast)
+                    for m in CV_METRICS:
+                        _fold_scores[m].append(score_predictions(fold_result.top1, m))
+                    _fold_log_losses.append(
+                        log_loss_from_full(fold_result.full, fold_result.id2label)
+                    )
+
+                # Per-fold score for the target metric — returned as its own key
+                # so it lands in the trials CSV, as the Optuna backend's
+                # fold_<i>_<metric> user attrs do.
+                all_scores[f"fold_{fold_idx}_{metric_key}"] = _fold_scores[metric_key][-1]
+                empty_accelerator_cache()
+
+            all_scores.update(
+                {m: float(np.mean(v)) for m, v in _fold_scores.items()}
+            )
+            all_scores["log_loss"] = float(np.mean(_fold_log_losses))
+            all_scores[f"cv_std_{metric_key}"] = float(np.std(_fold_scores[metric_key]))
+            all_scores["n_cv_folds"] = len(cv_splits)
+
+        else:
+            # ── Fixed holdout path ─────────────────────────────────────────
+            train_text(
+                train_dataset=opt_train,
+                label2id=label2id,
+                id2label=id2label,
+                model_name=model_name,
+                output_dir=trial_dir,
+                hyperparams=config,
+                val_size=0.1,
+                use_lora=use_lora,
+                gradient_checkpointing=gradient_checkpointing,
+                early_stopping_patience=early_stopping_patience,
+                resume=False,
+                cleanup_checkpoints=True,  # trials only need a score, not checkpoints
+                save_total_limit=1,        # minimise per-trial disk under ray_experiment/
+                use_fast=use_fast,
+                random_state=random_state,
+            )
+
+            # --- Evaluate ---
+            result = predict_text(trial_dir, opt_val, use_fast=use_fast)
+            all_scores.update(
+                {
+                    m: score_predictions(result.top1, m)
+                    for m in CV_METRICS
+                }
+            )
+            all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
 
     except Exception:
         trial_failed = True
@@ -794,18 +906,19 @@ def _ray_trial_fn(
 # -----------------------
 # Main Ray HPO function
 # -----------------------
-def optimize_ray(
+def optimize_text_ray(
     train_dataset,
     label2id: dict,
     id2label: dict,
     model_name: str,
     output_dir: str | Path,
     n_trials: int | None = None,
-    metric: str = "accuracy",
+    metric: str = "f1_macro",
     search_space: dict | None = None,
     val_size: float = 0.2,
     random_state: int = 42,
-    use_lora: bool = True,
+    split_seed: int | None = None,
+    use_lora: bool = False,
     use_focal: bool = False,
     gradient_checkpointing: bool = False,
     early_stopping_patience: int | None = 2,
@@ -820,12 +933,35 @@ def optimize_ray(
     export_best_trial: bool = False,
     use_asha: bool = False,
     use_fast: bool = True,
+    # ── CV options ────────────────────────────────────────────────────────────
+    use_cv: bool = True,
+    n_cv_folds: int = 3,
 ) -> tuple[dict, Any]:
     """Distributed HPO using Ray Tune.
+
+    Builds its search space exactly as :func:`optimize_text` does, and scores
+    trials the same two ways: ``use_cv=True`` (default) runs stratified k-fold CV
+    per trial, ``use_cv=False`` scores on one holdout split.
 
     Extra args vs the original signature:
 
     Args:
+        use_cv:          Score each trial by stratified k-fold CV over
+                         ``train_dataset`` rather than one holdout split.
+                         Steadier, and costs ``n_cv_folds`` times more per
+                         trial — which is what the cluster is for. Default True,
+                         matching :func:`optimize_text` and
+                         :func:`optimize_tabular_ray`. Folds are pre-built once
+                         so every trial sees the same splits, so trial
+                         differences reflect hyperparameters only.
+                         Unlike the Optuna backend there is no inter-fold
+                         pruning; use ``use_asha=True`` for early termination
+                         across trials (see :func:`_ray_trial_fn`).
+        n_cv_folds:      Folds used when ``use_cv=True``. Default 3.
+        split_seed:      Seed for the validation split this function carves,
+                         or for the CV fold draw when ``use_cv=True``, as in
+                         :func:`optimize_text`. ``None`` (default) falls
+                         back to ``random_state``.
         n_trials:        Total number of trials. Defaults to 60 when
                          ``use_asha=True`` (ASHA prunes many trials early so
                          more are needed to saturate the search), or 30 otherwise.
@@ -865,9 +1001,11 @@ def optimize_ray(
         from ray.tune.search import ConcurrencyLimiter
     except ImportError as exc:
         raise ImportError(
-            "ray[tune] and optuna-integration are required for optimize_ray(). "
-            "Install with:  pip install 'ray[tune]>=2.9' 'optuna-integration>=3.4'\n"
-            "Or:            pip install multimodalva[ray]"
+            "ray[tune] and optuna-integration are required for optimize_text_ray(). "
+            "They live in an optional extra, so a normal install does not have them:\n"
+            "    pip install 'multimodalva[ray]'\n"
+            "Or search on the Optuna backend, which needs nothing extra:\n"
+            "    Optimize(backend=\"optuna\")   # or backend=\"auto\""
         ) from exc
 
     # --- Resolve n_trials default (depends on use_asha) ---
@@ -881,7 +1019,7 @@ def optimize_ray(
     output_dir.mkdir(parents=True, exist_ok=True)
     runtime_tracker = RuntimeTracker(
         output_dir,
-        report_name="ray_hpo_runtime.json",
+        report_name="hpo_runtime.json",
         metadata={
             "pipeline": "text_hpo_ray",
             "model_name": model_name,
@@ -898,12 +1036,12 @@ def optimize_ray(
         logger_=logger,
     )
 
-    # --- Auto-redirect to optimize() on MPS/CPU-only ---
+    # --- Auto-redirect to optimize_text() on MPS/CPU-only ---
     # Ray Train v2 is incompatible with function trainables on non-CUDA devices:
     # RunConfig auto-injects checkpoint_at_end=True which raises ValueError,
     # forcing a no-RunConfig fallback where trial state goes to ~/ray_results
     # and cannot be restored → resume always restarts from trial 1.
-    # On MPS/CPU, optimize() (Optuna + JournalStorage) is the correct backend.
+    # On MPS/CPU, optimize_text() (Optuna + JournalStorage) is the correct backend.
     try:
         import torch as _torch
         _cuda_available = _torch.cuda.device_count() > 0
@@ -912,13 +1050,13 @@ def optimize_ray(
     if not _cuda_available:
         _safe = model_name.replace("/", "_")
         logger.info(
-            "optimize_ray(): no CUDA GPUs detected — redirecting to optimize() "
+            "optimize_text_ray(): no CUDA GPUs detected — redirecting to optimize_text() "
             "(Optuna sequential, JournalStorage-backed). Ray Tune requires CUDA for "
             "reliable experiment persistence and resume. "
             "Journal log: %s/hpo_%s.log",
             output_dir, _safe,
         )
-        return optimize(
+        return optimize_text(
             train_dataset=train_dataset,
             label2id=label2id,
             id2label=id2label,
@@ -949,18 +1087,17 @@ def optimize_ray(
     # --- Build effective search space: data-adaptive base → LoRA/focal merges → caller overrides ---
     n_samples = len(train_dataset)
     n_classes = len(id2label)
-    active_space = get_default_search_space(n_samples, n_classes)
+    active_space = get_text_default_search_space(n_samples, n_classes)
     logger.info(
         "Text HPO adaptive search space: sample_tier=%s, class_tier=%s "
         "(n_samples=%d, n_classes=%d).",
-        _sample_tier(n_samples), _class_tier(n_classes), n_samples, n_classes,
+        _sample_tier(n_samples), get_class_tier(n_classes), n_samples, n_classes,
     )
     if use_lora:
         active_space.update(LORA_SEARCH_SPACE)
     if use_focal:
         active_space.update(FOCAL_SEARCH_SPACE)
-    if search_space:
-        active_space.update(search_space)
+    merge_search_space(active_space, search_space, logger)
 
     # Drop classifier_dropout for architectures that don't support it (e.g. Longformer).
     if "classifier_dropout" in active_space:
@@ -977,14 +1114,49 @@ def optimize_ray(
 
     ray_space = to_ray_space(active_space)
 
-    # --- Stratified split ---
+    # --- Data split setup ---
+    if use_cv and n_cv_folds < 2:
+        raise ValueError("n_cv_folds must be >= 2 when use_cv=True.")
+
     all_labels = _get_dataset_labels(train_dataset)
-    indices = list(range(len(train_dataset)))
-    opt_train_idx, opt_val_idx = train_test_split(
-        indices, test_size=val_size, stratify=all_labels, random_state=random_state
-    )
-    opt_train = Subset(train_dataset, opt_train_idx)
-    opt_val = Subset(train_dataset, opt_val_idx)
+    _split_seed = split_seed if split_seed is not None else random_state
+    opt_train = opt_val = None
+    cv_splits: list[tuple[list[int], list[int]]] | None = None
+
+    if use_cv:
+        # Pre-build the folds once, exactly as optimize_text() does, so every
+        # trial — and every worker — shares the same splits. Fold-assignment
+        # variance would otherwise be indistinguishable from a hyperparameter
+        # effect in the search signal.
+        _, _class_counts = np.unique(all_labels, return_counts=True)
+        _min_class_count = int(_class_counts.min())
+        if n_cv_folds > _min_class_count:
+            raise ValueError(
+                f"n_cv_folds={n_cv_folds} is greater than the minimum class count "
+                f"({_min_class_count}) in train_dataset. Reduce n_cv_folds or "
+                "rebalance the data."
+            )
+        _skf = StratifiedKFold(n_splits=n_cv_folds, shuffle=True, random_state=_split_seed)
+        cv_splits = [
+            (train_idx.tolist(), val_idx.tolist())
+            for train_idx, val_idx in _skf.split(list(range(len(train_dataset))), all_labels)
+        ]
+        logger.info(
+            "CV HPO (Ray): %d-fold stratified splits pre-built "
+            "(n_samples=%d, n_classes=%d).  Each trial runs %d training jobs.",
+            n_cv_folds, len(all_labels), len(id2label), n_cv_folds,
+        )
+    else:
+        opt_train_idx, opt_val_idx = stratified_indices(
+            all_labels,
+            val_size,
+            _split_seed,
+            what="validation",
+            label_names=id2label,
+            log=logger,
+        )
+        opt_train = Subset(train_dataset, opt_train_idx)
+        opt_val = Subset(train_dataset, opt_val_idx)
 
     # --- Initialise Ray ---
     if not ray.is_initialized():
@@ -1005,14 +1177,14 @@ def optimize_ray(
     # trainables when RunConfig is used, causing checkpoint_at_end ValueError.
     # This means experiment state cannot be persisted → resume is impossible.
     # The fallback (tuner_no_rc) saves to ~/ray_results which we cannot restore.
-    # Users on Apple Silicon or CPU-only machines should use optimize() instead.
+    # Users on Apple Silicon or CPU-only machines should use optimize_text() instead.
     if available_gpus == 0:
         logger.warning(
-            "optimize_ray(): no CUDA GPUs available (MPS/CPU-only environment). "
+            "optimize_text_ray(): no CUDA GPUs available (MPS/CPU-only environment). "
             "Ray Train v2 is incompatible with function trainables on non-CUDA "
             "devices — experiment state cannot be persisted and resume will not "
             "work across restarts. "
-            "RECOMMENDATION: use optimize() (Optuna backend) instead — it uses "
+            "RECOMMENDATION: use optimize_text() (Optuna backend) instead — it uses "
             "JournalStorage for reliable crash recovery and resume on MPS/CPU machines.",
         )
 
@@ -1052,10 +1224,10 @@ def optimize_ray(
         logger.info("ASHA scheduler enabled (max_t=%d epochs, grace_period=2).", _max_t)
 
     # --- Trainable ---
-    trainable = tune.with_parameters(
-        _ray_trial_fn,
-        opt_train=opt_train,
-        opt_val=opt_val,
+    # Datasets are bound through the Ray object store by with_parameters(); in CV
+    # mode the whole train_dataset is stored once and each worker Subsets it from
+    # the shared fold indices, rather than k datasets being shipped per trial.
+    _bound: dict = dict(
         label2id=label2id,
         id2label=id2label,
         model_name=model_name,
@@ -1065,7 +1237,13 @@ def optimize_ray(
         early_stopping_patience=early_stopping_patience,
         random_state=random_state,
         use_fast=use_fast,
+        metric_key=metric,
     )
+    if use_cv:
+        _bound.update(train_dataset=train_dataset, cv_splits=cv_splits)
+    else:
+        _bound.update(opt_train=opt_train, opt_val=opt_val)
+    trainable = tune.with_parameters(_ray_trial_fn, **_bound)
     trainable = tune.with_resources(
         trainable, resources={"cpu": num_cpus_per_trial, "gpu": num_gpus_per_trial}
     )
@@ -1153,8 +1331,14 @@ def optimize_ray(
             )
         tuner = _fresh_tuner()
 
-    logger.info("Launching %d trials, metric=%s, gpus/trial=%.1f, cpus/trial=%d",
-                n_trials, metric, num_gpus_per_trial, num_cpus_per_trial)
+    logger.info(
+        "Launching %d trials, metric=%s, scoring=%s, gpus/trial=%.1f, cpus/trial=%d "
+        "(%d training job(s) per trial)",
+        n_trials, metric,
+        f"{n_cv_folds}-fold CV" if use_cv else f"holdout {val_size:.0%}",
+        num_gpus_per_trial, num_cpus_per_trial,
+        n_cv_folds if use_cv else 1,
+    )
 
     # AutoGluon sets RAY_AIR_NEW_OUTPUT=1, which changes Ray's verbose handling.
     # Ray internally passes verbose="auto" (a string) but the new output path
@@ -1175,6 +1359,8 @@ def optimize_ray(
                 "resume": resume,
                 "n_trials": n_trials,
                 "metric": metric,
+                "use_cv": use_cv,
+                "n_cv_folds": n_cv_folds if use_cv else None,
             },
             monitor_gpu=True,
         ):
@@ -1190,14 +1376,14 @@ def optimize_ray(
                     # In this fallback mode, trials run via tuner_no_rc and their
                     # state is saved to ~/ray_results — NOT to our exp_path — so
                     # resume via Tuner.restore() is impossible across restarts.
-                    # On MPS/Apple Silicon: switch to optimize() (Optuna) for
-                    # reliable resume.  optimize() uses JournalStorage and resumes
+                    # On MPS/Apple Silicon: switch to optimize_text() (Optuna) for
+                    # reliable resume.  optimize_text() uses JournalStorage and resumes
                     # correctly after crashes or SLURM preemptions.
                     logger.warning(
                         "checkpoint_at_end error from Ray Train v2 (%s). "
                         "Retrying without RunConfig — this run's trial state will be "
                         "saved to ~/ray_results (not %s) and CANNOT be resumed. "
-                        "If you need resume support, use optimize() (Optuna backend) "
+                        "If you need resume support, use optimize_text() (Optuna backend) "
                         "which persists state in JournalStorage and resumes correctly on "
                         "MPS/CPU-only machines.", _ve, exp_path,
                     )
@@ -1289,11 +1475,20 @@ def optimize_ray(
     best_result = results.get_best_result(metric=metric, mode=_ray_mode)
     best_hyperparams = best_result.config
 
-    with open(output_dir / "best_hyperparams_ray.json", "w") as fh:
+    # Canonical names, the same ones optimize_text() writes. They used to carry a
+    # "_ray" suffix, which was harmless while Ray was only reachable from this
+    # function and no reader looked for it. It stopped being harmless when
+    # Optimize(backend="ray") made the backend a switch: the run contract names
+    # hpo/best_hyperparams.json, results/validation.py reads hpo_trials.csv to
+    # produce validation.json's hpo_cv score, and the LOPO / sample-size scripts
+    # load best_hyperparams.json and feed it straight back as hyperparams=. With
+    # the suffix, switching backend silently produced a run missing all three.
+    # Readers still accept the legacy "_ray" spellings for runs already on disk.
+    with open(output_dir / "best_hyperparams.json", "w") as fh:
         json.dump(best_hyperparams, fh, indent=2)
 
     # --- Copy best trial artifacts (opt-in) ---
-    # best_hyperparams_ray.json + the trials CSV already capture everything needed
+    # best_hyperparams.json + the trials CSV already capture everything needed
     # to retrain; only persist the best trial's weights when explicitly requested.
     best_trial_path = Path(best_result.path)
     if export_best_trial:
@@ -1310,12 +1505,12 @@ def optimize_ray(
 
     # --- Save trial CSV ---
     if save_trials_csv:
-        results.get_dataframe().to_csv(output_dir / "hpo_trials_ray.csv", index=False)
+        results.get_dataframe().to_csv(output_dir / "hpo_trials.csv", index=False)
 
     # --- Remove Ray experiment directory (optional) ---
     # The ray_experiment/ tree holds Ray's per-trial artifacts (model weights,
     # optimizer state, Ray metadata).  After a successful HPO run the best trial
-    # is already in best_trial/ and all metrics are in hpo_trials_ray.csv, so
+    # is already in best_trial/ and all metrics are in hpo_trials.csv, so
     # the experiment tree is no longer needed and can be several GB for text models.
     if cleanup_trials and exp_storage.exists():
         shutil.rmtree(exp_storage)
@@ -1328,10 +1523,85 @@ def optimize_ray(
         success_rate=_succ_rt_r,
         best_hyperparams=best_hyperparams,
         best_trial_path=str(best_trial_path),
-        best_hyperparams_path=str(output_dir / "best_hyperparams_ray.json"),
-        trials_csv_path=(str(output_dir / "hpo_trials_ray.csv") if save_trials_csv else None),
+        best_hyperparams_path=str(output_dir / "best_hyperparams.json"),
+        trials_csv_path=(str(output_dir / "hpo_trials.csv") if save_trials_csv else None),
         runtime_report=str(runtime_tracker.report_path),
         runtime_stage_csv=str(runtime_tracker.stage_csv_path),
     )
 
     return best_hyperparams, results
+
+
+# ---------------------------------------------------------------------------
+# Backend dispatch
+# ---------------------------------------------------------------------------
+def search_text(
+    search: "Optimize",
+    *,
+    resume: bool,
+    **common: Any,
+) -> tuple[dict, Any]:
+    """Run one text hyperparameter search on whichever backend ``search`` names.
+
+    The single place the :class:`~multimodalva.utils.optimize_config.Optimize`
+    fields are mapped onto :func:`optimize_text` / :func:`optimize_text_ray`, so
+    the classifiers and the ensembles do not each carry their own copy of the
+    mapping. Callers pass the arguments the two backends share; this function
+    adds the ones they spell differently.
+
+    ``Optimize(backend="auto")`` resolves through
+    :func:`~multimodalva.utils.optimize_config.resolve_backend` — Ray on a
+    CUDA/SLURM machine, Optuna otherwise. A resolved Ray call on a machine with
+    no CUDA GPU still redirects itself back to :func:`optimize_text`, so
+    ``backend="ray"`` is safe to leave set in a config that also runs on a
+    laptop.
+
+    Args:
+        search:  The search settings.
+        resume:  Already resolved by
+                 :func:`~multimodalva.utils.optimize_config.resolve_search_resume`.
+                 Spelled ``load_if_exists`` by the Optuna backend and ``resume``
+                 by the Ray one.
+        **common: Arguments both backends take under the same name
+                 (``train_dataset``, ``label2id``, ``id2label``, ``model_name``,
+                 ``output_dir``, ``random_state``, ``split_seed``, ``use_lora``,
+                 ``use_focal``, ``gradient_checkpointing``,
+                 ``early_stopping_patience``, ``use_fast``).
+
+    Returns:
+        ``(best_hyperparams, study_or_result_grid)`` — the backend object differs
+        (``optuna.Study`` vs ``ray.tune.ResultGrid``), which is why callers store
+        it without inspecting it.
+    """
+    from ..utils.optimize_config import resolve_backend, resolve_pruning
+
+    backend = resolve_backend(search.backend)
+    kwargs: dict[str, Any] = dict(
+        metric=search.metric,
+        search_space=search.space,
+        use_cv=search.cv,
+        n_cv_folds=search.cv_folds,
+        **common,
+    )
+    # n_trials=None means "this family's default", and the two backends resolve
+    # that to different numbers (Ray needs more trials when ASHA prunes). Let
+    # each apply its own rather than freezing one here.
+    if search.n_trials is not None:
+        kwargs["n_trials"] = search.n_trials
+
+    if backend == "ray":
+        if search.pruning is not None:
+            logger.warning(
+                "Optimize(pruning=%s) is ignored by the Ray backend, which has no "
+                "inter-trial pruner. Pass extra={'use_asha': True} to terminate "
+                "unpromising trials by successive halving instead.",
+                search.pruning,
+            )
+        kwargs["resume"] = resume
+        kwargs.update(search.extra)
+        return optimize_text_ray(**kwargs)
+
+    kwargs["load_if_exists"] = resume
+    kwargs["enable_pruning"] = resolve_pruning(search, TEXT_PRUNING_DEFAULT)
+    kwargs.update(search.extra)
+    return optimize_text(**kwargs)

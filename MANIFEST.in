@@ -1,11 +1,37 @@
 # Files to add to the source distribution beyond what setuptools includes by
-# default (the package itself, tests, README, LICENSE, pyproject.toml).
+# default (the package itself, README, LICENSE, pyproject.toml, and — of the
+# tests directory — only files named test_*.py).
 #
 # CITATION.cff travels with the source so that anyone who obtains the package
 # from PyPI rather than GitHub still has the citation metadata.
 include CITATION.cff
 
+# CHANGELOG.md travels too: someone installing from PyPI has no other way to
+# see what changed between versions, or to find the pre-release rename table.
+include CHANGELOG.md
+
+# The three scripts under tests/ that are not named test_*.py, so setuptools
+# does not pick them up by itself:
+#   smoke_test.py      "is the install alive?" — README and CONTRIBUTING both
+#                      tell the reader to run it straight after installing, so
+#                      it has to be in the distribution they installed from.
+#   diagnose.py        the same for "which pipelines and models work here?".
+#   hpc_ray_smoke.py   the only way to verify the Ray search backend, which
+#                      needs a GPU node.
+# ~45 KB together. tests/__init__.py rides along so the directory imports as a
+# package when it is run in place.
+include tests/*.py
+
+# The SLURM wrapper for the Ray smoke test — setuptools ships no .sbatch, and
+# hpc_ray_smoke.py is half a tool without it, since the Ray backend can only be
+# verified on a GPU node, which in practice means a batch job. ~3 KB.
+include tests/*.sbatch
+
 # Deliberately NOT shipped in the sdist:
+#   tests/sample_data/  204 KB of CSV against a ~400 KB sdist, and nothing needs
+#               it: the scripts above build their data with `data("va_sample")`,
+#               and the one test that compares against the committed CSV skips
+#               when it is absent. The committed copies live in the repository.
 #   docs/       index.html is a generated artifact, 204 KB against a 261 KB
 #               sdist, and it is rebuilt from the docstrings that the sdist
 #               already contains (python docs/build_docs.py). The published

@@ -3,7 +3,7 @@ Ensemble strategy 1 — Data-level fusion — classifier.
 
 Receives the fused text produced by ``build_fused_text()`` (``data_fusion.py``)
 and runs the standard text classification pipeline:
-    split → prepare_dataset → [optimize →] train → predict
+    split → prepare_text_dataset → [optimize →] train → predict
 
 Long-context models are required because the combined tabular description and
 free-text narrative routinely exceeds 512 tokens:
@@ -14,7 +14,7 @@ free-text narrative routinely exceeds 512 tokens:
     "yikuan8/Clinical-BigBird"       — domain-adapted BigBird; MPS-native on Apple Silicon
 
 MPS (Apple Silicon) note:
-    BigBird is preferred for local M-chip runs.  train() auto-detects MPS and injects
+    BigBird is preferred for local M-chip runs.  train_text() auto-detects MPS and injects
     attention_type="original_full", switching BigBird from block-sparse to standard
     dense attention — same model weights, no CUDA ops, no CPU fallback required.
     Longformer on MPS requires PYTORCH_ENABLE_MPS_FALLBACK=1 and is typically slower
@@ -33,18 +33,27 @@ from pathlib import Path
 
 import pandas as pd
 
-from multimodalva.utils.runtime import RuntimeTracker, distributed_state, resolve_seed
+from multimodalva.utils.runtime import (
+    RuntimeTracker, distributed_state, apply_dataloader_workers,
+)
+from multimodalva.utils.runtime import track_run
+from multimodalva.utils.seeds import seed_everything, set_determinism
 
 from .data_fusion import build_fused_text, DEFAULT_SEPARATOR
 
 logger = logging.getLogger(__name__)
+
+from dataclasses import replace  # noqa: E402
+
+from ..utils.hpo_defaults import merge_search_space  # noqa: E402
+from ..utils.optimize_config import Optimize, resolve_hyperparams  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Default HPO search space for long-context models
 # ---------------------------------------------------------------------------
 
-# Passed to text.hpo.optimize() as the search_space argument when use_optimize=True
+# Merged under a caller's Optimize(space=...) when a search runs
 # and no custom search_space is provided.  Calibrated for Longformer / BigBird /
 # Clinical-Longformer (sequence lengths 1 024–4 096).
 #
@@ -55,10 +64,10 @@ logger = logging.getLogger(__name__)
 #   warmup_ratio  — wider range (0.05–0.2); longer warmup stabilises large-span attention
 #   gradient_accumulation_steps — 4 or 8 to reach an effective batch of ~16–32
 #
-# These values override the corresponding entries in text/hpo.py's DEFAULT_SEARCH_SPACE.
-# LoRA parameters (lora_r, lora_alpha) are merged in automatically by optimize()
+# These values override the corresponding entries in TEXT_DEFAULT_SEARCH_SPACE.
+# LoRA parameters (lora_r, lora_alpha) are merged in automatically by the text search
 # when use_lora=True.
-DEFAULT_SEARCH_SPACE: dict = {
+DATA_FUSION_DEFAULT_SEARCH_SPACE: dict = {
     # Long-context models are more sensitive to LR than BERT-base.
     # Upper bound capped at 2e-5 to avoid instability with 1024+ token sequences.
     "learning_rate": ("float_log", 5e-6, 2e-5),
@@ -94,7 +103,7 @@ class DataFusionClassifier:
 
     Fuses tabular features into the free-text narrative via
     ``build_fused_text()``, then runs the standard text classification
-    pipeline (split → prepare_dataset → [optimize →] train → predict).
+    pipeline (split → prepare_text_dataset → [optimize →] train → predict).
 
     Recommended models:
         "allenai/longformer-base-4096"   — general-purpose long-context (OSC/CUDA)
@@ -104,7 +113,7 @@ class DataFusionClassifier:
 
     MPS (Apple Silicon M-chip) guidance:
         BigBird is the recommended model family for local development on M-chip Macs.
-        train() auto-detects MPS and sets attention_type="original_full" for BigBird,
+        train_text() auto-detects MPS and sets attention_type="original_full" for BigBird,
         switching from block-sparse to standard dense attention which runs natively on
         Metal without any CPU fallback.
 
@@ -154,8 +163,10 @@ class DataFusionClassifier:
         self.id2label: dict | None = None
         self.predictions = None
         self.best_hyperparams: dict | None = None
-        self.study = None   # Optuna study, set when use_optimize=True
+        self.study = None   # Optuna study, set when hyperparams=Optimize(...)
 
+    @track_run("data_fusion", track=False)
+    @apply_dataloader_workers
     def run(
         self,
         df: pd.DataFrame,
@@ -176,26 +187,22 @@ class DataFusionClassifier:
         fusion_n_jobs: int | None = None,
         # --- split ---
         test_size: float = 0.2,
-        random_state: int = 42,
-        set_seed: int | None = None,
+        split_seed: int = 42,
+        train_seed: int = 42,
+        deterministic: bool = False,
         stratify: bool = True,
         split_col: str | None = None,
         # --- tokenisation ---
         max_length: int = 1024,
         # --- training ---
-        use_optimize: bool = False,
-        n_trials: int = 30,
-        optimize_metric: str = "csmf_accuracy",
-        search_space: dict | None = None,
-        hyperparams: dict | None = None,
-        use_lora: bool = True,
+        hyperparams: "dict | str | Optimize | None" = None,
+        use_lora: bool = False,
         use_focal: bool = False,
         gradient_checkpointing: bool = True,
         early_stopping_patience: int | None = 4,
-        use_cv: bool = True,
-        n_cv_folds: int = 3,
-        resume_hpo: bool = True,
-        resume_training: bool = True,
+        val_size: float | None = 0.1,
+        n_jobs: int | None = None,
+        resume: bool = True,
         # --- inference ---
         batch_size: int = 16,
         top_k: int = 3,
@@ -212,10 +219,10 @@ class DataFusionClassifier:
         Steps executed in order:
             1. build_fused_text()    — tabular features → text, concat with narrative
             2. split()               — stratified train/test split on fused DataFrame
-            3. prepare_dataset()     — tokenise for the chosen LM
-            4. [optimize()]          — optional Optuna HPO
-            5. train()               — fine-tune on the full training set
-            6. predict()             — generate labels and probabilities on test set
+            3. prepare_text_dataset()     — tokenise for the chosen LM
+            4. [search_text()]            — optional HPO (Optuna or Ray Tune)
+            5. train_text()               — fine-tune on the full training set
+            6. predict_text()             — generate labels and probabilities on test set
 
         Args:
             df:            Input DataFrame containing both text and tabular columns.
@@ -243,21 +250,23 @@ class DataFusionClassifier:
                            for faster cluster runs and lower shared-filesystem I/O.
             fusion_n_jobs: CPU workers for build_fused_text(). None = auto.
             test_size:     Fraction held out for testing. Default 0.2.
-            random_state:  Random seed. Default 42.
-            set_seed:      Optional alias for a single run-level seed. When
-                           provided, overrides ``random_state`` so one value
-                           controls split, HPO, and training seeds end-to-end.
+            split_seed:    Seed for every row-partitioning decision — the
+                           train/test split, the search's folds and the
+                           early-stopping slice. Default 42.
+            train_seed:    Seed for everything the model does with its rows.
+                           Default 42. See :mod:`multimodalva.utils.seeds`.
+            deterministic: Demand bit-for-bit repeatable kernels, at a cost in
+                           speed and robustness. Default False.
             stratify:      Stratified split. Default True.
             max_length:    Tokeniser max length. Default 1 024 (Longformer/BigBird).
                            Use 4 096 for very long documents.
-            use_optimize:  Run Optuna HPO before final training. Default False.
-            n_trials:      Optuna trial count (use_optimize=True only). Default 30.
-            optimize_metric: Metric to maximise during HPO. Default "csmf_accuracy".
-            search_space:  Custom Optuna search space dict.
-                           None → DEFAULT_SEARCH_SPACE (long-context calibrated defaults).
-            hyperparams:   Fixed hyperparameter dict. Used when use_optimize=False.
-            use_lora:      Apply LoRA adapters. Default True.
-            use_focal:     Use focal loss during HPO trials (use_optimize=True only).
+            hyperparams:   Where the hyperparameters come from: a dict of fixed
+                           values, ``Optimize(...)`` to search, or ``"default"``.
+                           A search starts from the long-context calibrated
+                           space; ``Optimize(space=...)`` overrides it per key
+                           rather than replacing it wholesale.
+            use_lora:      Train LoRA adapters instead of the full model. Default False.
+            use_focal:     Use focal loss during search trials.
                            Merges FOCAL_SEARCH_SPACE (focal_gamma, class_weights) and
                            injects loss_type="focal" into every trial. Default False.
                            For non-HPO focal loss, pass hyperparams={"loss_type": "focal",
@@ -265,13 +274,14 @@ class DataFusionClassifier:
             gradient_checkpointing: Enable gradient checkpointing. Default True
                            (strongly recommended for long-context models).
             early_stopping_patience: Early stopping patience. Default 4.
-            use_cv:        Use stratified k-fold CV in HPO to reduce metric variance
-                           on rare classes. Default True.
-            n_cv_folds:    Number of CV folds when use_cv=True. Default 3.
-            resume_hpo:    Resume an existing Optuna study if present (load_if_exists).
-                           Default True.
-            resume_training: Resume final training from the latest checkpoint in
-                           output_dir/final/ if one exists. Default True.
+            val_size:      Share of the training split held out for early
+                           stopping when hyperparameters are fixed; ignored after
+                           a search. Default 0.1.
+            n_jobs:        CPU workers for loading text batches. ``None``
+                           (default) chooses automatically. Default None.
+            resume:        Pick up where an interrupted run in the same
+                           output_dir stopped — the search's finished trials and
+                           the latest training checkpoint. Default True.
             batch_size:    Inference batch size. Default 16.
             top_k:         Number of top classes in topk output. Default 3.
             use_fast:      Use fast tokenizer implementations when available.
@@ -280,7 +290,7 @@ class DataFusionClassifier:
         Returns:
             dict with keys:
                 "predictions":      PredictionResult(top1, full, topk, id2label)
-                "train_metadata":   metadata dict from train()
+                "train_metadata":   metadata dict from train_text()
                 "best_hyperparams": hyperparams used for final training
                 "label2id":         label encoding map
                 "id2label":         reverse label encoding map
@@ -299,11 +309,12 @@ class DataFusionClassifier:
                 "text_col": text_col,
                 "label_col": label_col,
                 "fused_col": fused_col,
-                "use_optimize": use_optimize,
+                "hyperparams_from": resolve_hyperparams(hyperparams)[0],
             },
             logger_=logger,
         )
-        effective_seed = resolve_seed(random_state=random_state, set_seed=set_seed)
+        set_determinism(deterministic)
+        seed_everything(train_seed)
         rank, world_size = distributed_state()
         save_fused_path = (
             self.output_dir / "fused_text.csv"
@@ -350,10 +361,15 @@ class DataFusionClassifier:
                 # Build a minimal DataFrame: fused text + label only.
                 fused_df = df[[label_col]].copy()
                 fused_df[fused_col] = fused_series.values
-                # Carry a pre-defined split marker through so the split step
-                # can honour an external/fixed train-test assignment.
-                if split_col is not None and split_col in df.columns:
-                    fused_df[split_col] = df[split_col].values
+
+            # Carry the split marker and the row identifier through both
+            # branches: the split step needs the first to honour a fixed
+            # assignment, and the predictions need the second. The pre-fused
+            # branch used to keep neither, and neither branch kept id_col, so
+            # run(task="data_fusion", id_col=...) crashed.
+            for keep in (split_col, id_col):
+                if keep is not None and keep in df.columns and keep not in fused_df.columns:
+                    fused_df[keep] = df[keep].values
 
         # ------------------------------------------------------------------
         # Step 2 — Split
@@ -365,7 +381,7 @@ class DataFusionClassifier:
             details={
                 "rows": len(fused_df),
                 "test_size": test_size,
-                "random_state": effective_seed,
+                "split_seed": split_seed,
                 "stratify": stratify,
             },
         ):
@@ -374,7 +390,7 @@ class DataFusionClassifier:
                 label_col=label_col,
                 text_col=fused_col,
                 test_size=test_size,
-                random_state=effective_seed,
+                random_state=split_seed,
                 stratify=stratify,
                 split_col=split_col,
             )
@@ -385,13 +401,13 @@ class DataFusionClassifier:
         # ------------------------------------------------------------------
         # Step 3 — Tokenise
         # ------------------------------------------------------------------
-        from ..text.dataset import prepare_dataset
+        from ..text.dataset import prepare_text_dataset
 
         with runtime_tracker.stage(
             "prepare_dataset",
             details={"max_length": max_length, "use_fast": use_fast},
         ):
-            train_ds, test_ds, label2id, id2label = prepare_dataset(
+            train_ds, test_ds, label2id, id2label = prepare_text_dataset(
                 train_df,
                 test_df,
                 text_col=fused_col,
@@ -414,15 +430,25 @@ class DataFusionClassifier:
         # ------------------------------------------------------------------
         from ..text.text_classifier import TextClassifier
 
-        # Use long-context calibrated defaults when no custom space is given.
-        effective_search_space = search_space if search_space is not None else DEFAULT_SEARCH_SPACE
+        # Long-context models need particular batch sizes and accumulation
+        # steps to fit in memory, so the caller's space is merged ON TOP of the
+        # calibrated one rather than replacing it. A partial dict used to drop
+        # batch_size and gradient_accumulation_steps and blow up GPU memory.
+        hp_kind, hp_fixed, hp_search = resolve_hyperparams(hyperparams)
+        if hp_kind == "search":
+            merged_space = dict(DATA_FUSION_DEFAULT_SEARCH_SPACE)
+            if hp_search.space:
+                merge_search_space(merged_space, hp_search.space, logger)
+            hp_search = replace(hp_search, space=merged_space)
+            hp_search = hp_search.with_defaults(n_trials=30)
+            hyperparams = hp_search
 
         text_clf = TextClassifier(
             model_name=self.model_name,
             output_dir=self.output_dir,
         )
         # Pass the already-tokenised datasets directly so TextClassifier skips
-        # its own split + prepare_dataset steps and goes straight to HPO/train.
+        # its own split + prepare_text_dataset steps and goes straight to HPO/train.
         text_clf.train_dataset = train_ds
         text_clf.test_dataset  = test_ds
         text_clf.label2id      = label2id
@@ -431,28 +457,23 @@ class DataFusionClassifier:
         text_clf.test_df       = test_df
 
         logger.info(
-            "DataFusionClassifier: delegating HPO/train/predict to TextClassifier "
-            "(use_optimize=%s, n_trials=%d, metric=%s).",
-            use_optimize, n_trials, optimize_metric,
+            "DataFusionClassifier: delegating train/predict to TextClassifier "
+            "(hyperparameters %s).",
+            hp_search.describe() if hp_kind == "search" else f"from {hp_kind}",
         )
         results = text_clf._run_from_datasets(
             label_col=label_col,
             hyperparams=hyperparams,
-            use_optimize=use_optimize,
-            n_trials=n_trials,
-            optimize_metric=optimize_metric,
-            search_space=effective_search_space,
             batch_size=batch_size,
             top_k=top_k,
             use_lora=use_lora,
             use_focal=use_focal,
             gradient_checkpointing=gradient_checkpointing,
             early_stopping_patience=early_stopping_patience,
-            use_cv=use_cv,
-            n_cv_folds=n_cv_folds,
-            resume_hpo=resume_hpo,
-            resume_training=resume_training,
-            random_state=effective_seed,
+            val_size=val_size,
+            resume=resume,
+            split_seed=split_seed,
+            train_seed=train_seed,
             use_fast=use_fast,
             _runtime_tracker=runtime_tracker,
         )

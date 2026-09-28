@@ -4,17 +4,17 @@ Step 5 (tabular pipeline): Hyperparameter optimization.
 Two backends are provided; both accept the same search_space format and return
 ``(best_hyperparams, backend_object)`` so callers can switch backends without changing call sites:
 
-    optimize()      — Optuna (TPE sampler, JournalStorage persistence)
+    optimize_tabular()      — Optuna (TPE sampler, JournalStorage persistence)
                       Best for single-machine sequential or lightly parallel HPO.
 
-    optimize_ray()  — Ray Tune (OptunaSearch / TPE, distributed runtime)
+    optimize_tabular_ray()  — Ray Tune (OptunaSearch / TPE, distributed runtime)
                       Best for multi-CPU/GPU machines or multi-node clusters.
                       Runs N trials concurrently; auto-caps n_jobs per trial
                       to prevent CPU contention between concurrent workers.
                       For GPU-accelerated models (catboost, lightgbm, xgboost),
                       set num_gpus_per_trial=1 and use_gpu=True.
 
-Input:  X_train, y_train, label2id, id2label from prepare_dataset()
+Input:  X_train, y_train, label2id, id2label from prepare_tabular_dataset()
 Output: best_hyperparams dict and backend study / ResultGrid object
 """
 
@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import optuna
     import ray
+
+    from ..utils.optimize_config import Optimize
 
 import numpy as np
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
@@ -51,29 +53,35 @@ from ..utils.metrics import (  # noqa: F401
     decode_trials_dataframe_for_space, CV_METRICS, HPO_METRICS,
 )
 from ..utils.ray_compat import to_ray_space
-from .predict import predict
-from .train import SUPPORTED_MODELS, train
+from ..utils.hpo_defaults import get_class_tier, merge_search_space
+from .predict import predict_tabular
+from .train import TABULAR_MODELS, train_tabular
 
 logger = logging.getLogger(__name__)
 
 from .search_spaces import (  # noqa: E402
-    DEFAULT_SEARCH_SPACES,
+    TABULAR_DEFAULT_SEARCH_SPACES,
     SEARCH_SPACE_PROFILES,
     _int_spec,
     _float_spec,
     _float_log_spec,
     _categorical_spec,
-    _class_tier,
     _apply_nclasses_adjustments,
     infer_search_space_profile,
     _resolve_search_space_profile,
     _max_features_choices,
     _build_profile_space,
-    get_default_search_space,
+    get_tabular_default_search_space,
 )
 
 
-def optimize(
+#: ``enable_pruning``'s default for this family — off, unlike text. A tree-model
+#: trial finishes in seconds, so the pruner mostly adds variance to the search
+#: for no saving. ``Optimize(pruning=None)`` resolves to this.
+TABULAR_PRUNING_DEFAULT = False
+
+
+def optimize_tabular(
     X_train: np.ndarray,
     y_train: np.ndarray,
     label2id: dict,
@@ -81,16 +89,17 @@ def optimize(
     model_name: str,
     output_dir: str | Path,
     n_trials: int = 50,
-    metric: str = "accuracy",
+    metric: str = "f1_macro",
     search_space: dict | None = None,
     val_size: float = 0.2,
     use_cv: bool = True,
     n_cv_folds: int = 3,
     random_state: int = 42,
+    split_seed: int | None = None,
     study_name: str = "tabular_hpo",
     storage_path: str | None = None,
     load_if_exists: bool = True,
-    enable_pruning: bool = False,
+    enable_pruning: bool = TABULAR_PRUNING_DEFAULT,
     save_trials_csv: bool = True,
     cleanup_trials: bool = True,
     n_jobs: int = -1,
@@ -103,25 +112,27 @@ def optimize(
       - use_cv=True: stratified k-fold CV over X_train/y_train; each trial score
         is the mean across folds.
       - use_cv=False: single stratified opt-train / opt-val split.
-    The held-out test set from prepare_dataset() is never used here.
+    The held-out test set from prepare_tabular_dataset() is never used here.
 
     After all trials complete, the best trial's artifacts are copied to
     output_dir/best_trial/ and best hyperparams saved as best_hyperparams.json.
 
     Args:
-        X_train:        Preprocessed feature matrix from prepare_dataset().
-        y_train:        Integer label array from prepare_dataset().
-        label2id:       Label-to-integer mapping from prepare_dataset().
-        id2label:       Integer-to-label mapping from prepare_dataset().
-        model_name:     Model alias — one of SUPPORTED_MODELS keys.
+        X_train:        Preprocessed feature matrix from prepare_tabular_dataset().
+        y_train:        Integer label array from prepare_tabular_dataset().
+        label2id:       Label-to-integer mapping from prepare_tabular_dataset().
+        id2label:       Integer-to-label mapping from prepare_tabular_dataset().
+        model_name:     Model alias — one of TABULAR_MODELS keys.
         output_dir:     Root directory for trial outputs and study database.
         n_trials:       Total Optuna trials. Default 50.
         metric:         Metric to optimise — "accuracy", "balanced_accuracy",
                         "f1_macro", "f1_weighted", "csmf_accuracy", or "log_loss".
-                        Default "accuracy". Use "balanced_accuracy",
+                        Default "f1_macro". Use "balanced_accuracy",
                         "csmf_accuracy", or "f1_macro" for imbalanced VA data.
         search_space:   Custom search space dict. Merged over the adaptive
                         default search space selected for this dataset.
+                        Overrides it per key; keys you omit keep
+                        their default.
         search_space_profile:
                         One of "auto", "small", "balanced", "wide", "large".
                         "auto" infers a profile from X_train.shape.
@@ -129,7 +140,13 @@ def optimize(
                         Ignored when use_cv=True.
         use_cv:         Use stratified k-fold CV for trial scoring. Default True.
         n_cv_folds:     Number of CV folds when use_cv=True. Default 3.
-        random_state:   Seed for stratified split and Optuna sampler. Default 42.
+        random_state:   Seed for the Optuna sampler and for each candidate fit.
+                        Default 42.
+        split_seed:     Seed for the cross-validation folds / internal
+                        validation split this function draws. ``None`` (the
+                        default) reuses ``random_state``, so existing callers
+                        are unaffected. Pass it separately to hold the folds
+                        fixed while ``random_state`` reseeds the models.
         study_name:     Optuna study name. Default "tabular_hpo".
         storage_path:   Path to the JournalStorage log file for study persistence.
                         Defaults to output_dir/hpo_<model_name>.log.
@@ -157,7 +174,7 @@ def optimize(
         from optuna.samplers import TPESampler
     except ImportError as exc:
         raise ImportError(
-            "optuna is required for optimize(). "
+            "optuna is required for optimize_tabular(). "
             "Install with:  pip install 'optuna>=3.4'"
         ) from exc
 
@@ -172,26 +189,25 @@ def optimize(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if model_name not in SUPPORTED_MODELS:
+    if model_name not in TABULAR_MODELS:
         raise ValueError(
-            f"Unsupported model '{model_name}'. Choose from: {list(SUPPORTED_MODELS)}."
+            f"Unsupported model '{model_name}'. Choose from: {list(TABULAR_MODELS)}."
         )
 
     # Build effective search space: data/class-adaptive base → caller overrides
     n_classes = len(id2label)
     resolved_profile = _resolve_search_space_profile(X_train, search_space_profile)
-    active_space = get_default_search_space(
+    active_space = get_tabular_default_search_space(
         model_name=model_name,
         X_train=X_train,
         search_space_profile=resolved_profile,
         n_classes=n_classes,
     )
-    if search_space:
-        active_space.update(search_space)
+    merge_search_space(active_space, search_space, logger)
     logger.info(
         "Tabular HPO adaptive search space: profile=%s, class_tier=%s "
         "(n_samples=%d, n_features=%d, n_classes=%d).",
-        resolved_profile, _class_tier(n_classes),
+        resolved_profile, get_class_tier(n_classes),
         X_train.shape[0], X_train.shape[1], n_classes,
     )
 
@@ -225,6 +241,9 @@ def optimize(
     # Trial evaluation setup — never uses the held-out test set
     cv_splits: list[tuple[list[int], list[int]]] | None = None
     X_opt_train = y_opt_train = X_opt_val = y_opt_val = None
+    # Which rows form each fold is a partitioning decision, so it follows the
+    # split seed rather than the seed that reseeds the models.
+    _split_seed = split_seed if split_seed is not None else random_state
     if use_cv:
         _, class_counts = np.unique(y_train, return_counts=True)
         min_class_count = int(class_counts.min())
@@ -237,7 +256,7 @@ def optimize(
         skf = StratifiedKFold(
             n_splits=n_cv_folds,
             shuffle=True,
-            random_state=random_state,
+            random_state=_split_seed,
         )
         cv_splits = [
             (train_idx.tolist(), val_idx.tolist())
@@ -252,7 +271,7 @@ def optimize(
         sss = StratifiedShuffleSplit(
             n_splits=1,
             test_size=val_size,
-            random_state=random_state,
+            random_state=_split_seed,
         )
         opt_train_idx, opt_val_idx = next(sss.split(X_train, y_train))
         X_opt_train = X_train[opt_train_idx]
@@ -278,7 +297,7 @@ def optimize(
                 X_fold_val = X_train[cv_val_idx]
                 y_fold_val = y_train[cv_val_idx]
 
-                train(
+                train_tabular(
                     X_fold_train, y_fold_train,
                     label2id=label2id,
                     id2label=id2label,
@@ -289,7 +308,7 @@ def optimize(
                     n_jobs=n_jobs,
                     use_gpu=use_gpu,
                 )
-                fold_result = predict(fold_dir, X_fold_val, y_fold_val)
+                fold_result = predict_tabular(fold_dir, X_fold_val, y_fold_val)
                 for m in CV_METRICS:
                     fold_scores[m].append(score_predictions(fold_result.top1, m))
                 fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
@@ -302,7 +321,7 @@ def optimize(
             if X_opt_train is None or y_opt_train is None or X_opt_val is None or y_opt_val is None:
                 raise RuntimeError("Holdout split was not prepared for use_cv=False.")
 
-            train(
+            train_tabular(
                 X_opt_train, y_opt_train,
                 label2id=label2id,
                 id2label=id2label,
@@ -313,7 +332,7 @@ def optimize(
                 n_jobs=n_jobs,
                 use_gpu=use_gpu,
             )
-            result = predict(trial_dir, X_opt_val, y_opt_val)
+            result = predict_tabular(trial_dir, X_opt_val, y_opt_val)
             all_scores = {
                 m: score_predictions(result.top1, m)
                 for m in CV_METRICS
@@ -485,8 +504,8 @@ def _tabular_ray_trial_fn(
     if _project_root not in _sys.path:
         _sys.path.insert(0, _project_root)
 
-    from multimodalva.tabular.train import train as _train
-    from multimodalva.tabular.predict import predict as _predict
+    from multimodalva.tabular.train import train_tabular
+    from multimodalva.tabular.predict import predict_tabular
     from multimodalva.utils.metrics import score_predictions, log_loss_from_full
     from multimodalva.utils.ray_compat import get_ray_trial_dir
 
@@ -519,7 +538,7 @@ def _tabular_ray_trial_fn(
                 X_fold_val = X_train[cv_val_idx]
                 y_fold_val = y_train[cv_val_idx]
 
-                _train(
+                train_tabular(
                     X_fold_train, y_fold_train,
                     label2id=label2id,
                     id2label=id2label,
@@ -530,7 +549,7 @@ def _tabular_ray_trial_fn(
                     n_jobs=n_jobs,
                     use_gpu=use_gpu,
                 )
-                fold_result = _predict(fold_dir, X_fold_val, y_fold_val)
+                fold_result = predict_tabular(fold_dir, X_fold_val, y_fold_val)
                 for m in CV_METRICS:
                     fold_scores[m].append(score_predictions(fold_result.top1, m))
                 fold_log_losses.append(log_loss_from_full(fold_result.full, fold_result.id2label))
@@ -542,7 +561,7 @@ def _tabular_ray_trial_fn(
                 raise ValueError(
                     "Holdout mode requires X_opt_train, y_opt_train, X_opt_val, and y_opt_val."
                 )
-            _train(
+            train_tabular(
                 X_opt_train, y_opt_train,
                 label2id=label2id,
                 id2label=id2label,
@@ -553,7 +572,7 @@ def _tabular_ray_trial_fn(
                 n_jobs=n_jobs,
                 use_gpu=use_gpu,
             )
-            result = _predict(trial_dir, X_opt_val, y_opt_val)
+            result = predict_tabular(trial_dir, X_opt_val, y_opt_val)
             all_scores = {
                 m: score_predictions(result.top1, m)
                 for m in CV_METRICS
@@ -571,7 +590,7 @@ def _tabular_ray_trial_fn(
     return all_scores
 
 
-def optimize_ray(
+def optimize_tabular_ray(
     X_train: np.ndarray,
     y_train: np.ndarray,
     label2id: dict,
@@ -579,12 +598,13 @@ def optimize_ray(
     model_name: str,
     output_dir: str | Path,
     n_trials: int = 50,
-    metric: str = "accuracy",
+    metric: str = "f1_macro",
     search_space: dict | None = None,
     val_size: float = 0.2,
     use_cv: bool = True,
     n_cv_folds: int = 3,
     random_state: int = 42,
+    split_seed: int | None = None,
     n_jobs: int = -1,
     use_gpu: bool | None = None,
     # ---- Ray cluster / resource settings --------------------------------
@@ -635,7 +655,7 @@ def optimize_ray(
     ------------------------------------
     When multiple trials run in parallel, ``n_jobs=-1`` would cause each trial
     to attempt to use all CPU cores simultaneously, causing contention and
-    degraded throughput.  ``optimize_ray()`` automatically caps ``n_jobs`` to
+    degraded throughput.  ``optimize_tabular_ray()`` automatically caps ``n_jobs`` to
     ``num_cpus_per_trial`` to ensure each trial stays within its allocated
     resource budget:
 
@@ -659,11 +679,11 @@ def optimize_ray(
     trial artifacts.
 
     Args:
-        X_train:        Preprocessed feature matrix from prepare_dataset().
-        y_train:        Integer label array from prepare_dataset().
-        label2id:       Label-to-integer mapping from prepare_dataset().
-        id2label:       Integer-to-label mapping from prepare_dataset().
-        model_name:     Model alias — one of SUPPORTED_MODELS keys.
+        X_train:        Preprocessed feature matrix from prepare_tabular_dataset().
+        y_train:        Integer label array from prepare_tabular_dataset().
+        label2id:       Label-to-integer mapping from prepare_tabular_dataset().
+        id2label:       Integer-to-label mapping from prepare_tabular_dataset().
+        model_name:     Model alias — one of TABULAR_MODELS keys.
         output_dir:     Root directory for all Ray Tune artifacts.  Use a
                         shared filesystem path for multi-node clusters.
         n_trials:       Total number of trials. Default 50.
@@ -671,8 +691,10 @@ def optimize_ray(
                         ``"f1_macro"``, ``"f1_weighted"``, ``"csmf_accuracy"``,
                         or ``"log_loss"``. Default ``"accuracy"``.
         search_space:   Custom search space dict (same format as
-                        :func:`optimize`). Merged over the adaptive default
-                        search space selected for this dataset.
+                        :func:`optimize_tabular`). Merged over the adaptive
+                        default search space selected for this dataset.
+                        Overrides it per key; keys you omit keep
+                        their default.
         search_space_profile:
                         One of "auto", "small", "balanced", "wide", "large".
                         "auto" infers a profile from X_train.shape.
@@ -681,15 +703,22 @@ def optimize_ray(
                         Ignored when use_cv=True.
         use_cv:         Use stratified k-fold CV for trial scoring. Default True.
         n_cv_folds:     Number of CV folds when use_cv=True. Default 3.
-        random_state:   Seed for stratified split and OptunaSearch sampler.
-                        Default 42.
+        random_state:   Seed for each candidate fit and for the OptunaSearch
+                        sampler. Default 42.
+        split_seed:     Seed for the CV fold draw / internal validation split
+                        this function makes, as in :func:`optimize_tabular`.
+                        ``None`` (the default) reuses ``random_state``, so
+                        existing callers are unaffected. Pass it separately to
+                        hold the folds fixed while the model seed varies —
+                        without it, switching backend would silently move the
+                        fold boundaries of an otherwise identical search.
         n_jobs:         CPU parallelism *within* each trial.  Default -1
                         (all cores), but automatically capped to
                         ``num_cpus_per_trial`` when running in parallel to
                         prevent CPU contention.
         use_gpu:        Enable GPU acceleration for catboost / lightgbm /
                         xgboost.  ``None`` → auto-detect (same as
-                        :func:`~tabular.train.train`).  Set to ``True``
+                        :func:`~tabular.train.train_tabular`).  Set to ``True``
                         together with ``num_gpus_per_trial=1``.
         ray_address:    Ray cluster address.
                         ``None``          — local Ray instance.
@@ -704,7 +733,7 @@ def optimize_ray(
         max_concurrent_trials: Cap on simultaneously running trials.
                                ``None`` → Ray auto-determines. Default None.
         save_trials_csv: Save all trial metrics to
-                         ``output_dir/hpo_trials_ray.csv``. Default True.
+                         ``output_dir/hpo_trials.csv``. Default True.
 
     Returns:
         best_hyperparams: Dict from the best trial — pass to
@@ -714,7 +743,7 @@ def optimize_ray(
                  ``results.get_best_result().path`` → best trial artifact dir.
 
     Raises:
-        ValueError:  If model_name is not in SUPPORTED_MODELS.
+        ValueError:  If model_name is not in TABULAR_MODELS.
         ImportError: If ``ray[tune]`` is not installed.
     """
     _VALID_METRICS = HPO_METRICS
@@ -732,24 +761,27 @@ def optimize_ray(
         from ray.tune.search import ConcurrencyLimiter
     except ImportError as exc:
         raise ImportError(
-            "Ray Tune and Optuna are required for optimize_ray(). "
-            "Install with: pip install 'ray[tune]' optuna"
+            "Ray Tune is required for optimize_tabular_ray(). It lives in an "
+            "optional extra, so a normal install does not have it:\n"
+            "    pip install 'multimodalva[ray]'\n"
+            "Or search on the Optuna backend, which needs nothing extra:\n"
+            "    Optimize(backend=\"optuna\")   # or backend=\"auto\""
         ) from exc
 
-    if model_name not in SUPPORTED_MODELS:
+    if model_name not in TABULAR_MODELS:
         raise ValueError(
-            f"Unsupported model '{model_name}'. Choose from: {list(SUPPORTED_MODELS)}."
+            f"Unsupported model '{model_name}'. Choose from: {list(TABULAR_MODELS)}."
         )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Auto-redirect to optimize() on MPS/CPU-only ---
+    # --- Auto-redirect to optimize_tabular() on MPS/CPU-only ---
     # Ray Train v2 is incompatible with function trainables on non-CUDA devices:
     # RunConfig auto-injects checkpoint_at_end=True which raises ValueError,
     # forcing a no-RunConfig fallback where trial state goes to ~/ray_results
     # and cannot be restored → resume always restarts from trial 1.
-    # On MPS/CPU, optimize() (Optuna + JournalStorage) is the correct backend.
+    # On MPS/CPU, optimize_tabular() (Optuna + JournalStorage) is the correct backend.
     try:
         import torch as _torch
         _cuda_available = _torch.cuda.device_count() > 0
@@ -758,13 +790,13 @@ def optimize_ray(
     if not _cuda_available:
         _safe = model_name.replace("/", "_")
         logger.info(
-            "optimize_ray(): no CUDA GPUs detected — redirecting to optimize() "
+            "optimize_tabular_ray(): no CUDA GPUs detected — redirecting to optimize_tabular() "
             "(Optuna sequential, JournalStorage-backed). Ray Tune requires CUDA for "
             "reliable experiment persistence and resume. "
             "Journal log: %s/hpo_%s.log",
             output_dir, _safe,
         )
-        return optimize(
+        return optimize_tabular(
             X_train=X_train,
             y_train=y_train,
             label2id=label2id,
@@ -796,23 +828,26 @@ def optimize_ray(
     # --- Build effective search space: data/class-adaptive base → caller overrides ---
     n_classes = len(id2label)
     resolved_profile = _resolve_search_space_profile(X_train, search_space_profile)
-    active_space = get_default_search_space(
+    active_space = get_tabular_default_search_space(
         model_name=model_name,
         X_train=X_train,
         search_space_profile=resolved_profile,
         n_classes=n_classes,
     )
-    if search_space:
-        active_space.update(search_space)
+    merge_search_space(active_space, search_space, logger)
     ray_space = to_ray_space(active_space)
     logger.info(
         "Tabular HPO adaptive search space: profile=%s, class_tier=%s "
         "(n_samples=%d, n_features=%d, n_classes=%d).",
-        resolved_profile, _class_tier(n_classes),
+        resolved_profile, get_class_tier(n_classes),
         X_train.shape[0], X_train.shape[1], n_classes,
     )
 
-    # --- Trial evaluation setup (mirrors optimize()) ---
+    # --- Trial evaluation setup (mirrors optimize_tabular()) ---
+    # split_seed governs which rows go where, random_state what the model does
+    # with them. They are separate so that changing the model seed does not move
+    # the fold boundaries; None falls back to random_state, as everywhere else.
+    _split_seed = split_seed if split_seed is not None else random_state
     cv_splits: list[tuple[list[int], list[int]]] | None = None
     X_opt_train = y_opt_train = X_opt_val = y_opt_val = None
     if use_cv:
@@ -827,7 +862,7 @@ def optimize_ray(
         skf = StratifiedKFold(
             n_splits=n_cv_folds,
             shuffle=True,
-            random_state=random_state,
+            random_state=_split_seed,
         )
         cv_splits = [
             (train_idx.tolist(), val_idx.tolist())
@@ -840,7 +875,7 @@ def optimize_ray(
         )
     else:
         sss = StratifiedShuffleSplit(
-            n_splits=1, test_size=val_size, random_state=random_state
+            n_splits=1, test_size=val_size, random_state=_split_seed
         )
         opt_train_idx, opt_val_idx = next(sss.split(X_train, y_train))
         X_opt_train = X_train[opt_train_idx]
@@ -890,11 +925,11 @@ def optimize_ray(
     # This means experiment state cannot be persisted → resume is impossible.
     if available_gpus == 0:
         logger.warning(
-            "optimize_ray(): no CUDA GPUs available (MPS/CPU-only environment). "
+            "optimize_tabular_ray(): no CUDA GPUs available (MPS/CPU-only environment). "
             "Ray Train v2 is incompatible with function trainables on non-CUDA "
             "devices — experiment state cannot be persisted and resume will not "
             "work across restarts. "
-            "RECOMMENDATION: use optimize() (Optuna backend) instead — it uses "
+            "RECOMMENDATION: use optimize_tabular() (Optuna backend) instead — it uses "
             "JournalStorage for reliable crash recovery and resume on MPS/CPU machines.",
         )
     else:
@@ -1037,7 +1072,7 @@ def optimize_ray(
         tuner = _fresh_tuner()
 
     logger.info(
-        "optimize_ray: launching %d trials  model=%s  metric=%s  "
+        "optimize_tabular_ray: launching %d trials  model=%s  metric=%s  "
         "cpus/trial=%d  gpus/trial=%.1f",
         n_trials, model_name, metric, num_cpus_per_trial, num_gpus_per_trial,
     )
@@ -1064,14 +1099,14 @@ def optimize_ray(
             # In this fallback mode, trials run via tuner_no_rc and their
             # state is saved to ~/ray_results — NOT to our exp_path — so
             # resume via Tuner.restore() is impossible across restarts.
-            # On MPS/Apple Silicon: switch to optimize() (Optuna) for
-            # reliable resume.  optimize() uses JournalStorage and resumes
+            # On MPS/Apple Silicon: switch to optimize_tabular() (Optuna) for
+            # reliable resume.  optimize_tabular() uses JournalStorage and resumes
             # correctly after crashes or SLURM preemptions.
             logger.warning(
                 "checkpoint_at_end error from Ray Train v2 (%s). "
                 "Retrying without RunConfig — this run's trial state will be "
                 "saved to ~/ray_results (not %s) and CANNOT be resumed. "
-                "If you need resume support, use optimize() (Optuna backend) "
+                "If you need resume support, use optimize_tabular() (Optuna backend) "
                 "which persists state in JournalStorage and resumes correctly on "
                 "MPS/CPU-only machines.", _ve, exp_path,
             )
@@ -1163,7 +1198,12 @@ def optimize_ray(
     best_result = results.get_best_result(metric=metric, mode=_ray_mode)
     best_hyperparams = best_result.config
 
-    with open(output_dir / "best_hyperparams_ray.json", "w") as fh:
+    # Canonical names, the same ones optimize_tabular() writes — see the note in
+    # text/hpo.py: the "_ray" suffix broke the run contract, validation.json's
+    # hpo_cv score and every script that reloads best_hyperparams.json, as soon as
+    # Optimize(backend="ray") made the backend a switch rather than a separate
+    # entry point. Readers still accept the legacy spellings for runs on disk.
+    with open(output_dir / "best_hyperparams.json", "w") as fh:
         json.dump(
             best_hyperparams, fh, indent=2,
             default=lambda o: list(o) if isinstance(o, tuple) else str(o),
@@ -1193,15 +1233,74 @@ def optimize_ray(
 
     # --- Save all trial results as CSV ---
     if save_trials_csv:
-        trials_csv_path = output_dir / "hpo_trials_ray.csv"
+        trials_csv_path = output_dir / "hpo_trials.csv"
         results.get_dataframe().to_csv(trials_csv_path, index=False)
         logger.info("Saved Ray trial results to %s", trials_csv_path)
 
     # --- Remove Ray experiment directory (optional) ---
     # After a successful HPO run the best trial is in best_trial/ and all metrics
-    # are in hpo_trials_ray.csv; the ray_experiment/ tree is no longer needed.
+    # are in hpo_trials.csv; the ray_experiment/ tree is no longer needed.
     if cleanup_trials and exp_storage.exists():
         shutil.rmtree(exp_storage)
         logger.info("Removed Ray experiment dir: %s", exp_storage)
 
     return best_hyperparams, results
+
+
+# ---------------------------------------------------------------------------
+# Backend dispatch
+# ---------------------------------------------------------------------------
+def search_tabular(
+    search: "Optimize",
+    *,
+    resume: bool,
+    **common: Any,
+) -> tuple[dict, Any]:
+    """Run one tabular hyperparameter search on whichever backend ``search`` names.
+
+    The tabular twin of :func:`multimodalva.text.hpo.search_text`, and the single
+    place :class:`~multimodalva.utils.optimize_config.Optimize` is mapped onto
+    :func:`optimize_tabular` / :func:`optimize_tabular_ray`.
+
+    Args:
+        search:  The search settings.
+        resume:  Already resolved by
+                 :func:`~multimodalva.utils.optimize_config.resolve_search_resume`;
+                 ``load_if_exists`` on the Optuna backend, ``resume`` on the Ray one.
+        **common: Arguments both backends take under the same name
+                 (``X_train``, ``y_train``, ``label2id``, ``id2label``,
+                 ``model_name``, ``output_dir``, ``random_state``, ``split_seed``,
+                 ``n_jobs``, ``use_gpu``).
+
+    Returns:
+        ``(best_hyperparams, study_or_result_grid)``.
+    """
+    from ..utils.optimize_config import resolve_backend, resolve_pruning
+
+    backend = resolve_backend(search.backend)
+    kwargs: dict[str, Any] = dict(
+        metric=search.metric,
+        search_space=search.space,
+        search_space_profile=search.space_profile,
+        use_cv=search.cv,
+        n_cv_folds=search.cv_folds,
+        **common,
+    )
+    if search.n_trials is not None:
+        kwargs["n_trials"] = search.n_trials
+
+    if backend == "ray":
+        if search.pruning is not None:
+            logger.warning(
+                "Optimize(pruning=%s) is ignored by the Ray backend, which has no "
+                "inter-trial pruner. Pass extra={'use_asha': True} instead.",
+                search.pruning,
+            )
+        kwargs["resume"] = resume
+        kwargs.update(search.extra)
+        return optimize_tabular_ray(**kwargs)
+
+    kwargs["load_if_exists"] = resume
+    kwargs["enable_pruning"] = resolve_pruning(search, TABULAR_PRUNING_DEFAULT)
+    kwargs.update(search.extra)
+    return optimize_tabular(**kwargs)

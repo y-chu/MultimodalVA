@@ -1,0 +1,44 @@
+# A tabular model on the symptom indicators.
+# Run with:  multimodalva run examples/config_tabular_model.yaml
+#
+# Every tag below says how much attention the line needs:
+#   [CHANGE]  no default can be right for your data — set it before you run
+#   [KEEP]    a sensible default; it will work as-is
+#   [TUNE]    works as-is, but the value is worth revisiting for your data
+# Lines starting with # are comments; delete the # to switch one on.
+
+task: tabular                         # [KEEP]   this file's pipeline
+data: demo                            # [CHANGE] "demo" = built-in synthetic data; use your own CSV/Parquet path
+label_col: cause_of_death             # [CHANGE] the column holding the cause of death
+output_dir: runs/yaml/tabular_lightgbm  # [CHANGE] where models, predictions and logs are written
+
+# Which columns are the model's inputs: a regex, an explicit list, or "auto"
+# ("auto" = every column except the label / text / filter / split columns).
+features: "re:^i\\d{3}[a-zA-Z]$"      # [CHANGE] matches InterVA i-codes; name your own columns
+# features: [i019a, i022e, i077o]     #          or list them explicitly
+
+model: lightgbm                       # [TUNE]   catboost | lightgbm | xgboost | random_forest | mlp | svm | knn | ...
+encode_categoricals: ordinal          # [KEEP]   how non-numeric columns become numbers
+
+# Where the hyperparameters come from. Three forms:
+#   an "optimize:" block  search for them, with these settings
+#   a mapping of values   use exactly those, no search
+#   default               the model library's own, no search
+hyperparams:                          # [TUNE]
+  optimize:
+    metric: f1_macro                  #          what the search maximises
+    n_trials: 40                      #          more trials = better search, longer run
+
+test_size: 0.2                        # [KEEP]   fraction held out for testing
+split_seed: 42                        # [KEEP]   which deaths land in the test set; vary to measure sampling uncertainty
+train_seed: 42                        # [KEEP]   model initialisation/search; vary (hyperparams fixed) to measure model noise
+top_k: 3                              # [KEEP]   how many ranked causes to record per death
+
+# Keep only some rows (e.g. adults), by any column in your data:
+# filters:                            # [TUNE]
+#   age_grp3: adult
+
+# Reuse one fixed train/test split across experiments, so models are compared
+# on identical rows:
+# split: /path/to/splits.json         # [TUNE]   or a column name holding "train"/"test"
+# id_col: record_id                   # [TUNE]   the column the split file refers to

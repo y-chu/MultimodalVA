@@ -2,9 +2,12 @@
 Shared output types used across text, tabular, and ensemble pipelines.
 """
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from ..inference.checks import PretrainedChecks
 
 
 class PredictionResult(NamedTuple):
@@ -24,9 +27,13 @@ class PredictionResult(NamedTuple):
         topk: Top-K predicted classes and their probabilities.
               Columns: true_label, top1_label, top1_prob, ..., topK_label, topK_prob.
         id2label: Dict mapping integer class ID → label string.
+        checks:   ``PretrainedChecks`` from ``predict_from_pretrained()`` — what
+                  was detected about the artifact and the input, and every
+                  warning raised. ``None`` from every training pipeline.
     """
 
     top1: pd.DataFrame
     full: pd.DataFrame
     topk: pd.DataFrame
     id2label: dict
+    checks: "PretrainedChecks | None" = None

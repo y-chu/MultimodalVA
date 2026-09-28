@@ -1,0 +1,71 @@
+# Stacking: train several models, then train a second model to combine them.
+# Run with:  multimodalva run examples/config_ensemble_stacking.yaml
+#
+# Every tag below says how much attention the line needs:
+#   [CHANGE]  no default can be right for your data — set it before you run
+#   [KEEP]    a sensible default; it will work as-is
+#   [TUNE]    works as-is, but the value is worth revisiting for your data
+#
+# A config file is the easiest way to run voting and stacking: their base-model
+# lists are lists of settings, which are awkward to type on a command line.
+
+task: stacking                        # [TUNE]   data_fusion | feature_fusion | voting | stacking
+data: demo                            # [CHANGE] "demo" = built-in synthetic data; use your own CSV/Parquet path
+label_col: cause_of_death             # [CHANGE] the column holding the cause of death
+text_col: narrative                   # [CHANGE] the column holding the free-text narrative
+features: "re:^i\\d{3}[a-zA-Z]$"      # [CHANGE] matches InterVA i-codes; name your own columns
+output_dir: runs/yaml/stacking        # [CHANGE] where models, predictions and logs are written
+
+# The models being combined. Add or remove entries freely; each is one model.
+text_models:                          # [TUNE]
+  - model_name: bluebert
+    max_length: 512                   #          longest narrative the model reads, in tokens
+tabular_models:                       # [TUNE]
+  - model_name: lightgbm
+  - model_name: random_forest
+
+# Settings that belong to the ensemble itself rather than to one model:
+init_kwargs:
+  n_folds: 5                          # [KEEP]   cross-validation folds used to build the combining step
+  meta_learners:                      # [TUNE]   candidate models that learn how to combine the others
+    - model_name: logistic_regression
+#   - model_name: lightgbm            #          add candidates freely; the best by CV is used
+
+# How the base models are combined (Stage 2). The meta-learner above is the default.
+# Give a list to get several from the same out-of-fold predictions — stage 1, the
+# expensive part, runs once; the first one listed is the main result in predictions/.
+combiner: meta_learner                # [TUNE]   meta_learner | simple_average | class_aware_voting |
+                                      #          ensemble_selection | a meta-learner name (lightgbm, …) |
+                                      #          a list of those | best
+# "best" compares them all by cross-validation on the out-of-fold predictions and
+# trains only the winner; the test set plays no part in the choice:
+# combiner: best
+# n_combiner_folds: 5                 #          folds for that comparison
+# ensemble_selection learns one weight per base model (Caruana et al. 2004);
+# its settings, used only when ensemble_selection is chosen:
+# ensemble_selection_kwargs:
+#   ensemble_size: 100                #          selection rounds; more rounds = finer weights
+#   n_bags: 1                         #          >1 = bagged selection over random model subsets
+#   bag_fraction: 0.5                 #          share of models per bag (only when n_bags > 1)
+# Reuse a finished stacking run's stage 1 instead of recomputing it; nothing is retrained:
+# oof_from: runs/stacking_first/stacking
+
+top_k: 3                              # [KEEP]   how many ranked causes to record per death
+
+# --- To run a different ensemble instead, change `task` above and use these ---
+#
+# Soft voting — average the base models' probabilities; no meta-learner, so
+# delete the init_kwargs block:
+# task: voting
+#
+# Data fusion — write the indicators out as sentences, glue them to the
+# narrative, fine-tune one long-context model. No base-model lists needed:
+# task: data_fusion
+# model: clinicalbigbird
+#
+# Feature fusion — one model reads text and indicators together (AutoGluon
+# AutoMM; needs `pip install "multimodalva[feature_fusion]"`):
+# task: feature_fusion
+# model: bioclinicalbert
+# init_kwargs: {fusion_strategy: attention, preset: medium_quality}
+# time_limit: 600                     #          seconds of training allowed

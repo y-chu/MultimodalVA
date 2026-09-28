@@ -10,32 +10,38 @@ Spec format (used by both Optuna and Ray Tune backends in hpo.py):
     ("float",     low, high)   — uniform float
     ("int",       low, high)   — uniform int
     ("categorical", [values])  — discrete choices
+
+Precedence, lowest to highest: TEXT_DEFAULT_SEARCH_SPACE →
+get_text_default_search_space(n_samples, n_classes) → LORA/FOCAL when enabled →
+the caller's ``search_space=``, which overrides per key. The run log records
+which keys the caller replaced. See FAQ.md, "Which search space did my run
+actually use?".
 """
 
 from __future__ import annotations
 
+from ..utils.hpo_defaults import get_class_tier
+
 # ---------------------------------------------------------------------------
 # Balanced reference space
 # Calibrated for ~20 classes, 3 000–5 000 samples.
-# get_default_search_space() copies this dict and overrides specific keys
+# get_text_default_search_space() copies this dict and overrides specific keys
 # based on actual n_samples and n_classes — do not hardcode these values
-# in analysis scripts; call get_default_search_space() instead.
+# in analysis scripts; call get_text_default_search_space() instead.
 # ---------------------------------------------------------------------------
 
-DEFAULT_SEARCH_SPACE: dict = {
-    # AdamW learning rate — most influential hyperparameter for BERT fine-tuning.
-    # BERT paper recommends 2e-5 to 5e-5; log-uniform covers the relevant scale.
-    # Wider range (1e-5, 1e-4) if the default range consistently hits a boundary.
-    "learning_rate": ("float_log", 8e-6, 4e-5),
+TEXT_DEFAULT_SEARCH_SPACE: dict = {
+    # AdamW learning rate. Log-uniform, since what matters is the order of magnitude.
+    # LoRA adapters usually want a higher rate than full fine-tuning.
+    "learning_rate": ("float_log", 8e-6, 1e-4),
 
-    # Per-device training batch size.
-    # 16 is the standard for 16 GB GPUs; use 8 if hitting OOM, or 32 for larger GPUs.
-    # Effective batch size = batch_size × gradient_accumulation_steps × n_GPUs.
+    # Per-device training batch size. Effective batch size is
+    # batch_size × gradient_accumulation_steps × n_GPUs.
     "batch_size": ("categorical", [8, 16, 32]),
 
     # Number of full passes over the training data.
     # 3–5 epochs is typical for BERT fine-tuning; small datasets may benefit from more.
-    # Always included so that optimize() returns an epoch count for the final train() call.
+    # Always included so that optimize_text() returns an epoch count for the final train_text() call.
     "epochs": ("categorical", [3, 5, 7]),
 
     # L2 regularisation on non-bias / non-LayerNorm parameters (AdamW decoupled decay).
@@ -44,9 +50,7 @@ DEFAULT_SEARCH_SPACE: dict = {
     "weight_decay": ("float", 0.0, 0.1),
 
     # Fraction of total training steps used for linear LR warmup.
-    # BERT paper uses 0.1 (10%); 0.0–0.1 is common in practice.
-    # Larger values (0.1–0.2) can help stabilize training on noisy or imbalanced data.
-    "warmup_ratio": ("float", 0.0, 0.1),
+    "warmup_ratio": ("float", 0.0, 0.2),
 
     # Number of gradient steps to accumulate before an optimizer update.
     # Simulates a larger effective batch size without extra GPU memory.
@@ -61,23 +65,21 @@ DEFAULT_SEARCH_SPACE: dict = {
     # 6  — aggressive (half of BERT-base's 12 layers); use when heavily overfitting.
     "freeze_layers": ("categorical", [2, 4, 6]),
 
-    # Classifier dropout — regularizes the randomly-initialised classification head.
-    # Kept narrow [0.1, 0.2]: values above 0.2 destroy signal from rare class examples
-    # (5–15 samples) by randomly dropping 20–40 % of head features per forward pass.
-    # The pretrained default (~0.1) is already sensible; this range allows modest tuning.
+    # Dropout on the randomly-initialised classification head. Higher values
+    # regularise more, at the cost of signal from classes with few examples.
     "classifier_dropout": ("float", 0.1, 0.2),
 
-    # label_smoothing intentionally omitted:
-    # - Reduces the loss contribution from every training example, including scarce
-    #   minority classes that already have limited learning signal.
-    # - No meaningful benefit for BERT fine-tuning on small, imbalanced VA datasets
-    #   (was popularised on ImageNet with millions of examples and 1 000 classes).
-    # - Use class_weights="effective_n" or loss_type="focal" for imbalance instead.
+    # label_smoothing is not searched by default — it softens the target for every
+    # example, including classes that already have few. To search it anyway, pass
+    # e.g. {"label_smoothing": ("float", 0.0, 0.15)} in search_space=; 0.0 turns it
+    # off. For imbalance, class_weights="effective_n" and loss_type="focal" are the
+    # other levers.
 }
 
 
 # ---------------------------------------------------------------------------
-# Optional add-on spaces (merged in by optimize() / optimize_ray())
+# Optional add-on spaces (merged in by optimize_text() / optimize_text_ray(), i.e.
+# by either backend search_text() dispatches to)
 # ---------------------------------------------------------------------------
 
 # Focal loss — merged when use_focal=True.
@@ -107,7 +109,7 @@ LORA_SEARCH_SPACE: dict = {
     "lora_alpha": ("categorical", [8, 16, 32, 64]),
 
     # Dropout inside LoRA adapters.
-    # 0.05 is the paper default; 0.0 often works well for small adapters.
+    # 0.05 is the LoRA paper's default; 0.0 often works well for small adapters.
     "lora_dropout": ("float", 0.0, 0.1),
 }
 
@@ -130,24 +132,10 @@ def _sample_tier(n_samples: int) -> str:
     return "large"
 
 
-def _class_tier(n_classes: int) -> str:
-    """Coarse tier from number of target classes (calibrated for 5–100 VA causes).
-
-    few      ≤ 14  — compact output head; standard regularisation
-    moderate  15–39  — moderate multi-class complexity
-    many     ≥ 40  — large output head; needs more epochs and lower layer freezing
-    """
-    if n_classes <= 14:
-        return "few"
-    if n_classes <= 39:
-        return "moderate"
-    return "many"
-
-
-def get_default_search_space(n_samples: int, n_classes: int) -> dict:
+def get_text_default_search_space(n_samples: int, n_classes: int) -> dict:
     """Return a default HPO search space adapted to dataset scale.
 
-    Starts from ``DEFAULT_SEARCH_SPACE`` (the balanced reference) and overrides
+    Starts from ``TEXT_DEFAULT_SEARCH_SPACE`` (the balanced reference) and overrides
     specific parameters based on training-set size and number of target classes.
     Any explicit ``search_space`` passed by the caller is merged on top — caller
     overrides always win.
@@ -159,11 +147,14 @@ def get_default_search_space(n_samples: int, n_classes: int) -> dict:
     - ``classifier_dropout``: small data or many classes → higher dropout range.
     - ``weight_decay``: small data → stronger L2 regularisation.
     - ``gradient_accumulation_steps``: small data → more accumulation steps.
-    - ``label_smoothing``: many classes → slightly wider smoothing range.
+    ``label_smoothing`` is deliberately absent from every tier — see the comment
+    on TEXT_DEFAULT_SEARCH_SPACE. Pass it in ``search_space=`` to search it.
     """
     st = _sample_tier(n_samples)
-    ct = _class_tier(n_classes)
-    space = dict(DEFAULT_SEARCH_SPACE)  # copy the balanced reference
+    # few: compact output head, standard regularisation.
+    # many: large output head, needs more epochs and less layer freezing.
+    ct = get_class_tier(n_classes)
+    space = dict(TEXT_DEFAULT_SEARCH_SPACE)  # copy the balanced reference
 
     # ── epochs ──────────────────────────────────────────────────────────────
     # Small data and many classes both push toward more training.
@@ -181,13 +172,14 @@ def get_default_search_space(n_samples: int, n_classes: int) -> dict:
     space["epochs"] = _epoch_map[(st, ct)]
 
     # ── batch_size ───────────────────────────────────────────────────────────
-    # Small data: small batches → more gradient updates per epoch.
-    # Large data: larger batches → stable gradients.
+    # Smaller batches give more gradient updates per epoch; larger ones give
+    # steadier gradients.
     if st == "small":
         space["batch_size"] = ("categorical", [4, 8, 16])
-    elif st == "large":
+    elif st == "moderate":
+        space["batch_size"] = ("categorical", [4, 8, 16, 32])
+    else:  # large
         space["batch_size"] = ("categorical", [16, 32, 64])
-    # moderate: keep [8, 16, 32]
 
     # ── freeze_layers ────────────────────────────────────────────────────────
     # Many classes demand full transformer capacity → prefer less freezing.
@@ -206,15 +198,15 @@ def get_default_search_space(n_samples: int, n_classes: int) -> dict:
         space["freeze_layers"] = ("categorical", [0, 2, 4])
 
     # ── classifier_dropout ───────────────────────────────────────────────────
-    # Kept bounded: high dropout destroys signal from rare class examples.
-    if st == "small" or ct == "many":
-        space["classifier_dropout"] = ("float", 0.1, 0.25)  # slightly wider for more regularization need
+    if st == "moderate":
+        space["classifier_dropout"] = ("float", 0.1, 0.5) if ct == "many" else ("float", 0.1, 0.4)
+    elif st == "small" or ct == "many":
+        space["classifier_dropout"] = ("float", 0.1, 0.25)
     elif st == "large" and ct == "few":
-        space["classifier_dropout"] = ("float", 0.0, 0.15)  # less regularization needed
+        space["classifier_dropout"] = ("float", 0.0, 0.15)
     # else: default [0.1, 0.2]
 
     # ── weight_decay ─────────────────────────────────────────────────────────
-    # Scaled proportionally with the new narrower baseline [0.0, 0.1].
     if st == "small":
         space["weight_decay"] = ("float", 0.0, 0.15)   # slightly wider for regularization pressure
     elif st == "large":
@@ -227,6 +219,6 @@ def get_default_search_space(n_samples: int, n_classes: int) -> dict:
         space["gradient_accumulation_steps"] = ("categorical", [2, 4])
     # moderate/large: default [1, 2]
 
-    # label_smoothing is intentionally not searched — see DEFAULT_SEARCH_SPACE comment.
+    # label_smoothing is intentionally not searched — see TEXT_DEFAULT_SEARCH_SPACE comment.
 
     return space

@@ -36,8 +36,8 @@ def to_ray_space(search_space: dict) -> dict:
         from ray import tune
     except ImportError as exc:
         raise ImportError(
-            "Ray Tune is required for optimize_ray(). "
-            "Install with: pip install 'ray[tune]'"
+            "Ray Tune is required for optimize_text_ray() / optimize_tabular_ray(). "
+            "It lives in an optional extra: pip install 'multimodalva[ray]'"
         ) from exc
 
     ray_space: dict = {}

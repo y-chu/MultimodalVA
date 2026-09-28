@@ -70,7 +70,7 @@ def plot_loss_curves(
 ) -> None:
     """Plot training and evaluation loss curves from a HuggingFace log history.
 
-    The log_history comes directly from train() metadata:
+    The log_history comes directly from train_text() metadata:
         metadata["log_history"]
     or from a live trainer:
         trainer.state.log_history

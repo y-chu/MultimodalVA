@@ -40,22 +40,47 @@ def distributed_state() -> tuple[int, int]:
     return rank, max(1, world_size)
 
 
-def resolve_seed(random_state: int, set_seed: int | None) -> int:
-    """Pick the effective seed, letting ``set_seed`` win over ``random_state``.
+@contextmanager
+def set_dataloader_workers(n_jobs: int | None):
+    """Set the text data-loader worker count for one run, then restore it.
 
-    ``set_seed`` is the single-value convenience knob on the pipeline wrappers:
-    passing it makes one number drive the split, HPO and training seeds.
+    Text training, search and prediction all read
+    ``MULTIMODALVA_DATALOADER_WORKERS``. Setting it only for the duration of a
+    run keeps one run's choice from leaking into the next in the same process.
+    ``None`` or a negative value leaves the automatic choice in place (one
+    worker per spare core, and none on Apple Silicon, where worker processes
+    cost more than they save).
     """
-    if set_seed is None:
-        return int(random_state)
-    resolved = int(set_seed)
-    if resolved != int(random_state):
-        logger.info(
-            "set_seed=%d provided; overriding random_state=%d.",
-            resolved,
-            random_state,
-        )
-    return resolved
+    key = "MULTIMODALVA_DATALOADER_WORKERS"
+    if n_jobs is None or int(n_jobs) < 0:
+        yield
+        return
+    previous = os.environ.get(key)
+    os.environ[key] = str(int(n_jobs))
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+def apply_dataloader_workers(method):
+    """Run ``method`` inside :func:`set_dataloader_workers` for its ``n_jobs``."""
+    import functools
+    import inspect
+
+    signature = inspect.signature(method)
+
+    @functools.wraps(method)
+    def wrapper(*args, **kwargs):
+        bound = signature.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        with set_dataloader_workers(bound.arguments.get("n_jobs")):
+            return method(*args, **kwargs)
+
+    return wrapper
 
 
 def is_cuda() -> bool:
@@ -611,3 +636,112 @@ class RuntimeTracker:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
+
+
+#: Keys every pipeline's run() result carries, whichever pipeline it is.
+RUN_RESULT_KEYS: tuple[str, ...] = (
+    "predictions", "output_dir", "label2id", "id2label", "train_metadata",
+    "best_hyperparams", "validation", "runtime_report", "runtime_stage_csv",
+)
+
+
+def _stamp_pipeline(out_dir: Path, pipeline: str) -> None:
+    """Record which pipeline made a run, in its training_metadata.json.
+
+    Anything that later loads the run — ``predict_from_pretrained()``, a
+    leaderboard — can then read the task instead of guessing it from the files
+    present. Written into every ``training_metadata.json`` the run has (the run
+    root and, for text pipelines, ``final/``), and never overwrites a value
+    already there.
+    """
+    from .. import __version__
+
+    for meta_path in (out_dir / "training_metadata.json",
+                      out_dir / "final" / "training_metadata.json"):
+        if not meta_path.is_file():
+            continue
+        try:
+            with open(meta_path) as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if meta.get("pipeline") == pipeline and "multimodalva_version" in meta:
+            continue
+        meta.setdefault("pipeline", pipeline)
+        meta.setdefault("multimodalva_version", __version__)
+        with open(meta_path, "w") as fh:
+            json.dump(meta, fh, indent=2, default=str)
+
+
+def track_run(pipeline: str, *, track: bool = True, monitor_gpu: bool = False):
+    """Give a pipeline's ``run()`` the artifacts and return keys every run has.
+
+    Wraps ``run()`` so that, whichever pipeline it is:
+
+    * the run is timed — and, where a GPU may be in use, its memory sampled —
+      into ``runtime/pipeline_runtime.json`` and ``runtime/stage_timings.csv``
+      (``track=False`` for pipelines that already record their own, finer,
+      stages);
+    * ``validation.json`` records the score for choosing between candidates
+      (see :mod:`multimodalva.results.validation`);
+    * the result dict carries every key in :data:`RUN_RESULT_KEYS`, with
+      ``None`` where a pipeline has nothing to put there.
+
+    Args:
+        pipeline:    Name recorded in the runtime report.
+        track:       Create a runtime tracker around the whole run.
+        monitor_gpu: Sample accelerator memory while the run is going.
+    """
+    import functools
+    import inspect
+
+    def decorate(method):
+        signature = inspect.signature(method)
+
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            bound = signature.bind_partial(self, *args, **kwargs)
+            bound.apply_defaults()
+            hyperparams = bound.arguments.get("hyperparams")
+            metric = getattr(hyperparams, "metric", None) or "f1_macro"
+
+            tracker = None
+            if track:
+                tracker = RuntimeTracker(
+                    self.output_dir, report_name="pipeline_runtime.json",
+                    metadata={"pipeline": pipeline}, logger_=logger,
+                )
+                with tracker.stage("run", monitor_gpu=monitor_gpu):
+                    result = method(self, *args, **kwargs)
+            else:
+                result = method(self, *args, **kwargs)
+
+            if not isinstance(result, dict):
+                return result
+            from ..results.validation import write_validation
+
+            out_dir = Path(result.get("output_dir") or self.output_dir)
+            result.setdefault("output_dir", out_dir)
+            result["validation"] = write_validation(out_dir, metric=metric)
+            if tracker is not None:
+                result.setdefault("runtime_report", tracker.report_path)
+                result.setdefault("runtime_stage_csv", tracker.stage_csv_path)
+            root_meta = out_dir / "training_metadata.json"
+            if not root_meta.is_file() and result.get("train_metadata"):
+                # Text, tabular and data fusion keep their metadata beside the
+                # model weights in final/, where reloading and push_to_hub read
+                # it. Give the run root a copy too, so every run has its
+                # metadata in the same place whatever made it.
+                with open(root_meta, "w") as fh:
+                    json.dump(result["train_metadata"], fh, indent=2, default=str)
+            _stamp_pipeline(out_dir, pipeline)
+            if root_meta.is_file():
+                with open(root_meta) as fh:
+                    result["train_metadata"] = json.load(fh)
+            for key in RUN_RESULT_KEYS:
+                result.setdefault(key, None)
+            return result
+
+        return wrapper
+
+    return decorate

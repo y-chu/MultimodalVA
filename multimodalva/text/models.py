@@ -8,7 +8,7 @@ always loads the same checkpoint regardless of the entry point.
 
 Accepted model names
 --------------------
-1. A package alias from :data:`SUPPORTED_MODELS` (e.g. ``"bluebert"``),
+1. A package alias from :data:`TEXT_MODELS` (e.g. ``"bluebert"``),
    resolved to its Hugging Face Hub ID.
 2. A remote key from :data:`REMOTE_MODELS` (e.g. ``"roberta-pm"``) for models
    that are not on the Hugging Face Hub. The archive is downloaded once and
@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 #: BERT (bert, biobert, bioclinicalbert, bluebert, biomedbert, clinicalbert),
 #: RoBERTa (biomedroberta), ELECTRA (bioelectra),
 #: long-context (longformer, clinicallongformer, bigbird, clinicalbigbird).
-SUPPORTED_MODELS: dict[str, str] = {
+TEXT_MODELS: dict[str, str] = {
     "bert":               "bert-base-uncased",
     "biobert":            "dmis-lab/biobert-base-cased-v1.2",
     "bioclinicalbert":    "emilyalsentzer/Bio_ClinicalBERT",
@@ -169,7 +169,7 @@ def download_model(key: str, cache_dir: str | Path | None = None) -> str:
 
     Downloads the archive to a temporary directory (or cache_dir), extracts
     it, removes the archive, and returns the local model directory path for
-    use as model_name in train(), predict(), and prepare_dataset().
+    use as model_name in train_text(), predict_text(), and prepare_text_dataset().
 
     Args:
         key: Key in REMOTE_MODELS (e.g. "roberta-pm").
@@ -253,8 +253,8 @@ def resolve_model_name(model_name: str, cache_dir: str | Path | None = None) -> 
         raise ValueError("model_name must be a non-empty string.")
     name = str(model_name)
 
-    if name in SUPPORTED_MODELS:
-        resolved = SUPPORTED_MODELS[name]
+    if name in TEXT_MODELS:
+        resolved = TEXT_MODELS[name]
         logger.info("Model %r resolved to %s (%s).", name, resolved, MODEL_DESCRIPTIONS.get(name, ""))
         return resolved
 

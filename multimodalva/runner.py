@@ -10,9 +10,9 @@ optional fixed train/test split, diagnostics — behind a single function::
 
     from multimodalva import run
 
-    run(task="text", data="clean.csv", label="cause",
+    run(task="text", data="clean.csv", label_col="cause",
         text_col="narrative", model="bluebert", output_dir="runs/bluebert",
-        optimize=True, n_trials=50)
+        hyperparams=Optimize(n_trials=50))
 
 ``data`` accepts a CSV/Parquet path **or** an in-memory DataFrame, so a
 statistician can preprocess in a notebook and pass the frame directly.
@@ -32,6 +32,9 @@ from typing import Any
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+from .utils.seeds import reject_removed_seed_args
+from .utils.optimize_config import Optimize  # noqa: E402
 
 __all__ = ["run", "SUPPORTED_TASKS"]
 
@@ -75,17 +78,15 @@ _SPLIT_MARKER_COL = "__mmva_split__"
 # ---------------------------------------------------------------------------
 def run(
     task: str,
-    data: "str | Path | pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]",
-    label: str,
-    output_dir: "str | Path",
+    data: "str | Path | pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame] | None" = None,
+    label_col: str | None = None,
+    output_dir: "str | Path" = "runs/run",
     *,
     text_col: str | None = None,
     features: "list[str] | str | None" = None,
     model: str | None = None,
     filters: dict | None = None,
-    optimize: bool = False,
-    n_trials: int | None = None,
-    metric: str | None = None,
+    hyperparams: "dict | str | Optimize | None" = None,
     # tabular preprocessing
     cat_cols: list[str] | None = None,
     num_cols: list[str] | None = None,
@@ -93,7 +94,9 @@ def run(
     scale_numeric: bool = False,
     # split
     test_size: float = 0.2,
-    random_state: int = 42,
+    split_seed: int = 42,
+    train_seed: int = 42,
+    deterministic: bool = False,
     stratify: bool = True,
     split: "str | dict | Path | tuple | None" = None,
     id_col: str | None = None,
@@ -111,7 +114,7 @@ def run(
         task: One of ``SUPPORTED_TASKS`` (aliases like ``"voting"`` accepted).
         data: CSV/Parquet path, an in-memory DataFrame, or an explicit
             ``(train_df, test_df)`` tuple (which also fixes the split).
-        label: Label (cause-of-death) column name.
+        label_col: Label (cause-of-death) column name.
         output_dir: Root directory for all artifacts.
         text_col: Narrative column (required for text/fusion tasks).
         features: Tabular feature columns. A list is used verbatim; ``"re:PAT"``
@@ -122,13 +125,29 @@ def run(
             ``"lightgbm"``). Falls back to each pipeline's default when ``None``.
         filters: ``{column: value | [values]}`` row filter applied before
             splitting. Omit for no filtering (df treated as ready-to-run).
-        optimize: Run HPO before final training.
-        n_trials: HPO trial count. ``None`` keeps each pipeline's own default.
-        metric: HPO metric. ``None`` uses ``"f1_macro"`` when ``optimize`` is set.
+        hyperparams: Where the model's hyperparameters come from. Pass a dict
+            to use exactly those values, ``Optimize(...)`` to search for them,
+            or leave it out for the model library's own defaults. For ``voting``
+            and ``stacking`` this applies to every base model that does not set
+            its own in ``text_models`` / ``tabular_models``.
         cat_cols / num_cols / encode_categoricals / scale_numeric: tabular
             preprocessing options (tabular / voting / stacking tabular models).
-        test_size / random_state / stratify: random-split controls (ignored when
-            an external split is supplied).
+        test_size / stratify: random-split controls (ignored when an external
+            split is supplied).
+        split_seed: Seed for every row-partitioning decision — the train/test
+            split, each search's cross-validation folds, the early-stopping
+            slice and stacking's out-of-fold partition. Vary it on its own to
+            measure sampling uncertainty. Default 42.
+        train_seed: Seed for everything a model does with the rows it is given —
+            initialisation, dropout, batch order, the Optuna sampler, each
+            estimator's ``random_state`` and AutoMM's trainer. Vary it on its
+            own, with ``hyperparams`` fixed, to measure model stochasticity.
+            Default 42. See :mod:`multimodalva.utils.seeds` for why the folds
+            follow ``split_seed`` rather than this.
+        deterministic: Demand bit-for-bit repeatable kernels. Slower, and an
+            operation with no deterministic implementation raises instead of
+            falling back. For the run behind a published number, not everyday
+            use. Default False.
         split: Fixed train/test assignment for cross-experiment comparison —
             a column name, a ``{"train_ids": [...], "test_ids": [...]}`` mapping
             (or path to a JSON file of that shape, resolved against ``id_col``),
@@ -150,28 +169,85 @@ def run(
     Returns:
         The underlying results dict: ``predictions`` (a ``PredictionResult``),
         ``label2id``, ``id2label``, ``output_dir``, and pipeline-specific keys.
+
+    Example:
+        Fine-tune a clinical BERT on the narrative::
+
+            import multimodalva as mv
+
+            out = mv.run(task="text", data="clean.csv", label_col="cause",
+                         text_col="narrative", model="bioclinicalbert",
+                         output_dir="runs/text")
+            out["predictions"].top1.head()
+
+        The questionnaire indicators instead, with a hyperparameter search::
+
+            out = mv.run(task="tabular", data="clean.csv", label_col="cause",
+                         features="re:^i\\d{3}[a-zA-Z]$", model="lightgbm",
+                         hyperparams=Optimize(n_trials=30),
+                         output_dir="runs/tabular")
+
+        Both together, fused before the model sees them::
+
+            out = mv.run(task="data_fusion", data="clean.csv", label_col="cause",
+                         text_col="narrative", features="auto",
+                         model="clinicallongformer", output_dir="runs/fusion")
+
+        Reusing one split across models so the numbers are comparable::
+
+            out = mv.run(task="text", data=(train_df, test_df), label_col="cause",
+                         text_col="narrative", output_dir="runs/fixed_split")
     """
+    # Seed arguments that no longer exist would otherwise slip through
+    # **run_kwargs into the classifier and fail there with an unhelpful
+    # message. Catch them here and name the replacement.
+    reject_removed_seed_args(
+        f"run(task={task!r})",
+        **{k: run_kwargs.pop(k) for k in ("random_state", "set_seed", "automm_seed")
+           if k in run_kwargs},
+    )
+    if "resume_training" in run_kwargs:
+        raise TypeError(
+            "resume_training= is now resume=, the same name every task uses."
+        )
+
     canonical = _normalize_task(task)
+    # Stacking's stage 2 reads everything — rows, split, seeds, label maps —
+    # from the run oof_from points at, so it needs no data of its own. Every
+    # other call does; saying so here beats a TypeError from a positional
+    # argument the caller deliberately left out.
+    reuses_oof = canonical == "stacking" and run_kwargs.get("oof_from") is not None
+    if not reuses_oof and (data is None or label_col is None):
+        raise TypeError(
+            f"run(task={task!r}) needs data= and label_col=. "
+            "Only stacking with oof_from= may omit them: that call reuses the "
+            "rows, split and seeds of the run it points at."
+        )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     init_kwargs = dict(init_kwargs or {})
 
     # --- 1-3. Load, filter, drop-missing, resolve split marker --------------
-    df, split_col = _prepare_dataframe(
-        data=data,
-        canonical=canonical,
-        label=label,
-        text_col=text_col,
-        filters=filters,
-        split=split,
-        id_col=id_col,
-    )
+    if reuses_oof:
+        df, split_col = None, None
+    else:
+        df, split_col = _prepare_dataframe(
+            data=data,
+            canonical=canonical,
+            label_col=label_col,
+            text_col=text_col,
+            filters=filters,
+            split=split,
+            id_col=id_col,
+        )
 
     # --- 4. Resolve feature columns (tabular / fusion / tabular base models) --
     feature_cols = None
-    if canonical in _FEATURE_TASKS or (tabular_models and canonical in _ENSEMBLE_METHODS):
+    if not reuses_oof and (
+        canonical in _FEATURE_TASKS or (tabular_models and canonical in _ENSEMBLE_METHODS)
+    ):
         feature_cols = _resolve_features(
-            df, features, label, text_col, filters, split_col
+            df, features, label_col, text_col, filters, split_col, id_col=id_col
         )
         logger.info("Running on %d feature columns.", len(feature_cols))
 
@@ -182,20 +258,20 @@ def run(
     results = _dispatch(
         canonical=canonical,
         df=df,
-        label=label,
+        label_col=label_col,
         text_col=text_col,
         feature_cols=feature_cols,
         model=model,
         output_dir=output_dir,
-        optimize=optimize,
-        n_trials=n_trials,
-        metric=metric,
+        hyperparams=hyperparams,
         cat_cols=cat_cols,
         num_cols=num_cols,
         encode_categoricals=encode_categoricals,
         scale_numeric=scale_numeric,
         test_size=test_size,
-        random_state=random_state,
+        split_seed=split_seed,
+        train_seed=train_seed,
+        deterministic=deterministic,
         stratify=stratify,
         split_col=split_col,
         top_k=top_k,
@@ -207,10 +283,12 @@ def run(
     )
 
     # --- 6. Diagnostics -----------------------------------------------------
-    if save_diagnostics and optimize:
-        _save_diagnostics(output_dir, metric or "f1_macro")
+    # Not gated on hyperparams=: ensembles configure the search per base-model
+    # spec, so the only reliable signal that one ran is a trials CSV on disk.
+    if save_diagnostics:
+        _save_diagnostics(output_dir, _diagnostics_metric(hyperparams))
 
-    _log_summary(results, label)
+    _log_summary(results, label_col)
     return results
 
 
@@ -259,7 +337,7 @@ def _apply_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
 
 
 def _prepare_dataframe(
-    *, data, canonical, label, text_col, filters, split, id_col
+    *, data, canonical, label_col, text_col, filters, split, id_col
 ) -> tuple[pd.DataFrame, str | None]:
     """Load, apply an explicit split (if any), filter, drop-missing.
 
@@ -285,7 +363,7 @@ def _prepare_dataframe(
         split_col = _resolve_split_col(df, split, id_col)
 
     df = _apply_filters(df, filters)
-    df = _drop_missing(df, canonical, label, text_col)
+    df = _drop_missing(df, canonical, label_col, text_col)
     if split_col is not None:
         _validate_split_nonempty(df, split_col)
     return df, split_col
@@ -352,14 +430,14 @@ def _looks_like_path(value) -> bool:
     return False
 
 
-def _drop_missing(df, canonical, label, text_col) -> pd.DataFrame:
-    if label not in df.columns:
+def _drop_missing(df, canonical, label_col, text_col) -> pd.DataFrame:
+    if label_col not in df.columns:
         raise ValueError(
-            f"label column {label!r} not in DataFrame. "
+            f"label column {label_col!r} not in DataFrame. "
             f"Available: {df.columns.tolist()}"
         )
     before = len(df)
-    mask = df[label].notna() & (df[label].astype(str).str.strip() != "")
+    mask = df[label_col].notna() & (df[label_col].astype(str).str.strip() != "")
     if canonical in _TEXT_TASKS and text_col and text_col in df.columns:
         mask &= df[text_col].notna() & (df[text_col].astype(str).str.strip() != "")
     out = df[mask].reset_index(drop=True)
@@ -387,14 +465,24 @@ def _validate_split_nonempty(df, split_col) -> None:
 # ---------------------------------------------------------------------------
 # Feature resolution
 # ---------------------------------------------------------------------------
-def _resolve_features(df, features, label, text_col, filters, split_col) -> list[str]:
+def _resolve_features(df, features, label_col, text_col, filters, split_col, id_col=None) -> list[str]:
     if isinstance(features, list):
         missing = [c for c in features if c not in df.columns]
         if missing:
             raise ValueError(f"feature columns not in DataFrame: {missing}")
+        if id_col is not None and id_col in features:
+            raise ValueError(
+                f"id_col {id_col!r} is also listed in features. A record identifier "
+                "carries no information about the cause of death, and where it "
+                "correlates with site or date it leaks. Remove it from features."
+            )
         return features
 
-    reserved = {label}
+    # An identifier is never a feature: it would be learned as noise, or as a
+    # leak wherever ids track site, date or interviewer.
+    reserved = {label_col}
+    if id_col:
+        reserved.add(id_col)
     if text_col:
         reserved.add(text_col)
     if filters:
@@ -425,16 +513,17 @@ def _resolve_features(df, features, label, text_col, filters, split_col) -> list
 # Dispatch
 # ---------------------------------------------------------------------------
 def _dispatch(
-    *, canonical, df, label, text_col, feature_cols, model, output_dir,
-    optimize, n_trials, metric, cat_cols, num_cols, encode_categoricals,
-    scale_numeric, test_size, random_state, stratify, split_col, top_k,
+    *, canonical, df, label_col, text_col, feature_cols, model, output_dir,
+    hyperparams, cat_cols, num_cols, encode_categoricals,
+    scale_numeric, test_size, split_seed, train_seed, deterministic,
+    stratify, split_col, top_k,
     text_models, tabular_models, init_kwargs, run_kwargs, id_col=None,
 ) -> dict:
-    metric_val = metric or ("f1_macro" if optimize else None)
+
 
     common_split = dict(
-        test_size=test_size, random_state=random_state,
-        stratify=stratify, split_col=split_col,
+        test_size=test_size, split_seed=split_seed, train_seed=train_seed,
+        deterministic=deterministic, stratify=stratify, split_col=split_col,
     )
 
     if canonical == "text":
@@ -445,12 +534,10 @@ def _dispatch(
             output_dir=output_dir,
         )
         kwargs = dict(
-            df=df, text_col=text_col, label_col=label,
-            use_optimize=optimize, top_k=top_k, **common_split, **run_kwargs,
+            df=df, text_col=text_col, label_col=label_col,
+            hyperparams=hyperparams, top_k=top_k, **common_split, **run_kwargs,
         )
         _put(kwargs, "id_col", id_col)
-        _put(kwargs, "optimize_metric", metric_val)
-        _put(kwargs, "n_trials", n_trials)
         return clf.run(**kwargs)
 
     if canonical == "tabular":
@@ -460,15 +547,13 @@ def _dispatch(
             model_name=model or "random_forest", output_dir=output_dir
         )
         kwargs = dict(
-            df=df, feature_cols=feature_cols, label_col=label,
-            use_optimize=optimize, top_k=top_k,
+            df=df, feature_cols=feature_cols, label_col=label_col,
+            hyperparams=hyperparams, top_k=top_k,
             cat_cols=cat_cols, num_cols=num_cols,
             encode_categoricals=encode_categoricals, scale_numeric=scale_numeric,
             **common_split, **run_kwargs,
         )
         _put(kwargs, "id_col", id_col)
-        _put(kwargs, "optimize_metric", metric_val)
-        _put(kwargs, "n_trials", n_trials)
         return clf.run(**kwargs)
 
     # ---- ensemble strategies ----
@@ -476,31 +561,86 @@ def _dispatch(
 
     ctor = dict(output_dir=output_dir)
     run_args = dict(df=df, text_col=text_col, feature_cols=feature_cols,
-                    label_col=label, **common_split, **run_kwargs)
+                    label_col=label_col, **common_split, **run_kwargs)
+    # Every ensemble accepts id_col, so predictions from any task can be joined
+    # back to the source records and matched against each other by id.
+    _put(run_args, "id_col", id_col)
 
     if canonical == "data_fusion":
         if model:
             ctor["model_name"] = _resolve_model_name(model)
-        run_args.update(use_optimize=optimize, top_k=top_k)
-        _put(run_args, "optimize_metric", metric_val)
-        _put(run_args, "n_trials", n_trials)
+        run_args.update(hyperparams=hyperparams, top_k=top_k)
 
     elif canonical == "feature_fusion":
         if model:
             ctor["model_name"] = model
-        if metric_val:
-            ctor["eval_metric"] = metric_val
-        run_args.update(use_hpo=optimize, top_k=top_k)
-        _put(run_args, "n_hpo_trials", n_trials)
+        _m = _diagnostics_metric(hyperparams)
+        if _m:
+            ctor["eval_metric"] = _m
+        run_args.update(hyperparams=hyperparams, top_k=top_k)
 
     elif canonical in {"soft_voting", "stacking"}:
-        ctor["text_models"] = text_models or []
-        ctor["tabular_models"] = tabular_models or []
+        if canonical == "stacking" and "resume" in run_kwargs:
+            # Stacking holds resume on the object, because one object spans
+            # several stage calls; every other task takes it on run().
+            ctor["resume"] = run_kwargs.pop("resume")
+        # Voting and stacking configure hyperparameters per base model, inside
+        # each spec dict. A run-level hyperparams= applies to every spec that
+        # does not already say otherwise, so the argument means the same thing
+        # here as it does for a single-model task.
+        # Preprocessing is a named argument of run(), so it is not in
+        # run_kwargs; pass it on explicitly or the ensembles never see it.
+        run_args.update(encode_categoricals=encode_categoricals,
+                        scale_numeric=scale_numeric)
+        ctor["text_models"] = _apply_hyperparams_to_specs(text_models, hyperparams)
+        ctor["tabular_models"] = _apply_hyperparams_to_specs(tabular_models, hyperparams)
         run_args["top_k"] = top_k
 
     ctor.update(init_kwargs)
     clf = EnsembleClassifier(method=canonical, **ctor)
     return clf.run(**run_args)
+
+
+
+def _apply_hyperparams_to_specs(specs, hyperparams):
+    """Give every base model the run-level ``hyperparams`` it did not set itself.
+
+    A spec that already says where its hyperparameters come from keeps saying
+    so — the per-model setting is the more specific one. In particular a spec
+    carrying explicit values is never overwritten by a run-level
+    ``Optimize(...)``, because those values are usually the result of an earlier
+    single-model search and searching again would discard them.
+
+    Returns new dicts; the caller's list is not modified.
+    """
+    if not specs:
+        return []
+    if hyperparams is None:
+        return [dict(s) for s in specs]
+    out = []
+    for spec in specs:
+        spec = dict(spec)
+        if "hyperparams" in spec:
+            logger.info(
+                "Base model %r sets its own hyperparams; the run-level value "
+                "does not apply to it.", spec.get("model_name"),
+            )
+        else:
+            spec["hyperparams"] = hyperparams
+        out.append(spec)
+    return out
+
+
+
+def _diagnostics_metric(hyperparams) -> str:
+    """The metric to label HPO diagnostics with.
+
+    Whatever the caller asked a search to maximise, or the default objective
+    when they did not configure one.
+    """
+    if isinstance(hyperparams, Optimize):
+        return hyperparams.metric
+    return "f1_macro"
 
 
 def _put(d: dict, key: str, value) -> None:
@@ -528,33 +668,43 @@ def _resolve_model_name(model: str | None) -> str | None:
 # Diagnostics + summary
 # ---------------------------------------------------------------------------
 def _save_diagnostics(output_dir: Path, metric: str) -> None:
-    try:
-        trials_csv = _find_trials_csv(output_dir)
-        if trials_csv is None:
-            return
-        from .results import hpo_leaderboard, hpo_convergence_plot
+    """Write hpo_leaderboard.csv and hpo_convergence.png beside every trials CSV.
 
-        trials_df = pd.read_csv(trials_csv)
+    An ensemble runs one search per base model, so there is one trials CSV per
+    ``base_models/*/hpo/`` as well as one for a single-model run. Each gets its
+    own diagnostics, next to the trials file it came from.
+    """
+    trials_csvs = _find_trials_csvs(output_dir)
+    if not trials_csvs:
+        return
+    from .results import hpo_leaderboard, hpo_convergence_plot
+
+    for trials_csv in trials_csvs:
         dest = trials_csv.parent
-        hpo_leaderboard(trials_df).to_csv(dest / "hpo_leaderboard.csv", index=False)
-        hpo_convergence_plot(
-            trials_df, metric=metric,
-            save_path=dest / "hpo_convergence.png", plot=False,
-        )
-        logger.info("Wrote HPO diagnostics to %s", dest)
-    except Exception as exc:  # diagnostics are non-fatal
-        logger.warning("HPO diagnostics failed (non-fatal): %s", exc)
+        try:
+            trials_df = pd.read_csv(trials_csv)
+            hpo_leaderboard(trials_df).to_csv(dest / "hpo_leaderboard.csv", index=False)
+            hpo_convergence_plot(
+                trials_df, metric=metric,
+                save_path=dest / "hpo_convergence.png", plot=False,
+            )
+            logger.info("Wrote HPO diagnostics to %s", dest)
+        except Exception as exc:  # diagnostics are non-fatal
+            logger.warning(
+                "HPO diagnostics failed for %s (non-fatal): %s", dest, exc
+            )
 
 
-def _find_trials_csv(output_dir: Path) -> Path | None:
+def _find_trials_csvs(output_dir: Path) -> list[Path]:
+    """Every Optuna/Ray trials CSV under ``output_dir``, deduplicated by folder."""
+    found: dict[Path, Path] = {}
     for name in ("hpo_trials_ray.csv", "hpo_trials.csv"):
-        hits = sorted(output_dir.rglob(name))
-        if hits:
-            return hits[0]
-    return None
+        for hit in sorted(Path(output_dir).rglob(name)):
+            found.setdefault(hit.parent, hit)
+    return list(found.values())
 
 
-def _log_summary(results: dict, label: str) -> None:
+def _log_summary(results: dict, label_col: str) -> None:
     try:
         pred = results.get("predictions")
         if pred is None or getattr(pred, "top1", None) is None:

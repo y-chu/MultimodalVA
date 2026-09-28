@@ -37,9 +37,6 @@ TOPK_BAR_COLORS: list[str] = [
     "#DDCC77",  # desaturated yellow (print-friendly)
 ]
 
-# Internal alias used by vis_predict (underscore-prefixed in the original code).
-_TOPK_BAR_COLORS = TOPK_BAR_COLORS
-
 # ---------------------------------------------------------------------------
 # Sequential heatmap — monotone luminance increase
 # ---------------------------------------------------------------------------

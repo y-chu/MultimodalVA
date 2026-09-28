@@ -108,7 +108,7 @@ def check_tabular_model(model: str, workdir: Path):
 
         df = _sample_df()
         res = run(
-            task="tabular", data=df, label="cause_of_death",
+            task="tabular", data=df, label_col="cause_of_death",
             features=_feature_cols(df), model=model,
             output_dir=workdir / f"tab_{model}", save_diagnostics=False,
         )
@@ -128,7 +128,7 @@ def check_pipeline(task: str, workdir: Path, *, with_text: bool):
         df = _sample_df()
         feats = _feature_cols(df)
         kwargs: dict = dict(
-            task=task, data=df, label="cause_of_death",
+            task=task, data=df, label_col="cause_of_death",
             output_dir=workdir / f"pipe_{task}", save_diagnostics=False,
         )
         needs_text = task in {"text", "data_fusion", "feature_fusion"}
@@ -198,8 +198,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     groups = set(args.group or GROUPS)
 
-    from multimodalva.tabular.train import SUPPORTED_MODELS as TAB_MODELS
-    from multimodalva.text.models import SUPPORTED_MODELS as TEXT_MODELS
+    from multimodalva.tabular.train import TABULAR_MODELS
+    from multimodalva.text.models import TEXT_MODELS
     from multimodalva.runner import SUPPORTED_TASKS
 
     tmp = Path(tempfile.mkdtemp(prefix="mmva_diag_"))
@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     results: list[Result] = []
     plan: list[tuple[str, str, object]] = []
     if "tabular-models" in groups:
-        plan += [("tabular-models", m, check_tabular_model(m, tmp)) for m in sorted(TAB_MODELS)]
+        plan += [("tabular-models", m, check_tabular_model(m, tmp)) for m in sorted(TABULAR_MODELS)]
     if "text-models" in groups:
         plan += [("text-models", m, check_text_model(m, tmp)) for m in sorted(TEXT_MODELS)]
     if "pipelines" in groups:

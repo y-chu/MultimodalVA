@@ -62,7 +62,7 @@ tok = AutoTokenizer.from_pretrained(repo)
 model = AutoModelForSequenceClassification.from_pretrained(repo).eval()
 
 narrative = "The deceased was a 45 year old male who had fever and cough for two weeks ..."
-inputs = tok(narrative, return_tensors="pt", truncation=True, max_length={max_length})
+inputs = tok(narrative, return_tensors="pt", truncation=True{max_length_arg})
 with torch.no_grad():
     probs = model(**inputs).logits.softmax(-1)[0]
 cause = model.config.id2label[int(probs.argmax())]
@@ -87,6 +87,13 @@ model = AutoModelForSequenceClassification.from_pretrained(
     "{repo_id}", num_labels=NEW_NUM_CLASSES, ignore_mismatched_sizes=True,
 )
 ```
+"""
+
+_LABEL_MEANING_NOTE = """\
+> **On the labels.** Predictions use this model's cause vocabulary. Whether a
+> cause label from another site, instrument or coding round means the same
+> thing as yours is a judgement only you can make; check the list above against
+> your own definitions before using or comparing the output.
 """
 
 _FUSION_CAVEAT = """\
@@ -171,10 +178,10 @@ def _base_model_info(name: str) -> tuple[str | None, str]:
     RoBERTa-PM, which is downloaded from its original release, or any local
     directory). ``label`` is the human-readable name used in the card text.
     """
-    from multimodalva.text.models import REMOTE_MODELS, SUPPORTED_MODELS
+    from multimodalva.text.models import REMOTE_MODELS, TEXT_MODELS
 
-    if name in SUPPORTED_MODELS:
-        return SUPPORTED_MODELS[name], SUPPORTED_MODELS[name]
+    if name in TEXT_MODELS:
+        return TEXT_MODELS[name], TEXT_MODELS[name]
     if name in REMOTE_MODELS or "RoBERTa-base-PM-M3-Voc" in name:
         return None, "RoBERTa-PM (RoBERTa-base-PM-M3-Voc-distill-hf)"
     if Path(name).expanduser().is_absolute() or Path(name).expanduser().is_dir():
@@ -189,7 +196,7 @@ def build_model_card(
     model_kind: str = "text",
     base_model: str | None = None,
     metrics: dict | None = None,
-    max_length: int = 512,
+    max_length: int | None = None,
     license: str = "mit",
 ) -> str:
     """Build a HuggingFace model-card (README.md) string with metrics and caveats.
@@ -204,7 +211,12 @@ def build_model_card(
         metrics:     Optional held-out test metrics to embed. If None, the card
                      tries a sibling ``predictions/*_top1.csv`` and falls back to
                      validation metrics from ``log_history``.
-        max_length:  Tokenizer ``max_length`` shown in the usage snippet.
+        max_length:  Tokenizer ``max_length`` shown in the usage snippet. When
+                     None, it is read from ``max_length`` in
+                     ``training_metadata.json``. If that is absent too (models
+                     trained before it was recorded), the snippet omits the
+                     argument and lets the tokenizer use the length saved in its
+                     own config, rather than printing a length that may be wrong.
         license:     SPDX license id for the card frontmatter.
 
     Returns:
@@ -266,8 +278,16 @@ def build_model_card(
         )
 
     # --- Usage ---
+    # Show the truncation length this model was actually trained with. Falling
+    # back to a literal default would print a number that silently disagrees
+    # with the model for anyone who trained at a different length, so when the
+    # value is unknown the argument is left out instead.
+    if max_length is None:
+        max_length = metadata.get("max_length")
+    max_length_arg = f", max_length={max_length}" if max_length else ""
+
     parts.append("## Usage\n")
-    parts.append(_TEXT_USAGE.format(repo_id=repo_id, max_length=max_length))
+    parts.append(_TEXT_USAGE.format(repo_id=repo_id, max_length_arg=max_length_arg))
     parts.append("\n" + _DOWNSTREAM_USAGE.format(repo_id=repo_id) + "\n")
 
     # --- Causes ---
@@ -276,6 +296,7 @@ def build_model_card(
         parts.append("<details><summary>Show all categories</summary>\n")
         parts.append("\n".join(f"- {c}" for c in causes))
         parts.append("\n</details>\n")
+        parts.append(_LABEL_MEANING_NOTE)
 
     # --- Hyperparameters ---
     if hyperparams:
@@ -301,7 +322,7 @@ def push_to_hub(
     model_kind: str = "text",
     base_model: str | None = None,
     metrics: dict | None = None,
-    max_length: int = 512,
+    max_length: int | None = None,
     license: str = "mit",
     generate_card: bool = True,
     create_pr: bool = False,
@@ -323,7 +344,9 @@ def push_to_hub(
         model_kind:     ``"text"`` or ``"data_fusion"`` — controls the card caveat.
         base_model:     Base checkpoint name (defaults to metadata ``model_name``).
         metrics:        Optional held-out test metrics dict to embed in the card.
-        max_length:     Tokenizer max length shown in the card usage snippet.
+        max_length:     Truncation length shown in the card usage snippet. When
+                        None (default), it is read from the run's
+                        ``training_metadata.json``.
         license:        SPDX license id for the card frontmatter. Default ``"mit"``.
         generate_card:  Write a ``README.md`` model card before uploading. Default True.
         create_pr:      Open a PR instead of committing to main. Default False.

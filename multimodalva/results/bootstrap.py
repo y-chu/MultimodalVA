@@ -43,8 +43,6 @@ from ..utils.metrics import REPORT_METRICS
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_METRICS = list(REPORT_METRICS)
-
 _CCCSMF_CHANCE = 0.632
 
 
@@ -169,15 +167,23 @@ def _as_top1_frame(name: str, value: Any) -> pd.DataFrame:
         value = value.top1
     if isinstance(value, (str, Path)):                           # run directory
         base = Path(value)
+        # Every pipeline writes predictions/predictions_top1.csv. The three
+        # other spellings are layouts that earlier runs used — they are read so
+        # that results already on disk stay usable, not because anything still
+        # writes them. The last entry lets `base` be a path to the CSV itself.
         for candidate in (base / "predictions" / "predictions_top1.csv",
-                          base / "predictions_top1.csv",
+                          base / "predictions_top1.csv",     # legacy
+                          base / "predictions" / "top1.csv",  # legacy
+                          base / "top1.csv",                  # legacy
                           base):
             if candidate.is_file():
                 value = pd.read_csv(candidate)
                 break
         else:
             raise ValueError(
-                f"Model {name!r}: no predictions_top1.csv found under {base}."
+                f"Model {name!r}: no top-1 predictions found under {base}. "
+                "Looked for predictions/predictions_top1.csv, "
+                "predictions_top1.csv, predictions/top1.csv and top1.csv."
             )
     if not isinstance(value, pd.DataFrame):
         raise ValueError(
@@ -397,11 +403,11 @@ def bootstrap_ci(
         ValueError: If the input cannot be read, the models were evaluated on
                     different test sets, or an unknown metric is requested.
     """
-    metrics = list(metrics or DEFAULT_METRICS)
-    unknown = set(metrics) - set(DEFAULT_METRICS)
+    metrics = list(metrics or REPORT_METRICS)
+    unknown = set(metrics) - set(REPORT_METRICS)
     if unknown:
         raise ValueError(
-            f"Unknown metric(s): {sorted(unknown)}. Supported: {DEFAULT_METRICS}."
+            f"Unknown metric(s): {sorted(unknown)}. Supported: {list(REPORT_METRICS)}."
         )
     if n_boot < 1:
         raise ValueError("n_boot must be at least 1.")
@@ -551,11 +557,11 @@ def paired_bootstrap_ci(
                     are given, if a named model is absent, or if the models were
                     evaluated on different test sets.
     """
-    metrics = list(metrics or DEFAULT_METRICS)
-    unknown = set(metrics) - set(DEFAULT_METRICS)
+    metrics = list(metrics or REPORT_METRICS)
+    unknown = set(metrics) - set(REPORT_METRICS)
     if unknown:
         raise ValueError(
-            f"Unknown metric(s): {sorted(unknown)}. Supported: {DEFAULT_METRICS}."
+            f"Unknown metric(s): {sorted(unknown)}. Supported: {list(REPORT_METRICS)}."
         )
 
     frame, cols = _resolve_input(data, true_col, model_cols)

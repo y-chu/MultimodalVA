@@ -1,7 +1,7 @@
 """
 Step 3 (tabular pipeline): Fit a sklearn-compatible classifier and save artifacts.
 
-Input:  X_train, y_train from prepare_dataset(); hyperparams dict
+Input:  X_train, y_train from prepare_tabular_dataset(); hyperparams dict
 Output: (model, metadata)
 """
 
@@ -25,7 +25,7 @@ from ..utils.numpy_compat import null_rng_pickler, prepare_estimator_for_joblib
 logger = logging.getLogger(__name__)
 
 # Supported model aliases: (module path, class name)
-SUPPORTED_MODELS: dict[str, tuple[str, str]] = {
+TABULAR_MODELS: dict[str, tuple[str, str]] = {
     "catboost":      ("catboost",                  "CatBoostClassifier"),
     "lightgbm":      ("lightgbm",                  "LGBMClassifier"),
     "gbdt":          ("sklearn.ensemble",           "GradientBoostingClassifier"),
@@ -37,7 +37,7 @@ SUPPORTED_MODELS: dict[str, tuple[str, str]] = {
     "svm":           ("sklearn.svm",                "SVC"),
 }
 
-DEFAULT_HYPERPARAMS: dict[str, dict] = {
+TABULAR_DEFAULT_HYPERPARAMS: dict[str, dict] = {
     "catboost":      {"iterations": 300, "learning_rate": 0.05, "depth": 6, "verbose": 0},
     "lightgbm":      {"n_estimators": 300, "learning_rate": 0.05, "max_depth": -1, "verbose": -1},
     "gbdt":          {"n_estimators": 200, "learning_rate": 0.1, "max_depth": 3},
@@ -53,6 +53,15 @@ DEFAULT_HYPERPARAMS: dict[str, dict] = {
 # Prevents accidental breakage (e.g. SVC needs probability=True for predict_proba).
 _FORCED_PARAMS: dict[str, dict] = {
     "svm": {"probability": True},
+}
+
+# Parameters that stop a model writing log files next to the process CWD.
+# CatBoost's default train_dir="catboost_info" is created wherever the caller
+# happens to be, which in these pipelines is a synced folder; the sync client
+# then renames the directory out from under the fit. setdefault, so a caller who
+# wants the training curves can ask for them.
+_SIDE_FILE_PARAMS: dict[str, dict] = {
+    "catboost": {"allow_writing_files": False},
 }
 
 # Maps model_name → constructor parameter name for CPU parallelism.
@@ -99,20 +108,31 @@ def _build_model(
     use_gpu: bool = False,
 ) -> Any:
     """Instantiate the model from its alias and hyperparams dict."""
-    if model_name not in SUPPORTED_MODELS:
+    if model_name not in TABULAR_MODELS:
         raise ValueError(
             f"Unsupported model '{model_name}'. "
-            f"Choose from: {list(SUPPORTED_MODELS)}."
+            f"Choose from: {list(TABULAR_MODELS)}."
         )
-    module_path, class_name = SUPPORTED_MODELS[model_name]
+    module_path, class_name = TABULAR_MODELS[model_name]
     module = importlib.import_module(module_path)
     cls = getattr(module, class_name)
 
     hp = dict(hyperparams)
-    # Inject random_state only where the constructor accepts it
+    # Inject random_state only where the constructor accepts it.
+    #
+    # Checking the named parameters alone is not enough: XGBClassifier.__init__
+    # is ``(self, objective, **kwargs)``, so ``"random_state" in sig.parameters``
+    # is False and the seed was silently dropped — every seed produced the same
+    # model, which makes a seed-variation study read as zero variance. A
+    # constructor taking **kwargs forwards random_state correctly, so treat that
+    # as accepting it too. Models with neither (naive_bayes, knn) are
+    # deterministic and need no seed.
     try:
         sig = inspect.signature(cls.__init__)
-        if "random_state" in sig.parameters:
+        takes_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        if "random_state" in sig.parameters or takes_kwargs:
             hp.setdefault("random_state", random_state)
     except (ValueError, TypeError):
         pass
@@ -120,6 +140,10 @@ def _build_model(
     # CPU parallelism — setdefault so user-supplied values take precedence
     if model_name in _NJOBS_PARAM:
         hp.setdefault(_NJOBS_PARAM[model_name], n_jobs)
+
+    # Keep training side-files out of the working tree — setdefault, see above
+    for k, v in _SIDE_FILE_PARAMS.get(model_name, {}).items():
+        hp.setdefault(k, v)
 
     # GPU acceleration — setdefault so user-supplied values take precedence
     if use_gpu and model_name in _CUDA_PARAMS:
@@ -139,7 +163,7 @@ def _serialize_hyperparams(hp: dict) -> dict:
     )
 
 
-def train(
+def train_tabular(
     X_train: np.ndarray,
     y_train: np.ndarray,
     label2id: dict,
@@ -163,15 +187,15 @@ def train(
         training_metadata.json
 
     Args:
-        X_train:      Preprocessed feature matrix from prepare_dataset().
-        y_train:      Integer label array from prepare_dataset().
-        label2id:     Label-to-integer mapping from prepare_dataset().
-        id2label:     Integer-to-label mapping from prepare_dataset().
-        model_name:   Model alias — one of SUPPORTED_MODELS keys.
+        X_train:      Preprocessed feature matrix from prepare_tabular_dataset().
+        y_train:      Integer label array from prepare_tabular_dataset().
+        label2id:     Label-to-integer mapping from prepare_tabular_dataset().
+        id2label:     Integer-to-label mapping from prepare_tabular_dataset().
+        model_name:   Model alias — one of TABULAR_MODELS keys.
         output_dir:   Directory to save all artifacts.
-        hyperparams:  Hyperparameter dict. Merged over DEFAULT_HYPERPARAMS[model_name].
+        hyperparams:  Hyperparameter dict. Merged over TABULAR_DEFAULT_HYPERPARAMS[model_name].
                       None = use defaults only.
-        preprocessor: Fitted ColumnTransformer from prepare_dataset(). Bundled
+        preprocessor: Fitted ColumnTransformer from prepare_tabular_dataset(). Bundled
                       into model.joblib for later use on raw new data.
         random_state: Random seed. Default 42.
         n_jobs:       Parallel jobs for CPU-parallel models (random_forest, knn,
@@ -192,7 +216,7 @@ def train(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Merge defaults and user hyperparams
-    hp = dict(DEFAULT_HYPERPARAMS.get(model_name, {}))
+    hp = dict(TABULAR_DEFAULT_HYPERPARAMS.get(model_name, {}))
     if hyperparams:
         hp.update(hyperparams)
 
@@ -208,7 +232,7 @@ def train(
 
     # Sanitize and strip all RNG objects before pickling to prevent
     # cross-NumPy-version joblib failures (MT19937 BitGenerator path changed
-    # between NumPy 1.x and 2.x).  RNG state is never used during predict().
+    # between NumPy 1.x and 2.x).  RNG state is never used during predict_tabular().
     #
     # Three-layer defence:
     #   1. _sanitize_random_state: reset random_state* attrs to int 42.
