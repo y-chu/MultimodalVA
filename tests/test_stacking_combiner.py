@@ -9,6 +9,7 @@ finished run's OOF predictions without retraining anything.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -271,3 +272,76 @@ def test_data_is_still_required_without_oof_from(tmp_path):
 
     with pytest.raises(TypeError, match="needs data= and label_col="):
         mv.run(task="tabular", output_dir=tmp_path / "nodata")
+
+
+# --- extend_oof_from: the inherited and new columns must share their folds ----
+
+def _fake_source_run(tmp_path, *, n_folds, split_seed, n_rows=6, n_cols=4):
+    """Minimal finished stage 1: enough for extend_oof_from to reach its checks."""
+    import json
+
+    import numpy as np
+    import pandas as pd
+
+    src = tmp_path / "source_run"
+    (src / "oof").mkdir(parents=True)
+    (src / "data").mkdir(parents=True)
+    np.save(src / "oof" / "oof_meta_X.npy", np.zeros((n_rows, n_cols)))
+    df = pd.DataFrame({"a": range(n_rows), "cause": ["x", "y"] * (n_rows // 2)})
+    df.to_csv(src / "data" / "train_df.csv", index=False)
+    df.to_csv(src / "data" / "test_df.csv", index=False)
+    (src / "oof" / "oof_metadata.json").write_text(json.dumps({
+        "n_folds": n_folds,
+        "split_seed": split_seed,
+        "model_sources": [],
+    }))
+    return src
+
+
+def _extend_with(tmp_path, src, *, n_folds, split_seed):
+    import pandas as pd
+
+    from multimodalva.ensemble.stacking import StackingClassifier
+
+    clf = StackingClassifier(
+        text_models=[],
+        tabular_models=[{"model_name": "lightgbm"}],
+        output_dir=tmp_path / "extended",
+        n_folds=n_folds,
+        extend_oof_from=src,
+    )
+    df = pd.DataFrame({"a": range(6), "cause": ["x", "y"] * 3})
+    return clf.train_base_models(
+        df, label_col="cause", feature_cols=["a"], split_seed=split_seed,
+    )
+
+
+def test_extend_oof_from_rejects_a_different_n_folds(tmp_path):
+    src = _fake_source_run(tmp_path, n_folds=5, split_seed=42)
+    with pytest.raises(ValueError) as exc:
+        _extend_with(tmp_path, src, n_folds=3, split_seed=42)
+    msg = str(exc.value)
+    assert "n_folds" in msg
+    assert "5" in msg and "3" in msg, f"both values must be shown: {msg}"
+
+
+def test_extend_oof_from_rejects_a_different_split_seed(tmp_path):
+    src = _fake_source_run(tmp_path, n_folds=5, split_seed=42)
+    with pytest.raises(ValueError) as exc:
+        _extend_with(tmp_path, src, n_folds=5, split_seed=7)
+    msg = str(exc.value)
+    assert "split_seed" in msg
+    assert "42" in msg and "7" in msg, f"both values must be shown: {msg}"
+
+
+def test_extend_oof_from_warns_when_the_source_records_no_folds(tmp_path, caplog):
+    """An older run with no n_folds in its metadata cannot be checked, not silently."""
+    import json
+
+    src = _fake_source_run(tmp_path, n_folds=5, split_seed=42)
+    (src / "oof" / "oof_metadata.json").write_text(json.dumps({"model_sources": []}))
+    with caplog.at_level("WARNING"):
+        with contextlib.suppress(Exception):   # it gets past the check, then needs real data
+            _extend_with(tmp_path, src, n_folds=3, split_seed=7)
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert "cannot be checked" in warned

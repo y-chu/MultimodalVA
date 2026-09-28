@@ -54,6 +54,25 @@ def test_with_defaults_does_not_override_an_explicit_backend():
 
 
 # --- resolve_backend --------------------------------------------------------
+#
+# "auto" resolves on two things: does this machine want Ray, and is Ray
+# installed. Any test whose expected answer is "ray" stubs the availability half,
+# because ray lives in the [ray] extra — left to the ambient environment such a
+# test passes on a dev machine that has the extra and fails in CI, which installs
+# only [dev]. Tests that expect "optuna" need no stub: absent ray only reinforces
+# that answer.
+
+def _pretend_ray_installed(monkeypatch):
+    import multimodalva.utils.optimize_config as oc
+
+    monkeypatch.setattr(oc, "ray_is_available", lambda: True)
+
+
+def _pretend_ray_missing(monkeypatch):
+    import multimodalva.utils.optimize_config as oc
+
+    monkeypatch.setattr(oc, "ray_is_available", lambda: False)
+
 
 @pytest.mark.parametrize("explicit", ["optuna", "ray"])
 def test_explicit_backend_is_returned_unchanged(explicit):
@@ -61,6 +80,7 @@ def test_explicit_backend_is_returned_unchanged(explicit):
 
 
 def test_auto_picks_ray_under_slurm(monkeypatch):
+    _pretend_ray_installed(monkeypatch)
     monkeypatch.setenv("SLURM_JOB_ID", "12345")
     assert resolve_backend("auto") == "ray"
 
@@ -74,6 +94,7 @@ def test_auto_picks_optuna_without_cuda_or_slurm(monkeypatch):
 
 
 def test_auto_picks_ray_with_cuda(monkeypatch):
+    _pretend_ray_installed(monkeypatch)
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
     import torch
 
@@ -82,12 +103,6 @@ def test_auto_picks_ray_with_cuda(monkeypatch):
 
 
 # --- ray lives in an extra: auto must not resolve to a backend that is absent --
-
-def _pretend_ray_missing(monkeypatch):
-    import multimodalva.utils.optimize_config as oc
-
-    monkeypatch.setattr(oc, "ray_is_available", lambda: False)
-
 
 def test_auto_falls_back_to_optuna_when_ray_is_not_installed(monkeypatch):
     # The whole point of the [ray] extra: a CUDA machine without ray still runs.
@@ -152,6 +167,7 @@ def test_auto_survives_a_torch_probe_that_raises(monkeypatch):
 
 
 def test_describe_reports_the_resolved_backend(monkeypatch):
+    _pretend_ray_installed(monkeypatch)
     monkeypatch.setenv("SLURM_JOB_ID", "1")
     line = Optimize().describe()
     assert "backend=ray (from auto)" in line

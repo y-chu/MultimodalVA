@@ -268,7 +268,10 @@ versioning; `1.0.0` will mark the API as stable rather than any one feature.
 
 - [FAQ](FAQ.md) — hardware, run time, disk use, reproducibility, resuming,
   publishing models to the Hugging Face Hub, common errors
-- [API reference](docs/index.html)
+- API reference — `docs/index.html`, one self-contained page generated from the
+  docstrings. GitHub serves `.html` as source rather than as a page, so open the
+  file after cloning (`open docs/index.html`) or rebuild it with
+  `python docs/build_docs.py`.
 - [Examples](examples/README.md)
 
 ## Questions and contributions

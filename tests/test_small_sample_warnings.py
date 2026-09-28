@@ -252,6 +252,81 @@ def test_every_validation_split_in_the_package_uses_the_shared_helper():
     )
 
 
+#: Where ``StratifiedShuffleSplit`` is still constructed directly, as
+#: ``{module: {enclosing function, …}}``. Both are ``optimize_tabular``'s
+#: single-holdout path (``Optimize(cv=False)``), which therefore *raises* on data
+#: thin enough that the text path degrades and continues — the limitation
+#: recorded in ``CHANGELOG.md`` under ``[0.1.0] → Known limitations``. Routing
+#: them through ``stratified_indices()`` changes which rows a tabular search
+#: validates on, so it waits for a release where tabular results are re-verified.
+#:
+#: This list is the point of the test below: these two are known, and a *third*
+#: one must not appear quietly. Removing an entry is how the fix gets recorded.
+KNOWN_DIRECT_SHUFFLE_SPLITS = {
+    "tabular/hpo.py": {"optimize_tabular", "optimize_tabular_ray"},
+}
+
+
+def test_no_new_direct_stratified_shuffle_split():
+    """Anti-drift, second form: the guard above only sees ``train_test_split``.
+
+    ``StratifiedShuffleSplit`` is the other way to write the same crash, and it
+    needs no ``stratify=`` kwarg to be stratified — the name is the request. So
+    it slipped past the ``train_test_split`` guard entirely, which is how
+    ``optimize_tabular`` came to raise where ``optimize_text`` degrades.
+    """
+    import ast
+    import pathlib
+
+    import multimodalva
+
+    root = pathlib.Path(multimodalva.__file__).parent
+    found: dict[str, set[str]] = {}
+    for path in root.rglob("*.py"):
+        if path.name == "split.py":
+            continue  # the one place sklearn's splitter is called
+        src = path.read_text()
+        if "StratifiedShuffleSplit" not in src:
+            continue
+        rel = str(path.relative_to(root))
+        tree = ast.parse(src)
+        for fn in (
+            n for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if name == "StratifiedShuffleSplit":
+                    found.setdefault(rel, set()).add(fn.name)
+
+    unexpected = {
+        mod: sorted(fns - KNOWN_DIRECT_SHUFFLE_SPLITS.get(mod, set()))
+        for mod, fns in found.items()
+        if fns - KNOWN_DIRECT_SHUFFLE_SPLITS.get(mod, set())
+    }
+    assert unexpected == {}, (
+        f"new direct StratifiedShuffleSplit call(s): {unexpected} — call "
+        "stratified_indices() instead, so a validation slice thinner than the "
+        "class count degrades rather than raising on every trial. If the call is "
+        "deliberate, add it to KNOWN_DIRECT_SHUFFLE_SPLITS with the reason."
+    )
+
+    # The reverse direction: a fixed site must not stay on the known list, or the
+    # list stops meaning anything.
+    stale = {
+        mod: sorted(fns - found.get(mod, set()))
+        for mod, fns in KNOWN_DIRECT_SHUFFLE_SPLITS.items()
+        if fns - found.get(mod, set())
+    }
+    assert stale == {}, (
+        f"KNOWN_DIRECT_SHUFFLE_SPLITS lists call site(s) that no longer exist: "
+        f"{stale} — remove them, and the matching note in CHANGELOG.md's "
+        "Known limitations if the limitation is gone."
+    )
+
+
 def test_feature_fusion_leaves_its_validation_split_to_automm():
     """AutoMM splits its own holdout; the package only passes the size.
 

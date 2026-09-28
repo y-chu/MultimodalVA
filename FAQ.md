@@ -1107,6 +1107,28 @@ To score your own model on the test set, get the base models' test
 probabilities the same way Stage 3 does — `predict_ensemble_from_pretrained()` on
 the finished run — and apply your fitted model to them.
 
+**Three settings mention an out-of-fold matrix, and they do different things.**
+They are easy to mix up, so side by side:
+
+| Setting | Stage 1 (base models) | Stage 2 (combiner) | Use it when |
+|---|---|---|---|
+| `run(..., oof_only=True)` | trained, then **stop** | **yours**, outside the package | your combiner is not one of the ten — the escape hatch above |
+| `run(..., oof_from=path)` | **not** trained — read from `path` | the package's, on that matrix | you want another combiner, or the same one again, without paying for stage 1 twice |
+| `StackingClassifier(extend_oof_from=path)` | **only the models you list here** are trained; `path`'s columns are inherited | the package's, on `[inherited \| new]` | you want to **add base models** to a stacking run that is already finished |
+
+`oof_only` and `oof_from` are the two halves of one split-it-up workflow — run
+stage 1 on a GPU box, fit combiners later and repeatedly somewhere cheap.
+`extend_oof_from` is the separate case of widening the matrix: it trains the new
+base models, reuses the source run's train/test split so the rows still line up,
+and `predict_test()` then loads inherited models from the source run and new ones
+from this run's `final/`. It must be given the source run's `n_folds` and
+`split_seed` — the inherited columns were computed over those folds and the new
+ones are computed over yours, so a mismatch is refused with both values named
+rather than combined into a matrix whose columns mean different things. Both are
+recorded in the source run's `oof/oof_metadata.json`. `extend_oof_from` and
+`n_folds` are constructor arguments, so through `run()` they travel in
+`init_kwargs=`.
+
 **4. Not a meta-learner at all.** `combiner=` also takes `simple_average`,
 `class_aware_voting` and `ensemble_selection`, none of which fits a classifier
 over the probabilities. See *Which stacking combiner should I use?* above; a list

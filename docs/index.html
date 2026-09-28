@@ -1899,7 +1899,7 @@ proba = predictor.predict_proba(new_df)</code></pre>
     <a class="anchor" id="ensemble-stacking"></a>
     <h3>StackingClassifier</h3>
     <div class="sig">
-      <span class="cls-name">StackingClassifier</span>(<span class="param">text_models</span>, <span class="param">tabular_models</span>, <span class="param">output_dir='runs/ensemble/stacking'</span>, <span class="param">meta_learners=None</span>, <span class="param">meta_select_metric='f1_macro'</span>, <span class="param">n_folds=5</span>, <span class="param">resume=True</span>, <span class="param">load_oof_from=None</span>)
+      <span class="cls-name">StackingClassifier</span>(<span class="param">text_models</span>, <span class="param">tabular_models</span>, <span class="param">output_dir='runs/ensemble/stacking'</span>, <span class="param">meta_learners=None</span>, <span class="param">meta_select_metric='f1_macro'</span>, <span class="param">n_folds=5</span>, <span class="param">resume=True</span>, <span class="param">extend_oof_from=None</span>)
     </div>
     <p>End-to-end stacking (super learner) ensemble classifier.</p>
     <p>Implements a two-stage pipeline with explicit stage methods so that each stage can be run independently across separate Python sessions (resumable).</p>
@@ -1914,14 +1914,14 @@ proba = predictor.predict_proba(new_df)</code></pre>
     <p>Attributes (populated after predict_test() / run()) ---------------------------------------------------- predictions :         Final PredictionResult.</p>
     <table>
       <tr><th>Parameter</th><th>Description</th></tr>
-      <tr><td><code>text_models</code></td><td>List of text base-model spec dicts. Same format as SoftVotingClassifier. When <code>load_oof_from</code> is set, list **only the new models** to add — do not repeat models already in the source run.</td></tr>
+      <tr><td><code>text_models</code></td><td>List of text base-model spec dicts. Same format as SoftVotingClassifier. When <code>extend_oof_from</code> is set, list **only the new models** to add — do not repeat models already in the source run.</td></tr>
       <tr><td><code>tabular_models</code></td><td>List of tabular base-model spec dicts. Same rule as <code>text_models</code>.</td></tr>
       <tr><td><code>output_dir</code></td><td>Root output directory for this run.</td></tr>
       <tr><td><code>meta_learners</code></td><td>One meta-learner spec dict, or a list of candidates — each is scored by CV on the OOF matrix and the best is refit on all of it. Default: :data:`DEFAULT_META_LEARNERS`, one multinomial logistic regression. Which models are worth comparing depends on the data, so comparing several is done by passing them. Any of the ten names :func:`_meta_learner_names` returns may be used, all on the same footing; one this package cannot build is refused before stage 1 with a pointer to <code>oof_only=True</code>, which hands back <code>oof_meta_X</code> / <code>oof_y</code> to fit whatever you like.</td></tr>
       <tr><td><code>meta_select_metric</code></td><td>Metric used to select among multiple meta-learner candidates.  Options: <code>accuracy</code>, <code>f1_macro</code> (default), <code>f1_weighted</code>, <code>csmf_accuracy</code>.</td></tr>
       <tr><td><code>n_folds</code></td><td>CV folds for the OOF loop. Default 5.</td></tr>
       <tr><td><code>resume</code></td><td>Resume interrupted training. Default True.</td></tr>
-      <tr><td><code>load_oof_from</code></td><td>Path to an existing stacking <code>output_dir</code> whose OOF predictions should be reused. When set:</td></tr>
+      <tr><td><code>extend_oof_from</code></td><td>Path to an existing stacking <code>output_dir</code> whose OOF predictions are **extended** with the models listed here. Not the same as <code>run(oof_from=...)</code>, which reuses a finished stage 1 and trains nothing: this one trains the new base models and widens the matrix. When set:</td></tr>
     </table>
 
     <h4>.train_base_models()</h4>
@@ -2097,6 +2097,7 @@ proba = predictor.predict_proba(new_df)</code></pre>
     <p><code>meta_select_metric</code> is the metric for every choice made in stage 2: between meta-learner candidates, by ensemble selection, and by <code>"best"</code>.</p>
     <p><code>oof_only=True</code> does the opposite: it computes stage 1, writes it, and returns before any combiner is fitted — for running the expensive half on a GPU box and the combiners later (or repeatedly) somewhere cheap. The result dict then carries the OOF matrix, <code>oof_dir</code>, <code>oof_metadata</code> (which records the base models, the split and the seeds), and <code>predictions</code> is <code>None</code>. Continue with <code>run(oof_from=&amp;lt;that output_dir&amp;gt;)</code>. Passing both raises.</p>
     <p><code>oof_from</code> skips stage 1 entirely. Point it at the <code>output_dir</code> of an earlier stacking run and its out-of-fold predictions, trained base models, train/test split, label maps and seeds are reused; nothing is retrained. <code>df</code>, the model specs and the seed arguments are then not used — stage 2 must see the split and seeds its out-of-fold predictions were made with. Leave it <code>None</code> to compute stage 1.</p>
+    <p>To *add* base models to a finished run instead of only re-combining the ones it has, that is the constructor's <code>extend_oof_from=</code>: it keeps the source run's OOF columns and split, trains the models listed in this run's specs, and widens the matrix to <code>[inherited | new]</code>. <code>oof_from</code> trains nothing; <code>extend_oof_from</code> trains the new columns.</p>
     <p>Outputs: Each combiner writes its predictions to its own folder — <code>meta_learner/predictions/</code>, <code>simple_average/predictions/</code>, <code>class_voter/predictions/</code>, <code>ensemble_selection/predictions/</code>, <code>meta_learner_&amp;lt;name&amp;gt;/predictions/</code> — and <code>predictions/</code> holds the main result, as for every other pipeline. <code>"best"</code> also writes <code>combiner_comparison/</code>.</p>
     <p><strong>Returns:</strong> dict with <code>predictions</code> (the main result), <code>combiner</code> (the combiners run, main first), <code>combiner_predictions</code> (<code>{combiner: PredictionResult}</code>), <code>combiner_chosen</code> and <code>combiner_comparison</code> (set by <code>"best"</code>, else <code>None</code>), <code>best_meta_name</code>, <code>meta_select_metric</code>, <code>meta_scores</code>, <code>class_voter</code> (the voter's report), <code>ensemble_selection_weights</code>, <code>oof_meta_X</code>, <code>oof_from</code>, <code>meta_learner</code>, <code>label2id</code>, <code>id2label</code> and <code>output_dir</code>.</p>
 

@@ -27,7 +27,7 @@ keywords:
 license: MIT
 version: 0.1.0
 # Keep in step with the git tag and with CHANGELOG.md's [0.1.0] heading.
-date-released: "2026-09-27"
+date-released: "2026-09-28"
 # After archiving the tagged release (e.g. on Zenodo), add its DOI here as:
 # doi: "10.5281/zenodo.XXXXXXX"
 references:

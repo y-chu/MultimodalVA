@@ -34,8 +34,19 @@ Two-stage pipeline:
         using training data only. combiner="best" uses it to choose.
 
     Convenience: run() calls the stages in sequence. run(combiner=...) picks
-    one combiner, a list of them (sharing one stage 1), or "best"; and
-    run(oof_from=...) reuses a finished run's stage 1 without retraining.
+    one combiner, a list of them (sharing one stage 1), or "best".
+
+    Three settings name an out-of-fold matrix and are not interchangeable:
+        run(oof_only=True)       train stage 1, stop, hand back oof_meta_X/oof_y
+                                 so a combiner the package cannot build can be
+                                 fitted outside it.
+        run(oof_from=path)       skip stage 1 and read it from `path`; nothing is
+                                 retrained. The other half of oof_only.
+        StackingClassifier(extend_oof_from=path)
+                                 inherit `path`'s OOF columns AND train the base
+                                 models listed here, widening the matrix to
+                                 [inherited | new]. The only one of the three
+                                 that trains base models.
 
 Output directory layout::
 
@@ -1435,14 +1446,14 @@ class StackingClassifier:
         meta_select_metric: str = "f1_macro",
         n_folds: int = 5,
         resume: bool = True,
-        load_oof_from: str | Path | None = None,
+        extend_oof_from: str | Path | None = None,
     ):
         """Initialise StackingClassifier.
 
         Args:
             text_models:          List of text base-model spec dicts.
                                   Same format as SoftVotingClassifier.
-                                  When ``load_oof_from`` is set, list **only
+                                  When ``extend_oof_from`` is set, list **only
                                   the new models** to add — do not repeat
                                   models already in the source run.
             tabular_models:       List of tabular base-model spec dicts.
@@ -1467,8 +1478,12 @@ class StackingClassifier:
                                   ``f1_weighted``, ``csmf_accuracy``.
             n_folds:              CV folds for the OOF loop. Default 5.
             resume:               Resume interrupted training. Default True.
-            load_oof_from:        Path to an existing stacking ``output_dir``
-                                  whose OOF predictions should be reused.
+            extend_oof_from:      Path to an existing stacking ``output_dir``
+                                  whose OOF predictions are **extended** with
+                                  the models listed here. Not the same as
+                                  ``run(oof_from=...)``, which reuses a finished
+                                  stage 1 and trains nothing: this one trains the
+                                  new base models and widens the matrix.
                                   When set:
 
                                   * The train/test split from that run is
@@ -1484,7 +1499,7 @@ class StackingClassifier:
                                     new models.
                                   * Chaining is supported: the source run may
                                     itself have been created with
-                                    ``load_oof_from``.
+                                    ``extend_oof_from``.
 
                                   Default ``None`` (standard full training).
         """
@@ -1514,7 +1529,7 @@ class StackingClassifier:
         self.meta_select_metric = meta_select_metric
         self.n_folds            = n_folds
         self.resume             = resume
-        self.load_oof_from      = Path(load_oof_from) if load_oof_from else None
+        self.extend_oof_from      = Path(extend_oof_from) if extend_oof_from else None
 
         # Populated after train_base_models()
         self.train_df:       pd.DataFrame | None = None
@@ -1765,8 +1780,8 @@ class StackingClassifier:
         data_dir = self.output_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Inherited OOF loading (load_oof_from) --------------------------
-        # When load_oof_from is set:
+        # --- Inherited OOF loading (extend_oof_from) --------------------------
+        # When extend_oof_from is set:
         #   • Reuse the exact train/test split from the source run (row alignment).
         #   • Only run OOF for the NEW models listed in text_models/tabular_models.
         #   • Concatenate [inherited_oof | new_oof] column-wise.
@@ -1775,8 +1790,8 @@ class StackingClassifier:
         inherited_oof_X: np.ndarray | None = None
         inherited_model_sources: list[dict] = []
 
-        if self.load_oof_from:
-            _src = self.load_oof_from
+        if self.extend_oof_from:
+            _src = self.extend_oof_from
             _ioof_file = _src / "oof" / "oof_meta_X.npy"
             if not _ioof_file.exists():
                 raise FileNotFoundError(
@@ -1785,7 +1800,7 @@ class StackingClassifier:
                 )
             inherited_oof_X = np.load(_ioof_file)
             logger.info(
-                "load_oof_from: loaded inherited OOF matrix %s from %s",
+                "extend_oof_from: loaded inherited OOF matrix %s from %s",
                 inherited_oof_X.shape, _src,
             )
 
@@ -1798,7 +1813,7 @@ class StackingClassifier:
                     "The source run must have been completed with train_base_models()."
                 )
             logger.info(
-                "load_oof_from: reusing train/test split from %s to guarantee "
+                "extend_oof_from: reusing train/test split from %s to guarantee "
                 "OOF row alignment.  The df argument is still used to prepare "
                 "features for the new models.", _src,
             )
@@ -1809,7 +1824,7 @@ class StackingClassifier:
                 raise ValueError(
                     f"Inherited OOF has {inherited_oof_X.shape[0]} rows but "
                     f"train_df.csv has {len(self.train_df)} rows — shape mismatch.  "
-                    "Ensure load_oof_from points to the correct source run."
+                    "Ensure extend_oof_from points to the correct source run."
                 )
 
             # Load model_sources from source metadata (supports chaining)
@@ -1817,6 +1832,44 @@ class StackingClassifier:
             if _src_meta_path.exists():
                 with open(_src_meta_path) as _f:
                     _src_meta = json.load(_f)
+
+                # The inherited columns were computed over the SOURCE run's
+                # folds; the new columns are computed over this run's. A
+                # different n_folds or split_seed therefore makes the two halves
+                # of [inherited | new] incomparable — each column's out-of-fold
+                # predictions would come from models that saw a different amount
+                # of training data, or different fold members — and nothing
+                # downstream can detect it: stage 2 just fits a combiner on a
+                # matrix that is internally inconsistent. The source records
+                # both values, so this is checkable, and it raises rather than
+                # warns because by the time a warning were noticed the meta
+                # learner would already have been fitted on it.
+                _fold_mismatch = []
+                for _field, _mine in (("n_folds", self.n_folds),
+                                      ("split_seed", split_seed)):
+                    _theirs = _src_meta.get(_field)
+                    if _theirs is None:
+                        logger.warning(
+                            "extend_oof_from: %s does not record %r, so it "
+                            "cannot be checked against this run's %r. If the "
+                            "source run used a different value, the inherited "
+                            "and new columns are not comparable.",
+                            _src_meta_path, _field, _mine,
+                        )
+                    elif _theirs != _mine:
+                        _fold_mismatch.append(
+                            f"  {_field}: source run {_theirs!r}, this run {_mine!r}"
+                        )
+                if _fold_mismatch:
+                    raise ValueError(
+                        f"extend_oof_from={str(_src)!r} computed its out-of-fold "
+                        "predictions with different fold settings, so its columns "
+                        "cannot be combined with new ones:\n"
+                        + "\n".join(_fold_mismatch)
+                        + "\nPass the source run's values — they are recorded in "
+                        f"{_src_meta_path} — or train the new models in a fresh "
+                        "stacking run instead of extending this one."
+                    )
                 if "model_sources" in _src_meta:
                     inherited_model_sources = _src_meta["model_sources"]
                 else:
@@ -2015,7 +2068,7 @@ class StackingClassifier:
         expected_cols    = n_inherited_cols + n_new_models * n_classes
 
         # Resume check: skip loop only when assembled matrix has the right shape.
-        # If load_oof_from was used and the file exists but has only new-model
+        # If extend_oof_from was used and the file exists but has only new-model
         # columns (incomplete previous run), re-generate and re-combine.
         _oof_file = oof_dir / "oof_meta_X.npy"
         _skip_oof = (
@@ -2127,7 +2180,7 @@ class StackingClassifier:
             "meta_feature_names": oof_meta_names,
             "text_best_hp":     self.text_best_hp,
             "tabular_best_hp":  self.tabular_best_hp,
-            "inherited_from":   str(self.load_oof_from.resolve()) if self.load_oof_from else None,
+            "inherited_from":   str(self.extend_oof_from.resolve()) if self.extend_oof_from else None,
         }
         with open(oof_dir / "oof_metadata.json", "w") as fh:
             json.dump(oof_metadata, fh, indent=2, default=str)
@@ -3388,6 +3441,12 @@ Passing both raises.
         retrained. ``df``, the model specs and the seed arguments are then not
         used — stage 2 must see the split and seeds its out-of-fold
         predictions were made with. Leave it ``None`` to compute stage 1.
+
+        To *add* base models to a finished run instead of only re-combining the
+        ones it has, that is the constructor's ``extend_oof_from=``: it keeps the
+        source run's OOF columns and split, trains the models listed in this
+        run's specs, and widens the matrix to ``[inherited | new]``. ``oof_from``
+        trains nothing; ``extend_oof_from`` trains the new columns.
 
         Outputs:
             Each combiner writes its predictions to its own folder —

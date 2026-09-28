@@ -39,7 +39,7 @@ which the public API is declared stable — not for any single feature.
   A trained AutoMM model can already be shared as a directory; ensembles need a
   card that points at each base model's repository.
 
-## [0.1.0] — 2026-09-27
+## [0.1.0] — 2026-09-28
 
 First public release.
 
@@ -284,6 +284,15 @@ these ever reached a tagged version.
   and sample-size scripts reload `best_hyperparams.json` and feed it straight
   back as `hyperparams=`. A Ray-backed run was missing all three. Readers still
   accept the legacy `hpo_trials_ray.csv` for runs already on disk.
+- `extend_oof_from=` refuses a source run whose out-of-fold predictions were
+  computed with a different `n_folds` or `split_seed`, naming both values. The
+  inherited columns come from the source run's folds and the new ones from this
+  run's, so a mismatch makes the two halves of `[inherited | new]` incomparable —
+  each column's out-of-fold predictions would come from models that saw a
+  different amount of training data, or different fold members. Nothing
+  downstream could detect it: stage 2 simply fitted a combiner on a matrix that
+  was internally inconsistent. The source run records both values, so the
+  mismatch was always knowable. A source run too old to record them warns instead.
 - The HPO runtime report is `hpo/runtime/hpo_runtime.json` on both backends. It
   was the one artifact the cleanup above missed: the Ray text search wrote
   `ray_hpo_runtime.json`, so a timing report had to be looked for under two names
@@ -402,6 +411,7 @@ export `train`, `predict`, `prepare_dataset`, `optimize`, `SUPPORTED_MODELS` and
 | `FeatureFusionClassifier.run(use_hpo=, n_hpo_trials=)` | `hyperparams=Optimize(n_trials=…)` |
 | `random_state=` on `run()` or any classifier | `split_seed=` and/or `train_seed=` |
 | `set_seed=` (text, data fusion) | `train_seed=` |
+| `StackingClassifier(load_oof_from=)` | `extend_oof_from=` — it trains the new base models and widens the OOF matrix, which `load_` did not say, and which `run(oof_from=)`, a step away by one prefix, does not do |
 | `FeatureFusionClassifier.run(automm_seed=)` | `train_seed=` |
 | `train_class_voter_stage(fallback_random_state=)` | `split_seed=` |
 | `train_meta_learner_stage(random_state=)` | `split_seed=` / `train_seed=`, both defaulting to stage 1's |
