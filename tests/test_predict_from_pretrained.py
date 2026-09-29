@@ -700,3 +700,25 @@ def test_voting_run_without_base_models_says_what_to_do(tmp_path):
     (tmp_path / "training_metadata.json").write_text(json.dumps({"pipeline": "voting"}))
     with pytest.raises(ValueError, match="vote_from_results"):
         mv.predict_ensemble_from_pretrained(tmp_path, pd.DataFrame({"a": [1]}))
+
+
+def test_tabular_backend_rejects_unknown_backend_kwargs_before_loading(tmp_path):
+    from multimodalva.inference.checks import PretrainedChecks
+    from multimodalva.inference.tabular_backend import TabularPretrainedBackend
+
+    checks = PretrainedChecks(
+        source=str(tmp_path), artifact_dir=str(tmp_path), task="tabular",
+        task_source="caller", multimodalva_version=None,
+    )
+    with pytest.raises(TypeError, match="silently ignored"):
+        TabularPretrainedBackend.from_pretrained(
+            tmp_path, checks, invented_option=True,
+        )
+
+
+def test_malformed_training_metadata_is_not_silently_ignored(tmp_path):
+    from multimodalva.inference.api import _read_training_metadata
+
+    (tmp_path / "training_metadata.json").write_text("{not valid json")
+    with pytest.raises(ValueError, match="Cannot read training metadata"):
+        _read_training_metadata(tmp_path, tmp_path)

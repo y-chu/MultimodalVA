@@ -28,7 +28,6 @@ Public API:
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +37,9 @@ from multimodalva.utils.runtime import (
 )
 from multimodalva.utils.runtime import track_run
 from multimodalva.utils.seeds import seed_everything, set_determinism
+from multimodalva.utils.provenance import (
+    enforce_resume_manifest, make_resume_manifest,
+)
 
 from .data_fusion import build_fused_text, DEFAULT_SEPARATOR
 
@@ -397,6 +399,49 @@ class DataFusionClassifier:
         self.train_df = train_df
         self.test_df  = test_df
         logger.info("Split: %d train / %d test rows.", len(train_df), len(test_df))
+
+        if id_col is not None:
+            if id_col not in df.columns:
+                raise ValueError(f"id_col {id_col!r} not found in the DataFrame.")
+            if df[id_col].isna().any() or df[id_col].duplicated().any():
+                raise ValueError(
+                    f"id_col {id_col!r} must contain non-missing, unique values."
+                )
+
+        signature_cols = [fused_col, label_col]
+        if id_col is not None:
+            signature_cols.append(id_col)
+        manifest = make_resume_manifest(
+            dataframes={
+                "train": train_df[signature_cols],
+                "test": test_df[signature_cols],
+            },
+            config={
+                "pipeline": "data_fusion", "model_name": self.model_name,
+                "text_col": text_col, "feature_cols": feature_cols,
+                "label_col": label_col, "fused_col": fused_col,
+                "with_neg": with_neg, "templates": templates,
+                "binary_map": binary_map, "prefix_cols": prefix_cols,
+                "yes_no_map": yes_no_map, "separator": separator,
+                "group_symptoms": group_symptoms,
+                "max_length": max_length, "hyperparams": hyperparams,
+                "split_seed": split_seed, "train_seed": train_seed,
+                "test_size": test_size, "stratify": stratify,
+                "use_lora": use_lora, "use_focal": use_focal,
+                "gradient_checkpointing": gradient_checkpointing,
+                "early_stopping_patience": early_stopping_patience,
+                "val_size": val_size, "use_fast": use_fast,
+            },
+        )
+        enforce_resume_manifest(
+            self.output_dir / "resume_manifest.json", manifest,
+            resume=resume,
+            artifacts_exist=any(
+                (self.output_dir / name).exists()
+                for name in ("hpo", "final", "predictions")
+            ),
+            what="this data-fusion run",
+        )
 
         # ------------------------------------------------------------------
         # Step 3 — Tokenise

@@ -29,6 +29,9 @@ Examples
     multimodalva predict --source runs/stacking --data new.csv \
         --text-col narrative --label-col cause --output-dir preds/
 
+    # Check a config against the data before submitting it: nothing is trained
+    multimodalva run experiment.yaml --dry-run
+
     # Check a submitted job before it spends an hour: nothing is scored
     multimodalva predict --source runs/stacking --data new.csv --dry-run
 
@@ -163,6 +166,20 @@ def _build_parser() -> argparse.ArgumentParser:
                             "out-of-fold predictions), before any combiner is "
                             "fitted. Continue later with --oof-from pointing "
                             "at this run.")
+    run_p.add_argument("--resume-adopt", dest="resume_adopt", action="store_true",
+                       help="Reuse artifacts already in --output-dir that carry "
+                            "no resume signature, instead of refusing them. For "
+                            "runs made before resume manifests existed: nothing "
+                            "verifies they came from this data and configuration, "
+                            "so this is your word, not a check. The signature of "
+                            "this call is then recorded, so later runs are "
+                            "checked normally.")
+    run_p.add_argument("--dry-run", dest="dry_run", action="store_true",
+                       help="Check the configuration against the data and stop: "
+                            "load, filter, split and resolve the feature columns, "
+                            "report what the run would do, train nothing. Exits 2 "
+                            "if anything would stop the run, so a job script can "
+                            "gate on it.")
     run_p.add_argument("--push-to-hub", dest="push_to_hub", action="store_true",
                        default=None, help="Publish the trained model to the HF Hub "
                        "(text / data_fusion).")
@@ -245,9 +262,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
         cfg.update(_load_config(args.config))
     cfg.update(_cli_overrides(args))
 
-    if "task" not in cfg or "data" not in cfg or "label_col" not in cfg:
-        print("error: --task, --data and --label-col are required (via flags or "
-              "config file).", file=sys.stderr)
+    if "task" not in cfg:
+        print("error: --task is required (via flags or config file).",
+              file=sys.stderr)
+        return 2
+    # Stage-2/3 stacking deliberately reads rows, labels and seeds from the
+    # completed OOF run. The Python API already supports that contract; the CLI
+    # used to reject the same valid call before it reached run().
+    from .runner import _normalize_task
+    try:
+        reuses_oof = (
+            _normalize_task(cfg["task"]) == "stacking"
+            and cfg.get("oof_from") is not None
+        )
+    except ValueError:
+        reuses_oof = False  # preflight/run will report the unknown task itself
+    if not reuses_oof and ("data" not in cfg or "label_col" not in cfg):
+        print("error: --data and --label-col are required (via flags or config "
+              "file), except for stacking with --oof-from.", file=sys.stderr)
         return 2
     cfg.setdefault("output_dir", "runs/mmva")
 
@@ -258,9 +290,48 @@ def _cmd_run(args: argparse.Namespace) -> int:
         from .datasets import data as _data
         cfg["data"] = _data("va_sample", n_per_class=30)
 
+    if getattr(args, "dry_run", False):
+        return _run_dry_run(cfg)
+
     from .runner import run
     run(**cfg)
     print(f"Done. Artifacts in: {cfg['output_dir']}")
+    return 0
+
+
+def _run_dry_run(cfg: dict[str, Any]) -> int:
+    """Report what a run would do, without building a model.
+
+    Exits 2 when the configuration would not get past the checks, so a job
+    script can gate on it::
+
+        multimodalva run job.yaml --dry-run || exit 1
+        multimodalva run job.yaml
+    """
+    from .runner import preflight
+
+    report = preflight(**cfg)
+    width = max((len(k) for k in report["facts"]), default=0)
+    for key, value in report["facts"].items():
+        print(f"{key:{width}s}  {value}")
+    for line in report["log"]:
+        print(f"{'':{width}s}  log: {line}")
+    for note in report["notes"]:
+        print(f"\nnote: {note}")
+    if report["problems"]:
+        # The facts above are the context for the errors below; without this the
+        # two streams interleave and the report reads out of order.
+        sys.stdout.flush()
+        print(file=sys.stderr)
+        for problem in report["problems"]:
+            print(f"error: {problem}", file=sys.stderr)
+        print(f"\nDry run: {len(report['problems'])} problem(s); the run would "
+              "not get past them.", file=sys.stderr)
+        return 2
+    print("\nDry run: the configuration is consistent with the data. Nothing was "
+          "trained or written.\nA clean dry run does not promise the run will "
+          "succeed — nothing here trains, so it cannot\nsee a batch size that "
+          "will not fit or a trial budget too small for the search space.")
     return 0
 
 
@@ -370,6 +441,8 @@ def _predict_dry_run(args: argparse.Namespace, task: str, root: Path,
             from .inference.ensemble_api import (
                 _resolve_combiner, _stacking_base_dirs, _voting_base_dirs,
             )
+            from .inference.api import build_pretrained_backend
+            from .inference.checks import PretrainedChecks
             bases = (_voting_base_dirs(root, meta) if task == "voting"
                      else _stacking_base_dirs(root))
             kinds = {}
@@ -379,7 +452,36 @@ def _predict_dry_run(args: argparse.Namespace, task: str, root: Path,
                 len(bases), ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))))
             if task == "stacking":
                 print("Combiner:", _resolve_combiner(root, meta, args.combiner))
-            cols = None
+            # Match the real ensemble prediction path: load every base artifact
+            # and prepare the input, but stop before predict_proba(). Merely
+            # counting directories allowed corrupt/unloadable models to pass a
+            # dry run even though the command promised the models were loaded.
+            expected_cols: list[str] = []
+            first_labels = None
+            for i, (base_dir, base_task) in enumerate(bases):
+                checks = PretrainedChecks(
+                    source=str(base_dir), artifact_dir=str(base_dir),
+                    task=base_task, task_source="ensemble_metadata",
+                )
+                backend = build_pretrained_backend(
+                    _find_artifact_dir(base_dir), base_task, checks,
+                    text_col=args.text_col,
+                    missing_feature_method=args.missing_feature_method,
+                    batch_size=args.batch_size,
+                )
+                backend.prepare_inputs(df)
+                if first_labels is None:
+                    first_labels = backend.id2label
+                elif backend.id2label != first_labels:
+                    raise ValueError(
+                        f"Base model {base_dir} has a different label map from "
+                        "the first base model."
+                    )
+                for col in getattr(backend, "feature_cols", []) or []:
+                    if col not in expected_cols:
+                        expected_cols.append(col)
+                print(f"Loaded base model {i + 1}: {base_task} ({base_dir})")
+            cols = expected_cols
         else:
             from .inference.api import build_pretrained_backend
             from .inference.checks import PretrainedChecks
@@ -549,8 +651,15 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
         out["oof_from"] = args.oof_from
     if args.oof_only:
         out["oof_only"] = True
+    if args.no_resume and getattr(args, "resume_adopt", False):
+        raise SystemExit(
+            "error: --no-resume and --resume-adopt contradict each other. "
+            "--no-resume rebuilds the artifacts; --resume-adopt reuses them."
+        )
     if args.no_resume:
         out["resume"] = False
+    elif getattr(args, "resume_adopt", False):
+        out["resume"] = "adopt"
     if args.features is not None:
         out["features"] = _parse_features(args.features)
     if args.filters is not None:

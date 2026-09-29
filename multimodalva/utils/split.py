@@ -267,6 +267,16 @@ def split(
             f"df = df[df[{label_col!r}].notna()], or pass stratify=False."
         )
 
+    if stratify:
+        counts = df[label_col].value_counts()
+        if int(counts.min()) < 2:
+            rare = counts[counts < 2].index.tolist()
+            raise ValueError(
+                "A stratified train/test split needs at least 2 rows per class, "
+                f"but these class(es) have fewer: {rare}. Collect/group more "
+                "cases, supply a valid fixed split, or deliberately pass "
+                "stratify=False (which may leave a class out of training)."
+            )
     stratify_col = df[label_col] if stratify else None
     train_df, test_df = _sklearn_split(
         df,

@@ -252,19 +252,11 @@ def test_every_validation_split_in_the_package_uses_the_shared_helper():
     )
 
 
-#: Where ``StratifiedShuffleSplit`` is still constructed directly, as
-#: ``{module: {enclosing function, …}}``. Both are ``optimize_tabular``'s
-#: single-holdout path (``Optimize(cv=False)``), which therefore *raises* on data
-#: thin enough that the text path degrades and continues — the limitation
-#: recorded in ``CHANGELOG.md`` under ``[0.1.0] → Known limitations``. Routing
-#: them through ``stratified_indices()`` changes which rows a tabular search
-#: validates on, so it waits for a release where tabular results are re-verified.
-#:
-#: This list is the point of the test below: these two are known, and a *third*
-#: one must not appear quietly. Removing an entry is how the fix gets recorded.
-KNOWN_DIRECT_SHUFFLE_SPLITS = {
-    "tabular/hpo.py": {"optimize_tabular", "optimize_tabular_ray"},
-}
+#: Deliberately permitted direct ``StratifiedShuffleSplit`` call sites, as
+#: ``{module: {enclosing function, …}}``. The tabular HPO holdout paths now use
+#: ``stratified_indices()`` too, so this is empty. Keeping the allow-list and its
+#: reverse check makes any future exception explicit rather than silent.
+KNOWN_DIRECT_SHUFFLE_SPLITS: dict[str, set[str]] = {}
 
 
 def test_no_new_direct_stratified_shuffle_split():
@@ -272,8 +264,8 @@ def test_no_new_direct_stratified_shuffle_split():
 
     ``StratifiedShuffleSplit`` is the other way to write the same crash, and it
     needs no ``stratify=`` kwarg to be stratified — the name is the request. So
-    it slipped past the ``train_test_split`` guard entirely, which is how
-    ``optimize_tabular`` came to raise where ``optimize_text`` degrades.
+    it slipped past the ``train_test_split`` guard entirely in the old tabular
+    holdout paths. Those paths now share ``stratified_indices()`` with text HPO.
     """
     import ast
     import pathlib
@@ -308,8 +300,8 @@ def test_no_new_direct_stratified_shuffle_split():
     }
     assert unexpected == {}, (
         f"new direct StratifiedShuffleSplit call(s): {unexpected} — call "
-        "stratified_indices() instead, so a validation slice thinner than the "
-        "class count degrades rather than raising on every trial. If the call is "
+        "stratified_indices() instead, so small-sample handling stays consistent "
+        "across pipelines. If the call is "
         "deliberate, add it to KNOWN_DIRECT_SHUFFLE_SPLITS with the reason."
     )
 

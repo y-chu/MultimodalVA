@@ -15,6 +15,8 @@ publish and re-use trained models.
 - [Can I combine runs I already finished, without retraining?](#can-i-combine-runs-i-already-finished-without-retraining)
 - [How do I keep track of which prediction belongs to which death?](#how-do-i-keep-track-of-which-prediction-belongs-to-which-death)
 - [What data does the package expect?](#what-data-does-the-package-expect)
+- [How are my indicator columns preprocessed?](#how-are-my-indicator-columns-preprocessed)
+- [Can I check a config before I submit the job?](#can-i-check-a-config-before-i-submit-the-job)
 - [Some of my causes are very rare — what does the package do?](#some-of-my-causes-are-very-rare--what-does-the-package-do)
 - [YAML or JSON for config files?](#yaml-or-json-for-config-files)
 - [How do I publish and re-use a trained model?](#how-do-i-publish-and-re-use-a-trained-model)
@@ -372,6 +374,31 @@ A voting base model counts as finished only when both its trained model and its
 prediction files exist, so one interrupted during prediction is redone rather
 than half-reused.
 
+Resume is deliberately strict. Each training pipeline writes
+`resume_manifest.json`, fingerprinting the consumed train/test rows and the
+settings that affect its artifacts. With `resume=True`, existing artifacts are
+reused only when that signature matches exactly. A changed split, feature set,
+model spec, hyperparameter configuration or fused text raises and tells you to
+use a new `output_dir` or move the old artifacts. Pass `resume=False` only when
+you intend to rebuild the directory's artifacts from the current call.
+
+**Artifacts made before manifests existed: `resume="adopt"`.** A directory with
+artifacts but no `resume_manifest.json` is refused by default, because there is
+no signature to check. `resume="adopt"` (`--resume-adopt`) reuses it anyway and
+records the signature of the current call, so later runs are checked normally:
+
+```bash
+multimodalva run job.yaml --resume-adopt      # once, for a pre-manifest directory
+multimodalva run job.yaml                     # from here on, checked as usual
+```
+
+It warns every time, because nothing verified that those artifacts came from this
+data, split and settings — that is your judgement, not a check. It covers only
+the case where there is **no** signature: a manifest that is present and
+*disagrees* still raises, since a disagreement is evidence of a real difference
+rather than a missing check. Runs the current pipeline produces need no adoption;
+they carry a signature from the start.
+
 ## Can I combine runs I already finished, without retraining?
 
 Yes. `load_predictions()` reads any run's saved predictions back, and
@@ -433,7 +460,165 @@ qdesc = load_qdesc("multimodalva/utils/qdesc_who2016.csv")
 Both are curated tables — to add or change an indicator, edit the CSV
 (columns: `indic, qdesc, sdesc, type, yes, no, desc`).
 
+## How are my indicator columns preprocessed?
+
+Two settings, both on `run()` (and on `prepare_tabular_dataset()` underneath).
+Column types are auto-detected from the training split — `object`/`category`
+dtype becomes categorical, numeric dtype becomes numeric — or name them yourself
+with `cat_cols=` / `num_cols=`. The transformer is fitted on the training rows
+only, applied to both splits, and saved inside `model.joblib` so inference on new
+data repeats it exactly.
+
+**`encode_categoricals`** — four accepted values:
+
+| Value | What it does |
+|---|---|
+| `"ordinal"` (default) | `OrdinalEncoder`. Unknown categories become `-1`, and **missing stays missing** (`encoded_missing_value=np.nan`), so CatBoost, LightGBM and XGBoost can learn from missingness itself |
+| `"auto"` | **Identical to `"ordinal"`** — not a cleverer policy, just the tree-safe default under another name |
+| `"onehot"` | `OneHotEncoder(handle_unknown="ignore")`. Recommended for MLP and linear models, which would otherwise read the ordinal codes as a magnitude. Costs width: 353 indicators with three values each become roughly a thousand columns |
+| `None` | No encoding. The columns must already be numeric |
+
+**`scale_numeric`** — `StandardScaler` on the numeric columns; default `False`,
+because tree models do not need it. **It does nothing when there are no numeric
+columns.** That is the usual case for WHO-style indicator data: if the indicators
+are strings (`"Y"` / `"N"` / `"."`), every feature is categorical, the scaler is
+never added to the pipeline, and `scale_numeric=True` and `False` produce
+identical matrices. The line to check in your own log is:
+
+```
+Features: 0 numeric, 353 categorical. encode_categoricals=ordinal, scale_numeric=False.
+```
+
+**Per base model, in an ensemble.** Voting prepares each base model separately,
+so a spec may set its own:
+
+```python
+tabular_models=[
+    {"model_name": "lightgbm", "encode_categoricals": "ordinal"},
+    {"model_name": "mlp", "encode_categoricals": "onehot", "scale_numeric": True},
+]
+```
+
+Stacking cannot: it builds **one** shared feature matrix that the out-of-fold
+loop and the saved `X_test` both assume, so per-spec preprocessing is impossible
+there. A stacking spec that sets either key to something other than the run-level
+value now raises and says so, rather than being ignored. If the base models need
+different preprocessing, use voting, or train them as separate tabular runs and
+combine the saved predictions.
+
+## Can I check a config before I submit the job?
+
+Yes — `--dry-run` runs every step that happens before a model is built (argument
+checks, loading, filtering, the missing-row drop, the train/test split, feature
+resolution), reports what the run would do, and trains nothing.
+
+```
+$ multimodalva run job.yaml --dry-run
+task             text
+pipeline         TextClassifier
+model            bioclinicalbert -> emilyalsentzer/Bio_ClinicalBERT
+rows             4213 after filtering and the missing-row drop
+classes          11
+smallest class   17 row(s) ('Assault')
+split            random: test_size=0.2, stratify=True, split_seed=42
+hyperparameters  search: metric=csmf_accuracy, n_trials=40
+hpo backend      ray
+search space     the package default, adapted to this data
+search split     3-fold cross-validation
+
+error: max_lenght= is not accepted by TextClassifier. Did you mean max_length=?
+error: text column 'narrativ' is not in the data. Available: ['id', 'cause', ...]
+
+Dry run: 2 problem(s); the run would not get past them.
+```
+
+It exits 2 when anything would stop the run, so a job script can gate on it:
+
+```bash
+multimodalva run job.yaml --dry-run || exit 1
+multimodalva run job.yaml
+```
+
+One report names every problem it finds rather than only the first, so a config
+with three mistakes takes one look instead of three submissions.
+
+A config file is where this earns its keep. On the command line `argparse`
+already rejects a flag it does not know, but a config file's keys are passed
+straight through, so `max_lenght: 512` in YAML is accepted by the loader and
+only fails once the pipeline is reached. The check compares each key `run()`
+does not name against the signature of the class the task dispatches to, and the
+same comparison covers `init_kwargs` keys, model names and base-model specs.
+
+Among the things it reports before training:
+
+- more search folds than the rarest class has rows in the actual training
+  split — this is an error, because every fold must contain every class;
+- `init_kwargs={"text_models": ...}` alongside `text_models=`, where
+  `init_kwargs` wins and the other argument has no effect;
+- a filter value that matches no row, which otherwise surfaces as "no rows
+  remain after dropping missing label/text" — naming the step that noticed
+  rather than the value responsible.
+
+It performs the real split, so the reported train/test counts and HPO
+feasibility checks are based on the rows the model will actually see. It also
+rejects unknown base-model spec keys, one-model voting, constructor-only
+settings passed as run keywords, and modality inputs that do not match a
+feature-fusion strategy.
+
+**What a clean dry run does not promise.** It checks that the configuration is
+consistent with the data, not that the run will succeed. Nothing trains, so it
+cannot tell you whether a batch size fits in the GPU, whether the trial budget is
+enough for the search space, or whether an `Optimize(extra=...)` key means
+anything to the backend. It also cannot verify a Hugging Face Hub ID without
+network access, and it will not download a remote model to check it — a preflight
+that pulls half a gigabyte is no longer a preflight.
+
+From Python the same check is `preflight(**config)`, which takes exactly what
+`run()` takes and returns a report instead of printing one:
+
+```python
+from multimodalva import preflight
+
+report = preflight(task="tabular", data="clean.csv", label_col="cause",
+                   features="re:^i\d{3}[a-zA-Z]$", model="lightgbm")
+if not report["ok"]:
+    raise SystemExit("\n".join(report["problems"]))
+```
+
+`report["facts"]` holds the label → value pairs shown above, `report["notes"]`
+the silent-behaviour warnings, and `report["log"]` the lines the package itself
+emitted while checking.
+
 ## Some of my causes are very rare — what does the package do?
+
+Three separate thresholds decide what "too rare" means, and they do different
+things:
+
+| Threshold | Default | What happens |
+|---|---|---|
+| A class has fewer rows than `cv_folds` in the **training** rows | `cv_folds=3` | A search **raises**: a stratified fold cannot hold a class with fewer rows than there are folds. Lower `Optimize(cv_folds=...)`, or use `"auto"` (below) |
+| A class has fewer than 2 rows | fixed by scikit-learn | A stratified train/test split **raises**. `stratify=False` is the only way past it, and it may leave a class out of training |
+| A class has fewer than `SMALL_CLASS_MIN` rows on one side of a split | 5 | A **warning** only. Nothing is dropped, merged or changed |
+
+`Optimize(cv_folds="auto")` is the setting for data whose rarest cause you do not
+know in advance: it uses as many folds as the rarest training class supports, up
+to the default 3, and says in the log how many it chose and why. It still raises
+if a class has a single row, because no fold count is valid for that.
+
+```python
+mv.run(task="text", data="clean.csv", label_col="cause", text_col="narrative",
+       hyperparams=Optimize(n_trials=30, cv_folds="auto"))
+```
+
+Two things to know before using it. Trial scores average over however many folds
+it picked, so a 2-fold search is noisier than a 3-fold one and **the two are not
+comparable** — do not put them on one leaderboard. And the fold count that
+actually ran is what the run records, in its search-name signature and its
+per-fold trial columns, so an artifact never claims `"auto"`.
+
+`--dry-run` reports the resolved fold count before the job starts.
+
+
 
 It warns, and leaves the data alone.
 
@@ -741,11 +926,14 @@ the run.
 | `"optuna"` | one process, trials in sequence, resumable from its journal file | nothing extra |
 | `"ray"` | trials in parallel across the CPUs, GPUs or cluster nodes Ray can see | `[ray]` extra |
 
-**Status.** The Ray backend is implemented but has not yet been verified on a
-real multi-GPU or multi-node run — every test of it so far has been on a machine
-without a CUDA GPU, where the Ray entry points hand the work back to Optuna by
-design. Optuna is the backend behind the results this package was developed on.
-If you are the first to run Ray in anger, start with the smoke test below.
+**Status.** The Ray backend was verified on a two-GPU SLURM node on 2026-09-28,
+all twelve checks of `tests/hpc_ray_smoke.py` passing: both families searched with
+cross-validation, trials observed running concurrently in each, the run contract
+intact, and a stacking base model searched on Ray. It has been exercised on one
+cluster with one Ray version, so start with the smoke test below on yours — a Ray
+misconfiguration usually shows up as trials that queue forever or run one at a
+time, neither of which looks like an error. Optuna is what `"auto"` picks off a
+CUDA machine and is the backend this package was developed on.
 
 **It does not change what a trial means.** Both backends build the same search
 space, score each configuration the same way — k-fold CV over the training split
@@ -774,8 +962,15 @@ laptop also runs on the cluster.
 - **Trial budget.** `n_trials=None` means the family default, and Ray's is higher
   when ASHA is on (it prunes many trials early, so more are needed to saturate
   the search). Pass an explicit `n_trials` when you want the two comparable.
-- **Resume.** Optuna reattaches to a study by name in its journal file; Ray
-  restores an experiment directory. Both follow the run's `resume=`.
+- **Resume.** Optuna reattaches to a content-derived study name in its journal
+  file; Ray restores a content-derived experiment directory. Changing the data
+  or effective search configuration therefore starts a distinct state instead
+  of merging incompatible trials. An explicitly supplied study/experiment name
+  remains the caller's responsibility. Both follow the run's `resume=`. Ray's side
+  needs a `RunConfig`, which also fixes where the experiment is written; if the
+  log says `Could not create RunConfig`, resume is off for that run **and** Ray
+  falls back to `~/ray_results`, which on a cluster with a small home quota fills
+  up mid-search.
 
 **Check the backend works on your cluster before trusting a long run.**
 `tests/hpc_ray_smoke.py` runs the Ray path end to end on a GPU node — twelve
@@ -810,19 +1005,61 @@ file-for-file.
 
 Precedence, lowest to highest: the balanced reference space, then the adaptive
 adjustment for your training-set size and cause count, then LoRA or focal
-additions if those are on, then `Optimize(space=...)`, which overrides the
-result one key at a time.
+additions if those are on, then `Optimize(space=...)`.
 
-The run log records each layer. A line like
+**A key you name is searched over exactly the range you wrote.** The adaptive
+machinery runs on the defaults *before* your keys are applied, so nothing narrows,
+rescales or re-profiles a range you set. **A key you do not name keeps its adaptive
+value and is still searched** — a partial dict never silently shrinks the search.
+
+The run log states both halves:
 
 ```
 Tabular HPO adaptive search space: profile=wide, class_tier=few (n_samples=176, n_features=57, n_classes=11)
-search_space= replaced 1/5 default key(s): n_estimators.
+search_space= gave 2 key(s), used exactly as passed: learning_rate, n_estimators.
+The other 7 key(s) come from the adaptive space for this data and are searched too:
+colsample_bytree, max_depth, min_child_samples, num_leaves, reg_alpha, reg_lambda,
+subsample. Name them in search_space= to set them yourself.
 ```
 
-says the adaptive space was chosen for your data, and that you replaced exactly
-one of its keys. Keys you do not mention keep their adaptive value — passing a
-partial dict never silently drops the rest.
+So the space that actually ran is yours where you spoke and adaptive where you did
+not, and the log says which is which.
+
+**To hold one hyperparameter fixed while searching the others, give it a
+single-value range.** `hyperparams=` is one argument with one meaning at a time —
+a dict of fixed values means no search at all — so a search that pins a value does
+it inside the space:
+
+```python
+hyperparams=Optimize(space={
+    "learning_rate": ("float_log", 1e-5, 1e-3),   # searched
+    "batch_size":    ("categorical", [8]),        # pinned at 8
+})
+```
+
+Every trial then gets `batch_size=8`. Omitting a key does something different: it
+keeps that key's adaptive range and searches it.
+
+**A malformed space is refused when you build the `Optimize`, not when the search
+starts.** The searches run with per-trial errors caught so one bad configuration
+cannot kill a long search, which means a bad *space* would otherwise fail every
+trial quietly and reach the end of its budget with nothing completed — after the
+queue wait, on a cluster. So `None` in place of a range, a NaN bound, an empty
+choice list, a misspelled kind and a low above its high are all named up front:
+
+```
+ValueError: Optimize(space=...) is malformed:
+  learning_rate: low=nan is not finite; a NaN bound reaches the sampler as an
+  unreadable OverflowError
+  batch_size: ('categorical', []) — needs at least one choice. A single choice
+  pins the value, which is how a hyperparameter is held fixed while others are
+  searched.
+```
+
+This matters most for data fusion, where `batch_size` and
+`gradient_accumulation_steps` are calibrated so a long-context model fits on a GPU:
+a partial space keeps them rather than dropping them, which is what stops a
+two-key space from running out of memory.
 
 The run also says where the hyperparameters came from at all:
 
@@ -921,11 +1158,11 @@ in, because a name the label map does not know raises rather than scoring zero.
 
 ### What about InSilicoVA specifically?
 
-Running it *from* this package is a v1 item, not a feature. `pyinsilicova` does
+Running it *from* this package is a future item, not a feature. `pyinsilicova` does
 not install on Python 3.12+, which this package requires, and it cannot train a
 probbase against your own cause list — it works with InSilicoVA's native causes
-only. The `model_name="insilicova"` hook in the stacking code is unfinished
-scaffolding; do not read it as support.
+only. A stacking spec with `model_name="insilicova"` is rejected immediately;
+there is no partial hook that can appear to work.
 
 Run it where it runs — `pyinsilicova` if its native cause list fits your study,
 otherwise the R implementation — and bring the assignments back through the

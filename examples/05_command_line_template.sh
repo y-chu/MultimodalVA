@@ -20,6 +20,12 @@
 #
 # Everything else already has a working default. `set -e` stops at the first
 # error.
+#
+# Add --dry-run to any command below to check it against your data and stop
+# before anything is trained: it reports the rows, classes, split and feature
+# columns the run would use, names anything that would stop it, and exits
+# non-zero so an sbatch script can gate on it. Worth its few seconds in front of
+# a queued job.
 
 set -euo pipefail
 

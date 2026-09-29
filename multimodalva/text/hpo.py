@@ -18,6 +18,7 @@ Output: best_hyperparams dict and backend study / ResultGrid object
 
 from __future__ import annotations
 
+import hashlib
 import json
 import inspect
 import logging
@@ -72,9 +73,36 @@ from multimodalva.utils.metrics import (
     CV_METRICS,
     HPO_METRICS,
 )
+
+
+def _text_search_signature(train_dataset, config: dict) -> str:
+    """Content signature used to isolate default Optuna/Ray resume state."""
+    digest = hashlib.sha256()
+    digest.update(np.asarray(
+        _get_dataset_labels(train_dataset), dtype=np.int64
+    ).tobytes())
+    encodings = getattr(train_dataset, "encodings", None)
+    if encodings is not None:
+        for key in sorted(encodings):
+            digest.update(key.encode())
+            for sequence in encodings[key]:
+                value = sequence.detach().cpu().numpy()
+                digest.update(len(value).to_bytes(8, "little"))
+                digest.update(value.tobytes())
+    else:
+        for index in range(len(train_dataset)):
+            item = train_dataset[index]
+            for key in sorted(k for k in item if k != "labels"):
+                value = item[key]
+                value = value.detach().cpu().numpy() if hasattr(value, "detach") \
+                    else np.asarray(value)
+                digest.update(key.encode())
+                digest.update(np.ascontiguousarray(value).tobytes())
+    digest.update(json.dumps(config, sort_keys=True, default=str).encode())
+    return digest.hexdigest()[:16]
 from multimodalva.utils.runtime import RuntimeTracker, empty_accelerator_cache
 from multimodalva.utils.split import stratified_indices
-from multimodalva.utils.ray_compat import to_ray_space
+from multimodalva.utils.ray_compat import ray_trials_to_contract, to_ray_space
 from multimodalva.text.models import resolve_model_name
 from multimodalva.text.train import train_text, _get_dataset_labels
 from multimodalva.text.predict import predict_text
@@ -140,7 +168,7 @@ def optimize_text(
     val_size: float = 0.2,
     random_state: int = 42,
     split_seed: int | None = None,
-    study_name: str = "text_hpo",
+    study_name: str | None = None,
     use_lora: bool = False,
     use_focal: bool = False,
     gradient_checkpointing: bool = False,
@@ -195,7 +223,9 @@ def optimize_text(
                       Pass it separately to hold the partition fixed while
                       ``random_state`` reseeds the model.
                       Default 42.
-        study_name: Name for the Optuna study. Default "text_hpo".
+        study_name: Optuna study name. By default a content-derived name is
+                    used, so a JournalStorage file cannot silently mix trials
+                    from different tokenized data or search configurations.
         use_lora: Apply LoRA adapters during each trial. Default False.
         use_focal: Use focal loss during each trial.  When True, merges
                    FOCAL_SEARCH_SPACE (focal_gamma, class_weights) and fixes
@@ -286,6 +316,17 @@ def optimize_text(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Resolve "auto" here, before anything records the fold count: it feeds
+    # the search-name signature and the configuration this run reports, both
+    # of which have to say how many folds actually ran.
+    _all_labels = _get_dataset_labels(train_dataset)
+    if use_cv:
+        from ..utils.optimize_config import resolve_cv_folds  # noqa: PLC0415
+
+        n_cv_folds = resolve_cv_folds(
+            n_cv_folds, _all_labels, where="the text search", log=logger,
+        )
+
     runtime_tracker = RuntimeTracker(
         output_dir,
         report_name="hpo_runtime.json",
@@ -335,6 +376,23 @@ def optimize_text(
                 model_name, _cfg_cls.__name__,
             )
 
+    if study_name is None:
+        signature = _text_search_signature(train_dataset, {
+            "model_name": model_name,
+            "metric": metric,
+            "space": active_space,
+            "val_size": val_size,
+            "use_cv": use_cv,
+            "n_cv_folds": n_cv_folds,
+            "random_state": random_state,
+            "split_seed": split_seed,
+            "use_lora": use_lora,
+            "use_focal": use_focal,
+            "gradient_checkpointing": gradient_checkpointing,
+            "early_stopping_patience": early_stopping_patience,
+        })
+        study_name = f"text_hpo_{signature}"
+
     # JournalStorage (append-only log + fcntl locking) replaces SQLite as the
     # default backend.  It tolerates cloud-sync folders (Dropbox, iCloud) and
     # network filesystems where SQLite's page-lock protocol tends to break.
@@ -367,7 +425,6 @@ def optimize_text(
     storage_obj = optuna.storages.JournalStorage(_JBackend(storage_path))
 
     # --- Data split setup (fixed split only needed for use_cv=False) ---
-    _all_labels = _get_dataset_labels(train_dataset)
     _indices = list(range(len(train_dataset)))
     _split_seed = split_seed if split_seed is not None else random_state
     if not use_cv:
@@ -389,6 +446,14 @@ def optimize_text(
     # This removes fold-assignment variance from the HPO signal — trial differences
     # reflect hyperparameters only, not different random fold draws.
     if use_cv:
+        _, _class_counts = np.unique(_all_labels, return_counts=True)
+        _min_class_count = int(_class_counts.min())
+        if n_cv_folds > _min_class_count:
+            raise ValueError(
+                f"n_cv_folds={n_cv_folds} is greater than the minimum class "
+                f"count ({_min_class_count}) in train_dataset. Reduce "
+                "n_cv_folds or rebalance the data."
+            )
         _skf = StratifiedKFold(n_splits=n_cv_folds, shuffle=True, random_state=_split_seed)
         _cv_splits = [
             (train_idx.tolist(), val_idx.tolist())
@@ -778,14 +843,7 @@ def _ray_trial_fn(
     if use_focal:
         config = {**config, "loss_type": "focal"}
 
-    all_scores: dict[str, float] = {
-        "accuracy": 0.0,
-        "balanced_accuracy": 0.0,
-        "f1_macro": 0.0,
-        "f1_weighted": 0.0,
-        "csmf_accuracy": 0.0,
-        "log_loss": float("inf"),
-    }
+    all_scores: dict[str, float] = {}
     trial_started = time.perf_counter()
     trial_failed = False
 
@@ -878,8 +936,14 @@ def _ray_trial_fn(
     except Exception:
         trial_failed = True
         _trial_logger.exception(
-            "Ray trial failed (config=%s); reporting zero/inf scores.", config
+            "Ray trial failed (config=%s); propagating the error to Ray Tune.",
+            config,
         )
+        # Returning placeholder metrics marks the trial successful in Ray and
+        # defeats both Result.error and the all-trials-failed check. Ray Tune
+        # already contains failures to the affected trial, so surface the real
+        # exception and let the experiment continue with the remaining trials.
+        raise
 
     finally:
         # Free GPU / MPS memory before the next trial.
@@ -906,6 +970,24 @@ def _ray_trial_fn(
 # -----------------------
 # Main Ray HPO function
 # -----------------------
+def _run_config_with_checkpoint_config(storage_path: str, name: str):
+    """RunConfig that pins checkpoint_at_end=False (older Ray Train v2)."""
+    from ray.train import CheckpointConfig, RunConfig
+
+    return RunConfig(
+        storage_path=storage_path,
+        name=name,
+        checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
+    )
+
+
+def _run_config_plain(storage_path: str, name: str):
+    """RunConfig without a CheckpointConfig (newer Ray rejects the argument)."""
+    from ray.train import RunConfig
+
+    return RunConfig(storage_path=storage_path, name=name)
+
+
 def optimize_text_ray(
     train_dataset,
     label2id: dict,
@@ -1080,9 +1162,7 @@ def optimize_text_ray(
 
     # --- Experiment storage path (for resume) ---
     safe_name = model_name.replace("/", "_")
-    exp_name    = experiment_name or f"ray_hpo_{safe_name}"
     exp_storage = output_dir / "ray_experiment"
-    exp_path    = exp_storage / exp_name
 
     # --- Build effective search space: data-adaptive base → LoRA/focal merges → caller overrides ---
     n_samples = len(train_dataset)
@@ -1114,11 +1194,46 @@ def optimize_text_ray(
 
     ray_space = to_ray_space(active_space)
 
-    # --- Data split setup ---
-    if use_cv and n_cv_folds < 2:
-        raise ValueError("n_cv_folds must be >= 2 when use_cv=True.")
-
+    # Resolve "auto" here, before anything records the fold count: it feeds
+    # the search-name signature and the configuration this run reports, both
+    # of which have to say how many folds actually ran.
     all_labels = _get_dataset_labels(train_dataset)
+    if use_cv:
+        from ..utils.optimize_config import resolve_cv_folds  # noqa: PLC0415
+
+        n_cv_folds = resolve_cv_folds(
+            n_cv_folds, all_labels, where="the text Ray search", log=logger,
+        )
+
+    if experiment_name is None:
+        signature = _text_search_signature(train_dataset, {
+            "model_name": model_name,
+            "metric": metric,
+            "space": active_space,
+            "val_size": val_size,
+            "use_cv": use_cv,
+            "n_cv_folds": n_cv_folds,
+            "random_state": random_state,
+            "split_seed": split_seed,
+            "use_lora": use_lora,
+            "use_focal": use_focal,
+            "gradient_checkpointing": gradient_checkpointing,
+            "early_stopping_patience": early_stopping_patience,
+        })
+        exp_name = f"ray_hpo_{safe_name}_{signature}"
+    else:
+        exp_name = experiment_name
+    exp_path = exp_storage / exp_name
+
+    # --- Data split setup ---
+    # Only an explicit integer can be judged this early; "auto" is resolved
+    # against the class counts below.
+    if use_cv and isinstance(n_cv_folds, int) and n_cv_folds < 2:
+        raise ValueError(
+            'n_cv_folds must be >= 2 when use_cv=True, or "auto" to use as many '
+            "folds as the rarest class supports."
+        )
+
     _split_seed = split_seed if split_seed is not None else random_state
     opt_train = opt_val = None
     cv_splits: list[tuple[list[int], list[int]]] | None = None
@@ -1259,33 +1374,37 @@ def optimize_text_ray(
     #      trainables").  This is the preferred path.
     #   2. Plain RunConfig — fallback for older Ray versions that don't have
     #      CheckpointConfig or don't inject checkpoint_at_end.
+    # Losing this costs more than resume: without a RunConfig, Ray has no
+    # storage_path and writes the experiment to ~/ray_results, which on a cluster
+    # with a small home quota fills it up mid-run ("Disk quota exceeded" from the
+    # syncer, observed on a real GPU node 2026-09-28). So every variant that can
+    # set storage_path is tried before giving up.
+    #
+    # Ray versions disagree about CheckpointConfig(checkpoint_at_end=...):
+    #   * older Ray Train v2 auto-injects checkpoint_at_end=True for function
+    #     trainables and raises unless it is explicitly False;
+    #   * ray >= ~2.49 rejects the argument outright ("checkpoint_at_end is
+    #     deprecated since it does not apply to user-defined training functions").
+    # Both are ordinary exceptions, so each variant is tried in turn and only a
+    # failure of *all* of them disables persistence.
     _run_config = None
-    try:
-        from ray.train import RunConfig, CheckpointConfig
-        exp_storage.mkdir(parents=True, exist_ok=True)
-        _run_config = RunConfig(
-            storage_path=str(exp_storage.resolve()),
-            name=exp_name,
-            checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
-        )
-    except ImportError:
-        # CheckpointConfig not available — try plain RunConfig
+    _rc_errors: list[str] = []
+    for _variant, _build in (
+        ("with CheckpointConfig", _run_config_with_checkpoint_config),
+        ("plain", _run_config_plain),
+    ):
         try:
-            from ray.train import RunConfig  # noqa: F811
             exp_storage.mkdir(parents=True, exist_ok=True)
-            _run_config = RunConfig(
-                storage_path=str(exp_storage.resolve()),
-                name=exp_name,
-            )
-        except Exception as _rc_err2:
-            logger.warning(
-                "Could not create RunConfig — experiment state will not be persisted "
-                "(resume disabled for this run): %s", _rc_err2,
-            )
-    except Exception as _rc_err:
+            _run_config = _build(str(exp_storage.resolve()), exp_name)
+            break
+        except Exception as _rc_err:
+            _rc_errors.append(f"{_variant}: {_rc_err}")
+    if _run_config is None:
         logger.warning(
-            "Could not create RunConfig — experiment state will not be persisted "
-            "(resume disabled for this run): %s", _rc_err,
+            "Could not create RunConfig — experiment state will not be persisted, "
+            "resume is disabled for this run, and Ray will write under its default "
+            "~/ray_results instead of %s. Tried %s",
+            exp_storage, "; ".join(_rc_errors),
         )
 
     _tune_config = tune.TuneConfig(
@@ -1293,7 +1412,9 @@ def optimize_text_ray(
         mode=_ray_mode,
         num_samples=n_trials,
         search_alg=search_alg,
-        max_concurrent_trials=max_concurrent_trials,
+        # Concurrency is enforced by the ConcurrencyLimiter wrapped around
+        # search_alg above. Passing it here as well makes Ray warn that it is
+        # ignoring this one, which reads like the setting did not take effect.
         scheduler=_scheduler,
     )
 
@@ -1505,7 +1626,9 @@ def optimize_text_ray(
 
     # --- Save trial CSV ---
     if save_trials_csv:
-        results.get_dataframe().to_csv(output_dir / "hpo_trials.csv", index=False)
+        ray_trials_to_contract(results.get_dataframe(), metric).to_csv(
+            output_dir / "hpo_trials.csv", index=False
+        )
 
     # --- Remove Ray experiment directory (optional) ---
     # The ray_experiment/ tree holds Ray's per-trial artifacts (model weights,
@@ -1573,7 +1696,13 @@ def search_text(
         (``optuna.Study`` vs ``ray.tune.ResultGrid``), which is why callers store
         it without inspecting it.
     """
-    from ..utils.optimize_config import resolve_backend, resolve_pruning
+    from dataclasses import fields as dataclass_fields
+
+    from ..utils.optimize_config import (
+        resolve_backend,
+        resolve_pruning,
+        warn_unused_settings,
+    )
 
     backend = resolve_backend(search.backend)
     kwargs: dict[str, Any] = dict(
@@ -1588,6 +1717,22 @@ def search_text(
     # each apply its own rather than freezing one here.
     if search.n_trials is not None:
         kwargs["n_trials"] = search.n_trials
+
+    # space_profile sizes the *tabular* search space; the text spaces adapt to
+    # training-set size and class count on their own and have no profiles. Name
+    # it rather than dropping a setting the caller deliberately passed. Derived
+    # from the instance, so a field added to Optimize is honoured by default and
+    # has to be excluded here deliberately.
+    warn_unused_settings(
+        search,
+        frozenset(f.name for f in dataclass_fields(search)) - {"space_profile"},
+        pipeline="text search",
+        note=(
+            "The text search spaces adapt to sample size and class count on their "
+            "own; space_profile= applies to tabular searches."
+        ),
+        log=logger,
+    )
 
     if backend == "ray":
         if search.pruning is not None:

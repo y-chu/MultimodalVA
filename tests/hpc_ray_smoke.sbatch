@@ -45,10 +45,28 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=false
 
-# Ray writes its session state under /tmp by default, which on many clusters is
-# small or shared. Point it at node-local scratch when there is some.
-export RAY_TMPDIR="${TMPDIR:-/tmp}/ray_$SLURM_JOB_ID"
-mkdir -p "$RAY_TMPDIR"
+# Ray puts its session state here, and inside it a Unix domain socket whose full
+# path must fit in 107 bytes — a hard limit in the kernel, not something Ray can
+# work around. Ray itself appends about 65 characters
+# (ray/session_<timestamp>_<pid>/sockets/plasma_store), so this directory has to
+# stay under roughly 40. A $TMPDIR on project storage is typically far longer
+# than that: on one cluster it was /gpfs/projects/<acct>/<user>/tmp, and every
+# Ray start failed with "AF_UNIX path length cannot exceed 107 bytes". So prefer
+# a short node-local path, and say so plainly if none is short enough.
+for _candidate in "${SLURM_TMPDIR:-}" "/tmp" "${TMPDIR:-}"; do
+    [ -n "$_candidate" ] || continue
+    _try="$_candidate/ray_${SLURM_JOB_ID:-$$}"
+    if [ ${#_try} -le 40 ] && mkdir -p "$_try" 2>/dev/null; then
+        export RAY_TMPDIR="$_try"
+        break
+    fi
+done
+if [ -z "${RAY_TMPDIR:-}" ]; then
+    echo "ERROR: no directory short enough for Ray's socket path (needs <= ~40" >&2
+    echo "  characters). Set RAY_TMPDIR to a short node-local path and resubmit." >&2
+    exit 1
+fi
+echo "ray tmpdir    : $RAY_TMPDIR (${#RAY_TMPDIR} chars)"
 
 # The package unsets RAY_AIR_LOCAL_CACHE_DIR around its own tuner.fit() and
 # forces RAY_AIR_NEW_OUTPUT=0; nothing here needs to set either.

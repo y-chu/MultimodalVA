@@ -102,3 +102,73 @@ def get_ray_trial_dir() -> Path:
         "Unable to resolve the Ray Tune trial directory. "
         "Install a supported Ray Tune version or update the compatibility shim."
     )
+
+
+# Ray Tune bookkeeping columns: present in every ResultGrid dataframe, carry no
+# information about the search itself, and are dropped when the trials table is
+# written in the shape every reader expects.
+_RAY_BOOKKEEPING = frozenset({
+    "trial_id", "date", "timestamp", "pid", "hostname", "node_ip", "done",
+    "training_iteration", "time_this_iter_s", "time_since_restore",
+    "iterations_since_restore", "checkpoint_dir_name", "logdir",
+    "should_checkpoint", "experiment_tag",
+})
+
+
+def ray_trials_to_contract(df, metric: str):
+    """Map a Ray ``ResultGrid`` dataframe onto the trials-table contract.
+
+    Both backends write ``hpo/hpo_trials.csv``, but until 2026-09-28 the Ray path
+    wrote Ray's own dataframe into it: bare metric columns, ``config/<name>``,
+    ``trial_id``, ``logdir``. Every reader of that file expects Optuna's shape —
+    ``results/validation.py`` keys on ``value`` and ``user_attrs_*`` (and counts
+    folds from ``user_attrs_fold_<i>_<metric>``), ``results/vis_train.py`` on
+    ``value``/``duration``/``params_*``. Matching only the *file name* left
+    ``validation.json`` reading ``source="none"`` for a Ray-searched run and no
+    fold stability anywhere, which is what hpc_ray_smoke checks 4 and 5 caught on
+    the first real GPU run.
+
+    Args:
+        df:     ``results.get_dataframe()`` from a finished ``Tuner.fit()``.
+        metric: The objective, which becomes the ``value`` column.
+
+    Returns:
+        A new DataFrame; the input is not modified.
+    """
+    import pandas as pd
+
+    out = df.copy()
+
+    # Optuna's trials_dataframe() carries datetime_start / datetime_complete, and
+    # readers use them to tell whether trials overlapped. Ray reports `timestamp`
+    # (when the result came in) and `time_total_s`, so the pair is recoverable.
+    _start = _complete = None
+    if "timestamp" in out.columns:
+        _complete = pd.to_datetime(out["timestamp"], unit="s", errors="coerce")
+        if "time_total_s" in out.columns:
+            _start = _complete - pd.to_timedelta(out["time_total_s"], unit="s",
+                                                 errors="coerce")
+
+    renamed = {}
+    for col in out.columns:
+        if col in _RAY_BOOKKEEPING:
+            continue
+        if col.startswith("config/"):
+            renamed[col] = f"params_{col[len('config/'):]}"
+        elif col == "time_total_s":
+            renamed[col] = "duration"
+        else:
+            renamed[col] = f"user_attrs_{col}"
+    out = out[list(renamed)].rename(columns=renamed)
+
+    # `value` is the objective, as Optuna's trials_dataframe() spells it.
+    if _complete is not None:
+        out["datetime_complete"] = _complete
+    if _start is not None:
+        out["datetime_start"] = _start
+
+    objective = f"user_attrs_{metric}"
+    if objective in out.columns:
+        out.insert(0, "value", out[objective])
+    out.insert(0, "number", range(len(out)))
+    return out

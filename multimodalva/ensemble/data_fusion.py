@@ -48,6 +48,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import pandas as pd
@@ -169,8 +170,8 @@ def qdesc_feature_overlap(
     """Compare feature columns against qdesc indicator names.
 
     Useful before a data-fusion run: shows which tabular columns will be
-    converted to natural language (overlap), which will be silently skipped by
-    ``tabular_to_text()`` (only in data — add ``templates=`` to cover these),
+    converted through qdesc (overlap), which use template/binary fallback
+    rendering (only in data — add ``templates=`` to customise these),
     and which qdesc entries have no matching data column (only in qdesc).
 
     Args:
@@ -345,7 +346,7 @@ def _is_negative(val) -> bool:
 
 
 def _get_prefix(
-    row: pd.Series,
+    row: Mapping | pd.Series,
     prefix_cols: dict[str, str],
     fallback: str,
 ) -> str:
@@ -363,7 +364,7 @@ def _get_prefix(
         Subject string, e.g. "He", "The child", "The deceased".
     """
     for col, label in prefix_cols.items():
-        if col in row.index and _is_positive(row[col]):
+        if col in row and _is_positive(row[col]):
             return label
     return fallback
 
@@ -466,7 +467,7 @@ def _prepare_qdesc_context(
 # ---------------------------------------------------------------------------
 
 def tabular_to_text(
-    row: pd.Series,
+    row: Mapping | pd.Series,
     feature_cols: list[str],
     qdesc: pd.DataFrame | None = None,
     templates: dict[str, str] | None = None,
@@ -511,7 +512,7 @@ def tabular_to_text(
         - Otherwise: ``"col: value."`` pattern.
 
     Args:
-        row:            A single row from a DataFrame (pd.Series).
+        row:            A single DataFrame row, as a Series or mapping.
         feature_cols:   Column names to include in the description.
         qdesc:          Question-description DataFrame (from load_qdesc()).
                         Only the ``indic``, ``type``, and ``desc`` columns are
@@ -548,7 +549,7 @@ def tabular_to_text(
         qdesc = _get_default_qdesc()
 
     # Restrict to columns actually present in the row.
-    present_cols = [c for c in feature_cols if c in row.index]
+    present_cols = [c for c in feature_cols if c in row]
 
     parts: list[str] = []
 
@@ -742,7 +743,8 @@ def build_fused_text(
 
     qdesc_idx, demo_indics, non_demo_indics = _prepare_qdesc_context(qdesc)
 
-    if n_jobs is None:
+    auto_n_jobs = n_jobs is None
+    if auto_n_jobs:
         try:
             base_cpus = int(
                 os.environ.get(
@@ -759,7 +761,12 @@ def build_fused_text(
         n_jobs = max(1, base_cpus // max(1, world_size))
     n_jobs = max(1, int(n_jobs))
 
-    def _fuse_row(row: pd.Series) -> str:
+    # Process startup and serialisation cost more than they save on small data.
+    # Keep explicit n_jobs choices intact; only the automatic policy downshifts.
+    if auto_n_jobs and len(df) < max(256, 32 * n_jobs):
+        n_jobs = 1
+
+    def _fuse_row(row: Mapping | pd.Series) -> str:
         tab_text  = tabular_to_text(
             row,
             feature_cols=feature_cols,
@@ -782,18 +789,23 @@ def build_fused_text(
     if n_jobs > 1 and len(df) > 0:
         try:
             from joblib import Parallel, delayed  # noqa: PLC0415
-            fused_values = Parallel(n_jobs=n_jobs, prefer="processes")(
-                delayed(_fuse_row)(row) for _, row in df.iterrows()
-            )
-            fused = pd.Series(fused_values, index=df.index)
-        except Exception as exc:
+        except ImportError:
             logger.warning(
-                "Parallel fused-text generation failed (n_jobs=%d). "
-                "Falling back to single-process mode. Error: %s",
-                n_jobs,
-                exc,
+                "joblib is unavailable; generating fused text in one process."
             )
             fused = df.apply(_fuse_row, axis=1)
+        else:
+            # Sending an entire pandas Series (index, dtype metadata, name) for
+            # every task is expensive. Plain records carry only consumed values.
+            required_cols = list(dict.fromkeys(
+                [text_col] + list(feature_cols) + list((prefix_cols or DEFAULT_PREFIX_COLS))
+            ))
+            required_cols = [col for col in required_cols if col in df.columns]
+            records = df.loc[:, required_cols].to_dict(orient="records")
+            fused_values = Parallel(n_jobs=n_jobs, prefer="processes")(
+                delayed(_fuse_row)(row) for row in records
+            )
+            fused = pd.Series(fused_values, index=df.index)
     else:
         fused = df.apply(_fuse_row, axis=1)
 

@@ -58,6 +58,13 @@ DOC_PLAN: dict[str, list[dict]] = {
         },
         {
             "kind": "standalone",
+            "anchor": "api-preflight",
+            "heading": "preflight()",
+            "file": "multimodalva/runner.py",
+            "name": "preflight",
+        },
+        {
+            "kind": "standalone",
             "anchor": "api-optimize",
             "heading": "Optimize",
             "file": "multimodalva/utils/optimize_config.py",

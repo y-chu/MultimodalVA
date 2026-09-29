@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 from .utils.seeds import reject_removed_seed_args
 from .utils.optimize_config import Optimize  # noqa: E402
 
-__all__ = ["run", "SUPPORTED_TASKS"]
+__all__ = ["run", "preflight", "SUPPORTED_TASKS"]
 
 # Canonical task name -> internal handler key. Aliases fold onto canonical names
 # so users can write the natural word ("voting") or the internal method name.
@@ -210,6 +210,12 @@ def run(
         raise TypeError(
             "resume_training= is now resume=, the same name every task uses."
         )
+    if "resume" in run_kwargs:
+        # Checked here rather than at the guard inside the pipeline, which is
+        # reached only after the data has been loaded and split.
+        from .utils.provenance import _normalise_resume
+
+        _normalise_resume(run_kwargs["resume"], f"run(task={task!r})")
 
     canonical = _normalize_task(task)
     # Stacking's stage 2 reads everything — rows, split, seeds, label maps —
@@ -226,6 +232,9 @@ def run(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     init_kwargs = dict(init_kwargs or {})
+    requires_text, requires_features = _required_modalities(
+        canonical, text_models, tabular_models, init_kwargs
+    )
 
     # --- 1-3. Load, filter, drop-missing, resolve split marker --------------
     if reuses_oof:
@@ -239,19 +248,20 @@ def run(
             filters=filters,
             split=split,
             id_col=id_col,
+            requires_text=requires_text,
         )
 
     # --- 4. Resolve feature columns (tabular / fusion / tabular base models) --
     feature_cols = None
     if not reuses_oof and (
-        canonical in _FEATURE_TASKS or (tabular_models and canonical in _ENSEMBLE_METHODS)
+        requires_features
     ):
         feature_cols = _resolve_features(
             df, features, label_col, text_col, filters, split_col, id_col=id_col
         )
         logger.info("Running on %d feature columns.", len(feature_cols))
 
-    if canonical in _TEXT_TASKS and not text_col:
+    if requires_text and not text_col:
         raise ValueError(f"task={task!r} requires text_col.")
 
     # --- 5. Dispatch --------------------------------------------------------
@@ -293,6 +303,746 @@ def run(
 
 
 # ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+#: Destination class per single-model task, as ``(module, class name)``. The four
+#: ensemble tasks read theirs from ``SUPPORTED_METHODS``, so that mapping is not
+#: copied here and cannot drift from it.
+_SINGLE_MODEL_TARGETS: dict[str, tuple[str, str]] = {
+    "text": ("multimodalva.text.text_classifier", "TextClassifier"),
+    "tabular": ("multimodalva.tabular.tabular_classifier", "TabularClassifier"),
+}
+
+#: Keyword names :func:`_dispatch` computes and supplies itself, and that are not
+#: also named parameters of :func:`run`. One of these passed to :func:`run`
+#: travels in ``**run_kwargs`` and arrives at the pipeline a second time, where
+#: it raises a duplicate-keyword ``TypeError``.
+_DISPATCH_SUPPLIED = frozenset({"df", "split_col", "model_name"})
+
+#: Flat keywords :func:`_dispatch` deliberately routes to the *constructor* for a
+#: given task, rather than forwarding to ``.run()``. Stacking keeps ``resume`` on
+#: the object because one object spans several stage calls, so ``resume=`` is the
+#: documented spelling there even though it is not a parameter of its ``run()``.
+_DISPATCH_ROUTED_TO_CTOR: dict[str, frozenset[str]] = {
+    "stacking": frozenset({"resume"}),
+}
+
+#: What each pipeline counts as "there is prior work here", mirroring the
+#: ``artifacts_exist=`` expression at its own ``enforce_resume_manifest()`` call.
+#: Preflight has to agree with those exactly, or it reports a directory as
+#: resumable that the run then refuses (or the reverse). Kept in step by
+#: ``test_every_task_has_a_resume_artifact_list``.
+_RESUME_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    "text":           ("hpo", "final", "predictions"),
+    "tabular":        ("hpo", "final", "predictions"),
+    "data_fusion":    ("hpo", "final", "predictions"),
+    "feature_fusion": ("automm_model", "hpo", "predictions"),
+    "soft_voting":    ("base_models", "predictions"),
+    "stacking":       ("oof", "hpo", "final", "label2id.json"),
+}
+
+
+def _resume_dir(output_dir: "str | Path", canonical: str) -> Path:
+    """Where the pipeline for ``canonical`` keeps its own artifacts.
+
+    An ensemble strategy is handed ``output_dir / method`` by
+    :class:`EnsembleClassifier`, so its manifest is one level down from the
+    ``output_dir`` the caller passed.
+    """
+    root = Path(str(output_dir))
+    return root / canonical if canonical in _ENSEMBLE_METHODS else root
+
+
+class _LogCapture(logging.Handler):
+    """Collects the INFO lines the package emits while a preflight runs.
+
+    The interesting facts — how many rows the filters left, which columns the
+    feature regex matched, which base model kept its own hyperparameters — are
+    already logged by the functions a preflight calls. Capturing them is exact
+    by construction, where a second implementation in the report would drift.
+    """
+
+    def __init__(self, sink: list[str]):
+        super().__init__(level=logging.INFO)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._sink.append(record.getMessage())
+
+
+def _run_default(name: str) -> Any:
+    """The default :func:`run` gives ``name``, read from its own signature."""
+    import inspect
+
+    return inspect.signature(run).parameters[name].default
+
+
+def _signature_names(fn) -> set[str] | None:
+    """Parameter names ``fn`` accepts, or ``None`` when it takes ``**kwargs``.
+
+    ``None`` means *not checkable*: a catch-all accepts every spelling, so
+    calling one of them unknown would be a guess. Every pipeline class spells
+    its arguments out today; this keeps the check honest if one stops.
+    """
+    import inspect
+
+    sig = inspect.signature(fn)
+    if any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values()):
+        return None
+    return {p.name for p in sig.parameters.values() if p.name != "self"}
+
+
+def _kwarg_targets(canonical: str) -> tuple[set[str] | None, set[str] | None, str]:
+    """``(constructor params, run params, class name)`` for a task's pipeline class.
+
+    Raises:
+        ImportError: when the task's optional dependency is not installed. That
+            is worth reporting rather than hiding: it is the failure a cluster
+            job discovers only after it has waited for the queue.
+    """
+    import importlib
+
+    if canonical in _SINGLE_MODEL_TARGETS:
+        module, cls_name = _SINGLE_MODEL_TARGETS[canonical]
+        cls = getattr(importlib.import_module(module), cls_name)
+    else:
+        from .ensemble.ensemble_classifier import SUPPORTED_METHODS
+
+        cls = SUPPORTED_METHODS[canonical]
+    return _signature_names(cls.__init__), _signature_names(cls.run), cls.__name__
+
+
+def _describe_text_model(name: str) -> tuple[str, str | None]:
+    """``(description, problem)`` for a text model name, **without downloading it**.
+
+    A remote model is reported as a pending download rather than fetched: a
+    preflight that pulls half a gigabyte is no longer a preflight.
+    """
+    import difflib
+
+    from .text.models import REMOTE_MODELS, TEXT_MODELS, resolve_model_name
+
+    if name in TEXT_MODELS:
+        return f"{name} -> {TEXT_MODELS[name]}", None
+    if name in REMOTE_MODELS:
+        return f"{name} -> downloaded to ~/.cache/multimodalva on first use", None
+    if Path(name).expanduser().is_dir():
+        return f"{name} (local directory)", None
+    try:
+        # Everything that downloads has already returned; this only raises for
+        # the spellings that could mean either biomedical RoBERTa.
+        resolve_model_name(name)
+    except ValueError as exc:
+        return name, str(exc)
+    # A Hub ID cannot be verified without network access, so an unknown name is
+    # not an error. It usually is a typo though, and a close package alias says
+    # so much more usefully than a download failure an hour later would.
+    close = difflib.get_close_matches(name, sorted(TEXT_MODELS), n=1)
+    if close and "/" not in name:
+        return (f"{name} (no package alias of this name — did you mean "
+                f"{close[0]!r}? Otherwise it is passed to Hugging Face as a Hub "
+                "ID, which cannot be verified without network access)"), None
+    return (f"{name} (no package alias of this name — passed to Hugging Face as a "
+            "Hub ID, which cannot be verified without network access)"), None
+
+
+def _describe_tabular_model(name: str) -> tuple[str, str | None]:
+    """``(description, problem)`` for a tabular model name."""
+    import difflib
+
+    from .tabular.train import TABULAR_MODELS
+
+    if name in TABULAR_MODELS:
+        return f"{name} -> {TABULAR_MODELS[name][1]}", None
+    close = difflib.get_close_matches(name, sorted(TABULAR_MODELS), n=1)
+    hint = f" Did you mean {close[0]!r}?" if close else ""
+    return name, (f"model={name!r} is not a tabular model. Choose from: "
+                  f"{', '.join(sorted(TABULAR_MODELS))}.{hint}")
+
+
+def preflight(**config: Any) -> dict:
+    """Check a :func:`run` configuration without training anything.
+
+    Takes the same keyword arguments as :func:`run` and performs every step that
+    happens *before* a model is built — argument policing, loading, filtering,
+    the missing-row drop, the train/test split, feature-column resolution — then
+    stops. On a cluster that turns a mistyped column name from a job that
+    queues, starts, and dies into an answer in seconds on the login node.
+
+    Unlike :func:`run` it does not raise on a bad configuration. Every problem it
+    finds is collected, so one call names all of them instead of only the first,
+    and ``ok`` says whether :func:`run` would get past this point.
+
+    Args:
+        **config: Exactly what :func:`run` takes. Keywords :func:`run` does not
+            name are checked against the signature of the class the task
+            dispatches to, which is where an unrecognised one would land.
+
+    Returns:
+        A report dict:
+
+        ``ok``
+            ``False`` if anything in ``problems`` would stop the run.
+        ``task``
+            The canonical task name, or ``None`` if even that could not be read.
+        ``problems``
+            Configuration errors, each already phrased for a reader.
+        ``notes``
+            Things worth knowing that are not errors — a degradation the run
+            would accept silently, a setting that overrides another.
+        ``facts``
+            Ordered label -> value pairs describing the run that would happen.
+        ``log``
+            The INFO lines the package emitted while checking.
+
+    What a clean preflight does **not** promise. It checks that the
+    configuration is consistent with the data, not that the run will succeed:
+    nothing here trains, so it cannot tell whether a batch size fits in the GPU,
+    whether the trial budget is enough for the search space, or whether an
+    ``Optimize(extra=...)`` key means anything to the backend.
+
+    Example:
+        ::
+
+            import multimodalva as mv
+
+            report = mv.preflight(task="tabular", data="clean.csv",
+                                  label_col="cause", features="re:^i\\d{3}$",
+                                  model="lightgbm")
+            if not report["ok"]:
+                raise SystemExit("\\n".join(report["problems"]))
+    """
+    problems: list[str] = []
+    notes: list[str] = []
+    facts: dict[str, str] = {}
+    captured: list[str] = []
+
+    pkg_logger = logging.getLogger(__package__)
+    handler = _LogCapture(captured)
+    previous_level = pkg_logger.level
+    pkg_logger.addHandler(handler)
+    if not pkg_logger.isEnabledFor(logging.INFO):
+        pkg_logger.setLevel(logging.INFO)
+    try:
+        canonical = _preflight_checks(dict(config), problems, notes, facts)
+    finally:
+        pkg_logger.removeHandler(handler)
+        pkg_logger.setLevel(previous_level)
+
+    return {
+        "ok": not problems,
+        "task": canonical,
+        "problems": problems,
+        "notes": notes,
+        "facts": facts,
+        "log": captured,
+    }
+
+
+def _preflight_checks(config: dict, problems: list[str], notes: list[str],
+                      facts: dict[str, str]) -> str | None:
+    """Every check :func:`preflight` runs, in dependency order.
+
+    Later stages are skipped when what they need is already known to be broken,
+    but independent stages all run, so one report names every problem at once.
+    """
+    import difflib
+    import inspect
+
+    # --- the task name ------------------------------------------------------
+    task = config.get("task")
+    try:
+        canonical = _normalize_task(task)
+    except (ValueError, KeyError) as exc:
+        problems.append(str(exc))
+        return None
+    facts["task"] = canonical if canonical == task else f"{canonical} (from {task!r})"
+
+    # --- arguments that no longer exist ------------------------------------
+    removed = {k: config[k] for k in ("random_state", "set_seed", "automm_seed")
+               if k in config}
+    if removed:
+        try:
+            reject_removed_seed_args(f"run(task={task!r})", **removed)
+        except TypeError as exc:
+            problems.append(str(exc))
+    if "resume_training" in config:
+        problems.append(
+            "resume_training= is now resume=, the same name every task uses."
+        )
+
+    # --- keywords the pipeline would not recognise ---------------------------
+    try:
+        ctor_params, run_params, cls_name = _kwarg_targets(canonical)
+    except ImportError as exc:
+        ctor_params = run_params = None
+        cls_name = canonical
+        problems.append(
+            f"task={canonical!r} cannot be imported in this environment: {exc}. "
+            "Install the extra it needs before submitting — on a cluster this is "
+            "the failure that waits for the queue first."
+        )
+    facts["pipeline"] = cls_name
+    init_kwargs = config.get("init_kwargs") or {}
+    requires_text, requires_features = _required_modalities(
+        canonical, config.get("text_models"), config.get("tabular_models"),
+        init_kwargs if isinstance(init_kwargs, dict) else {},
+    )
+
+    named = set(inspect.signature(run).parameters) - {"run_kwargs"}
+    already_reported = set(removed) | {"resume_training"}
+    extras = sorted(k for k in config
+                    if k not in named and k not in already_reported)
+    if extras and ctor_params is None and run_params is None:
+        notes.append(
+            f"{cls_name} accepts **kwargs, so these could not be checked: "
+            f"{', '.join(extras)}."
+        )
+    else:
+        accepted = (ctor_params or set()) | (run_params or set())
+        for key in extras:
+            if key in _DISPATCH_SUPPLIED:
+                problems.append(
+                    f"{key}= is computed by run() itself. Passing it as well "
+                    f"makes {cls_name} receive it twice, which raises there."
+                )
+                continue
+            if key in (run_params or set()):
+                continue
+            if key in _DISPATCH_ROUTED_TO_CTOR.get(canonical, frozenset()):
+                # run() moves this one to the constructor itself, so a flat
+                # keyword is the documented spelling rather than a mistake.
+                continue
+            if key in (ctor_params or set()):
+                problems.append(
+                    f"{key}= is a constructor setting of {cls_name}, but flat "
+                    "extra keywords are forwarded to .run(). Put it inside "
+                    f"init_kwargs={{'{key}': ...}}."
+                )
+                continue
+            close = difflib.get_close_matches(key, sorted(accepted | named), n=1)
+            hint = f" Did you mean {close[0]}=?" if close else ""
+            problems.append(f"{key}= is not accepted by {cls_name}.{hint}")
+
+    if isinstance(init_kwargs, dict) and ctor_params:
+        for key in sorted(init_kwargs):
+            if key in ctor_params:
+                if key in {"text_models", "tabular_models"} and config.get(key):
+                    notes.append(
+                        f"init_kwargs[{key!r}] and {key}= are both set. "
+                        f"init_kwargs wins, so {key}= would have no effect."
+                    )
+                continue
+            close = difflib.get_close_matches(key, sorted(ctor_params), n=1)
+            hint = f" Did you mean {close[0]!r}?" if close else ""
+            problems.append(
+                f"init_kwargs[{key!r}] is not accepted by {cls_name}(...).{hint}"
+            )
+
+    # --- the narrative column ----------------------------------------------
+    text_col = config.get("text_col")
+    if requires_text and not text_col:
+        problems.append(f"task={task!r} requires text_col.")
+    if canonical == "feature_fusion" and not requires_text and config.get("model"):
+        notes.append(
+            "fusion_strategy='tabular_only' does not use model=; no text "
+            "checkpoint will be resolved or downloaded."
+        )
+
+    # --- the model ----------------------------------------------------------
+    model = config.get("model")
+    if model:
+        if canonical in {"text", "data_fusion"}:
+            described, problem = _describe_text_model(str(model))
+        elif canonical == "tabular":
+            described, problem = _describe_tabular_model(str(model))
+        else:
+            described, problem = str(model), None
+        facts["model"] = described
+        if problem:
+            problems.append(problem)
+    elif canonical in _ENSEMBLE_METHODS:
+        facts["model"] = "per base-model spec"
+    else:
+        facts["model"] = "the pipeline default"
+
+    effective_specs = {
+        "text_models": init_kwargs.get("text_models", config.get("text_models"))
+        if isinstance(init_kwargs, dict) else config.get("text_models"),
+        "tabular_models": init_kwargs.get("tabular_models", config.get("tabular_models"))
+        if isinstance(init_kwargs, dict) else config.get("tabular_models"),
+    }
+    if canonical == "soft_voting" and sum(
+        len(effective_specs[k] or []) for k in effective_specs
+    ) < 2:
+        problems.append("voting requires at least 2 base models in total.")
+    if (canonical == "stacking" and config.get("oof_from") is None
+            and not any(effective_specs.values())):
+        problems.append(
+            "stacking requires at least one base model unless oof_from= reuses "
+            "a completed stage 1."
+        )
+
+    if canonical in {"soft_voting", "stacking"}:
+        from .utils.optimize_config import validate_base_model_specs
+
+        if canonical == "soft_voting":
+            from .ensemble.voting import (
+                VOTING_TABULAR_SPEC_KEYS, VOTING_TEXT_SPEC_KEYS,
+            )
+            allowed_text, allowed_tabular = (
+                VOTING_TEXT_SPEC_KEYS, VOTING_TABULAR_SPEC_KEYS,
+            )
+        else:
+            from .ensemble.stacking import (
+                STACKING_TABULAR_SPEC_KEYS, STACKING_TEXT_SPEC_KEYS,
+            )
+            allowed_text, allowed_tabular = (
+                STACKING_TEXT_SPEC_KEYS, STACKING_TABULAR_SPEC_KEYS,
+            )
+        for key, allowed in (("text_models", allowed_text),
+                             ("tabular_models", allowed_tabular)):
+            try:
+                validate_base_model_specs(
+                    effective_specs[key], allowed, setting=key
+                )
+            except (TypeError, ValueError) as exc:
+                problems.append(str(exc))
+
+    for key, describe in (("text_models", _describe_text_model),
+                          ("tabular_models", _describe_tabular_model)):
+        specs = effective_specs[key]
+        if not specs:
+            continue
+        facts[key] = f"{len(specs)} spec(s)"
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            name = (spec or {}).get("model_name")
+            if not name:
+                problems.append(f"a {key} spec has no model_name.")
+                continue
+            described, problem = describe(str(name))
+            if problem:
+                problems.append(f"{key}: {problem}")
+            elif "did you mean" in described:
+                notes.append(f"{key}: {described}")
+
+    # --- the data -----------------------------------------------------------
+    df: "pd.DataFrame | None" = None
+    train_preview: "pd.DataFrame | None" = None
+    split_col: str | None = None
+    label_col = config.get("label_col")
+    reuses_oof = canonical == "stacking" and config.get("oof_from") is not None
+    if reuses_oof:
+        oof = Path(str(config["oof_from"]))
+        facts["stage 2 only"] = f"rows, split and seeds come from {oof}"
+        if not oof.exists():
+            problems.append(f"oof_from={str(oof)!r} does not exist.")
+    elif config.get("data") is None or label_col is None:
+        problems.append(
+            f"run(task={task!r}) needs data= and label_col=. Only stacking with "
+            "oof_from= may omit them: that call reuses the rows, split and seeds "
+            "of the run it points at."
+        )
+    else:
+        try:
+            df, split_col = _prepare_dataframe(
+                data=config["data"], canonical=canonical, label_col=label_col,
+                text_col=text_col, filters=config.get("filters"),
+                split=config.get("split"), id_col=config.get("id_col"),
+                requires_text=requires_text,
+            )
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            problems.append(str(exc))
+            # "no rows remain" names the step that noticed, not the filter value
+            # that emptied the frame. Say which value matched nothing, since a
+            # misspelt filter is the usual reason a run ends up with no rows.
+            notes.extend(_unmatched_filter_values(config))
+
+    if df is not None:
+        facts["rows"] = f"{len(df)} after filtering and the missing-row drop"
+        counts = df[label_col].value_counts()
+        facts["classes"] = str(len(counts))
+        smallest, rarest = int(counts.iloc[-1]), counts.index[-1]
+        facts["smallest class"] = f"{smallest} row(s) ({rarest!r})"
+        # Perform the same split the real pipeline will perform. Besides making
+        # the reported counts exact, this ensures HPO feasibility is checked on
+        # the training side rather than on rows that will be held out for test.
+        try:
+            from .utils.split import split as split_dataframe
+
+            train_preview, test_preview = split_dataframe(
+                df,
+                label_col=label_col,
+                text_col=text_col if requires_text else None,
+                test_size=config.get("test_size", _run_default("test_size")),
+                random_state=config.get("split_seed", _run_default("split_seed")),
+                stratify=config.get("stratify", _run_default("stratify")),
+                split_col=split_col,
+            )
+            source = "supplied" if split_col is not None else "random"
+            if split_col is None:
+                facts["split"] = (
+                    f"{source}: {len(train_preview)} train / {len(test_preview)} "
+                    f"test (test_size={config.get('test_size', _run_default('test_size'))}, "
+                    f"stratify={config.get('stratify', _run_default('stratify'))})"
+                )
+            else:
+                facts["split"] = (
+                    f"{source}: {len(train_preview)} train / {len(test_preview)} test"
+                )
+        except (ValueError, TypeError) as exc:
+            problems.append(str(exc))
+
+    # --- the feature columns ------------------------------------------------
+    wants_features = requires_features
+    if df is not None and wants_features:
+        try:
+            cols = _resolve_features(
+                df, config.get("features"), label_col, text_col,
+                config.get("filters"), split_col, id_col=config.get("id_col"),
+            )
+            facts["feature columns"] = (
+                f"{len(cols)} resolved" + (f" (first: {cols[0]})" if cols else "")
+            )
+        except ValueError as exc:
+            problems.append(str(exc))
+
+    # --- resume -------------------------------------------------------------
+    _preflight_resume(config, canonical, problems, notes, facts)
+
+    # --- hyperparameters ----------------------------------------------------
+    _preflight_hyperparams(
+        config, canonical, train_preview, problems, notes, facts
+    )
+    return canonical
+
+
+def _preflight_resume(config: dict, canonical: str, problems: list[str],
+                      notes: list[str], facts: dict[str, str]) -> None:
+    """Report what ``resume=`` would do to whatever is already in output_dir.
+
+    The expensive mistake is discovering after the queue that a directory cannot
+    be resumed, so this looks at the directory now.
+    """
+    from .utils.provenance import _normalise_resume
+
+    try:
+        resume, adopt = _normalise_resume(config.get("resume", True),
+                                          f"run(task={canonical!r})")
+    except ValueError as exc:
+        problems.append(str(exc))
+        return
+
+    output_dir = _resume_dir(config.get("output_dir", _run_default("output_dir")),
+                             canonical)
+    manifest = output_dir / "resume_manifest.json"
+    artifacts = [name for name in _RESUME_ARTIFACTS[canonical]
+                 if (output_dir / name).exists()]
+
+    if not resume:
+        facts["resume"] = "off — artifacts in output_dir are rebuilt"
+        return
+    if not artifacts:
+        facts["resume"] = "on — no reusable artifacts in output_dir yet"
+        return
+    present = ", ".join(artifacts)
+    if manifest.is_file():
+        facts["resume"] = (
+            f"on — {present} present with a signature, reused only if it "
+            "matches this call"
+        )
+    elif adopt:
+        facts["resume"] = f"adopt — {present} present, no signature"
+        notes.append(
+            f'resume="adopt" will reuse the existing {present} in {output_dir} '
+            "without verifying them: nothing recorded what data, split or "
+            "settings produced them. The signature of this call is written, so "
+            "later runs are checked normally. Use resume=False to rebuild them."
+        )
+    else:
+        facts["resume"] = f"BLOCKED — {present} present, no signature"
+        problems.append(
+            f"{output_dir} already holds {present} but no resume_manifest.json, "
+            "so resume=True cannot verify they came from this data and "
+            'configuration. Use a new output_dir, resume="adopt" to accept them '
+            "deliberately (runs made before resume manifests existed), or "
+            "move/remove them and rerun."
+        )
+
+
+def _unmatched_filter_values(config: dict) -> list[str]:
+    """Filter values that match no row, for when the data stage left nothing.
+
+    Reloads the data — only on the failure path, where a second read costs far
+    less than the wrong diagnosis does.
+    """
+    filters = config.get("filters")
+    if not filters:
+        return []
+    try:
+        raw = _load_df(config.get("data"))
+    except Exception:  # the load itself is what failed; nothing to add
+        return []
+    out = []
+    for col, value in filters.items():
+        if col not in raw.columns:
+            continue
+        wanted = list(value) if isinstance(value, (list, tuple, set)) else [value]
+        present = set(raw[col].dropna().unique())
+        missing = [v for v in wanted if v not in present]
+        if missing:
+            sample = sorted(str(v) for v in present)[:8]
+            out.append(
+                f"filters[{col!r}]: {missing} match no row. The column holds "
+                f"{len(present)} distinct value(s), e.g. {sample}."
+            )
+    return out
+
+
+def _preflight_hyperparams(config: dict, canonical: str, train_df,
+                           problems: list[str],
+                           notes: list[str], facts: dict[str, str]) -> None:
+    """Report where hyperparameters come from, and what the class sizes allow.
+
+    The class-size checks are the ones worth having: a search splits the
+    training rows again, and a class too small to appear in every fold is the
+    difference between a silent degradation and a run that stops.
+    """
+    hyperparams = config.get("hyperparams")
+    if hyperparams is None:
+        facts["hyperparameters"] = "the model library's own defaults — no search"
+        return
+    if not isinstance(hyperparams, Optimize):
+        n = len(hyperparams) if isinstance(hyperparams, dict) else "?"
+        facts["hyperparameters"] = f"fixed: {n} value(s) as given — no search"
+        return
+
+    import os
+
+    from .utils.optimize_config import ray_is_available, resolve_backend
+
+    facts["hyperparameters"] = (
+        f"search: metric={hyperparams.metric}, n_trials="
+        f"{hyperparams.n_trials if hyperparams.n_trials else 'pipeline default'}"
+    )
+
+    if canonical == "feature_fusion":
+        from .ensemble.feature_fusion import FEATURE_FUSION_HONOURED_SETTINGS
+        from .utils.optimize_config import warn_unused_settings
+
+        dropped = warn_unused_settings(
+            hyperparams,
+            FEATURE_FUSION_HONOURED_SETTINGS,
+            pipeline="feature_fusion",
+            note=(
+                "AutoMM uses hpo_scheduler=/hpo_searcher=, its own holdout, "
+                "and the classifier's eval_metric=."
+            ),
+            log=logger,
+        )
+        if dropped:
+            notes.append(
+                "feature_fusion ignores these explicitly changed Optimize "
+                f"settings: {', '.join(dropped)}. Configure AutoMM with "
+                "init_kwargs={'eval_metric': ...} and the pipeline's "
+                "hpo_scheduler=/hpo_searcher= arguments instead."
+            )
+        facts["hpo backend"] = "AutoMM built-in search"
+        facts["search split"] = "AutoMM's own training holdout"
+        if hyperparams.space:
+            facts["search space"] = (
+                f"{len(hyperparams.space)} AutoMM key(s) given; package "
+                "defaults supply the remaining search dimensions"
+            )
+        else:
+            facts["search space"] = "the package's default AutoMM space"
+        return
+
+    requested = hyperparams.backend
+    resolved = resolve_backend(requested, warn=False)
+    facts["hpo backend"] = (
+        resolved if resolved == requested else f"{resolved} (requested {requested!r})"
+    )
+    # An explicit backend='ray' is never downgraded: the search raises an
+    # ImportError naming the extra. That is the right behaviour and the wrong
+    # moment — after the job has queued — so say it here instead.
+    if requested == "ray" and not ray_is_available():
+        problems.append(
+            "backend='ray' was asked for explicitly but ray is not installed in "
+            "this environment. An explicit request is never downgraded, so the "
+            "search raises instead of falling back: pip install "
+            "'multimodalva[ray]', or pass backend='auto'."
+        )
+    elif (requested == "auto" and resolved == "optuna"
+            and os.environ.get("SLURM_JOB_ID") and not ray_is_available()):
+        notes.append(
+            "backend='auto' resolves to Optuna here because ray is not installed, "
+            "on a machine where it would have run trials in parallel. The results "
+            "will be correct, only slower: pip install 'multimodalva[ray]'."
+        )
+    if hyperparams.space:
+        facts["search space"] = (
+            f"{len(hyperparams.space)} key(s) given and used exactly as passed "
+            f"({', '.join(sorted(hyperparams.space))}); every other key of the "
+            "adaptive space for this data is searched as well"
+        )
+    else:
+        facts["search space"] = "the package default, adapted to this data"
+
+    if train_df is None:
+        return
+    label_col = config.get("label_col")
+    train_labels = train_df[label_col].to_numpy()
+    smallest = int(train_df[label_col].value_counts().iloc[-1])
+    if hyperparams.cv:
+        # Ask the resolver the searches use, so preflight cannot disagree with
+        # them about what this data supports.
+        from .utils.optimize_config import (
+            CV_FOLDS_AUTO, CV_FOLDS_DEFAULT, resolve_cv_folds,
+        )
+
+        quiet = logging.getLogger(f"{__name__}._preflight_quiet")
+        quiet.propagate = False
+        try:
+            folds = resolve_cv_folds(hyperparams.cv_folds, train_labels,
+                                     where="the search", log=quiet)
+        except ValueError as exc:
+            facts["search split"] = (
+                "cross-validation is not possible on this data"
+                if hyperparams.cv_folds == CV_FOLDS_AUTO
+                else f"{hyperparams.cv_folds}-fold cross-validation (not possible)"
+            )
+            problems.append(str(exc))
+        else:
+            if hyperparams.cv_folds == CV_FOLDS_AUTO and folds < CV_FOLDS_DEFAULT:
+                facts["search split"] = (
+                    f'{folds}-fold cross-validation (cv_folds="auto" reduced it '
+                    f"from {CV_FOLDS_DEFAULT}; the rarest training class has "
+                    f"{smallest} row(s))"
+                )
+                notes.append(
+                    f'cv_folds="auto" will use {folds} folds instead of '
+                    f"{CV_FOLDS_DEFAULT}, because the rarest class in the "
+                    f"training split has {smallest} row(s). Trial scores average "
+                    f"over {folds} folds, so they are noisier than a "
+                    f"{CV_FOLDS_DEFAULT}-fold search and not comparable with one."
+                )
+            else:
+                facts["search split"] = f"{folds}-fold cross-validation"
+    else:
+        facts["search split"] = "a single stratified holdout (cv=False)"
+        if smallest < 2:
+            notes.append(
+                "the training split contains a singleton class, so the HPO "
+                "holdout cannot be stratified and will use a seeded random "
+                "split. That class may be absent from one side."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Task normalization
 # ---------------------------------------------------------------------------
 def _normalize_task(task: str) -> str:
@@ -302,6 +1052,36 @@ def _normalize_task(task: str) -> str:
             f"Unknown task {task!r}. Choose from: {list(SUPPORTED_TASKS)}."
         )
     return _TASK_ALIASES[key]
+
+
+def _required_modalities(
+    canonical: str,
+    text_models: list[dict] | None,
+    tabular_models: list[dict] | None,
+    init_kwargs: dict | None,
+) -> tuple[bool, bool]:
+    """Return whether a call actually consumes text and tabular columns.
+
+    Feature-fusion ablations and voting/stacking model rosters are modality
+    choices, not cosmetic settings. Centralising this prevents the loader,
+    preflight and dispatcher from disagreeing about columns that are required,
+    dropped for missing values, or resolved as features.
+    """
+    init_kwargs = init_kwargs or {}
+    if canonical == "text":
+        return True, False
+    if canonical == "tabular":
+        return False, True
+    if canonical == "data_fusion":
+        return True, True
+    if canonical == "feature_fusion":
+        strategy = init_kwargs.get("fusion_strategy", "default")
+        return strategy != "tabular_only", strategy != "text_only"
+    if canonical in {"soft_voting", "stacking"}:
+        effective_text = init_kwargs.get("text_models", text_models)
+        effective_tabular = init_kwargs.get("tabular_models", tabular_models)
+        return bool(effective_text), bool(effective_tabular)
+    return False, False
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +1117,8 @@ def _apply_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
 
 
 def _prepare_dataframe(
-    *, data, canonical, label_col, text_col, filters, split, id_col
+    *, data, canonical, label_col, text_col, filters, split, id_col,
+    requires_text: bool | None = None,
 ) -> tuple[pd.DataFrame, str | None]:
     """Load, apply an explicit split (if any), filter, drop-missing.
 
@@ -363,7 +1144,9 @@ def _prepare_dataframe(
         split_col = _resolve_split_col(df, split, id_col)
 
     df = _apply_filters(df, filters)
-    df = _drop_missing(df, canonical, label_col, text_col)
+    if requires_text is None:
+        requires_text = canonical in _TEXT_TASKS
+    df = _drop_missing(df, label_col, text_col, requires_text=requires_text)
     if split_col is not None:
         _validate_split_nonempty(df, split_col)
     return df, split_col
@@ -405,6 +1188,33 @@ def _apply_id_split(df: pd.DataFrame, spec: dict, id_col: str | None) -> str:
     test_ids = set(spec.get("test_ids", []))
     if not train_ids and not test_ids:
         raise ValueError("split dict must contain non-empty 'train_ids' or 'test_ids'.")
+    overlap = train_ids & test_ids
+    if overlap:
+        shown = sorted(map(str, overlap))[:10]
+        raise ValueError(
+            "The id-based split assigns the same record(s) to both train and "
+            f"test: {shown}. The two sets must be disjoint."
+        )
+    if df[id_col].isna().any():
+        raise ValueError(
+            f"id_col {id_col!r} contains missing values; an id-based split "
+            "requires one non-missing identifier per row."
+        )
+    duplicated = df.loc[df[id_col].duplicated(keep=False), id_col]
+    if not duplicated.empty:
+        shown = sorted(map(str, duplicated.unique()))[:10]
+        raise ValueError(
+            f"id_col {id_col!r} is not unique; duplicated identifier(s): "
+            f"{shown}. A row identifier must identify exactly one record."
+        )
+    present = set(df[id_col])
+    absent = (train_ids | test_ids) - present
+    if absent:
+        shown = sorted(map(str, absent))[:10]
+        raise ValueError(
+            f"The supplied split names {len(absent)} id(s) that are not in "
+            f"{id_col!r}, e.g. {shown}. Refusing a partial/mistyped split."
+        )
 
     def _assign(rid):
         if rid in test_ids:
@@ -430,15 +1240,23 @@ def _looks_like_path(value) -> bool:
     return False
 
 
-def _drop_missing(df, canonical, label_col, text_col) -> pd.DataFrame:
+def _drop_missing(df, label_col, text_col, *, requires_text: bool) -> pd.DataFrame:
     if label_col not in df.columns:
         raise ValueError(
             f"label column {label_col!r} not in DataFrame. "
             f"Available: {df.columns.tolist()}"
         )
+    if requires_text:
+        if not text_col:
+            raise ValueError("text_col is required for this pipeline.")
+        if text_col not in df.columns:
+            raise ValueError(
+                f"text column {text_col!r} is not in the data. "
+                f"Available: {df.columns.tolist()}"
+            )
     before = len(df)
     mask = df[label_col].notna() & (df[label_col].astype(str).str.strip() != "")
-    if canonical in _TEXT_TASKS and text_col and text_col in df.columns:
+    if requires_text and text_col and text_col in df.columns:
         mask &= df[text_col].notna() & (df[text_col].astype(str).str.strip() != "")
     out = df[mask].reset_index(drop=True)
     dropped = before - len(out)
@@ -529,10 +1347,12 @@ def _dispatch(
     if canonical == "text":
         from .text.text_classifier import TextClassifier
 
-        clf = TextClassifier(
+        ctor = dict(
             model_name=_resolve_model_name(model) or "bert-base-uncased",
             output_dir=output_dir,
         )
+        ctor.update(init_kwargs)
+        clf = TextClassifier(**ctor)
         kwargs = dict(
             df=df, text_col=text_col, label_col=label_col,
             hyperparams=hyperparams, top_k=top_k, **common_split, **run_kwargs,
@@ -543,9 +1363,11 @@ def _dispatch(
     if canonical == "tabular":
         from .tabular.tabular_classifier import TabularClassifier
 
-        clf = TabularClassifier(
+        ctor = dict(
             model_name=model or "random_forest", output_dir=output_dir
         )
+        ctor.update(init_kwargs)
+        clf = TabularClassifier(**ctor)
         kwargs = dict(
             df=df, feature_cols=feature_cols, label_col=label_col,
             hyperparams=hyperparams, top_k=top_k,
@@ -560,6 +1382,14 @@ def _dispatch(
     from .ensemble.ensemble_classifier import EnsembleClassifier
 
     ctor = dict(output_dir=output_dir)
+    # Stacking holds resume on the object, because one object spans several stage
+    # calls; every other pipeline takes it on run(). This has to happen *before*
+    # run_args is built: popping it from run_kwargs afterwards leaves the copy
+    # that **run_kwargs already made, and StackingClassifier.run() has no such
+    # parameter, so `run(task="stacking", resume=...)` and the CLI's
+    # --no-resume died with "unexpected keyword argument 'resume'".
+    if canonical == "stacking" and "resume" in run_kwargs:
+        ctor["resume"] = run_kwargs.pop("resume")
     run_args = dict(df=df, text_col=text_col, feature_cols=feature_cols,
                     label_col=label_col, **common_split, **run_kwargs)
     # Every ensemble accepts id_col, so predictions from any task can be joined
@@ -574,16 +1404,9 @@ def _dispatch(
     elif canonical == "feature_fusion":
         if model:
             ctor["model_name"] = model
-        _m = _diagnostics_metric(hyperparams)
-        if _m:
-            ctor["eval_metric"] = _m
         run_args.update(hyperparams=hyperparams, top_k=top_k)
 
     elif canonical in {"soft_voting", "stacking"}:
-        if canonical == "stacking" and "resume" in run_kwargs:
-            # Stacking holds resume on the object, because one object spans
-            # several stage calls; every other task takes it on run().
-            ctor["resume"] = run_kwargs.pop("resume")
         # Voting and stacking configure hyperparameters per base model, inside
         # each spec dict. A run-level hyperparams= applies to every spec that
         # does not already say otherwise, so the argument means the same thing

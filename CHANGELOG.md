@@ -27,7 +27,7 @@ which the public API is declared stable — not for any single feature.
   the more natural way to combine probabilities; today it receives raw
   probabilities. Not the default until it has been compared on real
   out-of-fold data, since changing it would change published stacking results.
-- InSilicoVA as a stacking base learner. The hook exists but is not usable:
+- InSilicoVA as a stacking base learner. It is not exposed in this release:
   `pyinsilicova` does not install on Python 3.12+, and it cannot train a
   probbase against a study's own cause list, only its native causes. Until then,
   run InSilicoVA separately (R, or `pyinsilicova` with its native causes) and
@@ -202,6 +202,34 @@ blamed the model, not the split.
   contradicting a pipeline the run itself recorded is an error rather than an
   hour of inference down the wrong path, unless `--force` says otherwise.
 
+- `preflight()` and `multimodalva run --dry-run` — check a configuration against
+  the data without training anything. Every step that happens before a model is
+  built runs (argument policing, loading, filtering, the missing-row drop, the
+  train/test split, feature-column resolution), then it stops and reports what
+  the run would do. Keywords `run()` does not name are checked against the
+  signature of the class the task dispatches to, so a misspelt one is named with
+  a suggestion instead of reaching the cluster; so are model names, base-model
+  specs and `init_kwargs` keys. One report names every problem rather than only
+  the first, and the exit status is 2 when any of them would stop the run, so a
+  job script can gate on it:
+
+  ```bash
+  multimodalva run job.yaml --dry-run || exit 1
+  multimodalva run job.yaml
+  ```
+
+  Three checks report what the run would otherwise accept in silence: a class too
+  rare to appear in every search fold (now a hard error before training),
+  `init_kwargs` overriding an argument passed alongside it, and a filter
+  value that matches no row — which otherwise surfaces as "no rows remain",
+  naming the step that noticed rather than the value responsible. A missing
+  `text_col` is also caught here: the missing-row drop only looks at that column
+  when it is present, so an absent one otherwise reaches the pipeline first.
+
+  A clean dry run says the configuration is consistent with the data, not that
+  the run will succeed: nothing trains, so it cannot see a batch size that will
+  not fit or a trial budget too small for the search space.
+
 - `Optimize(backend=...)` — choose the search engine from one call:
   `"ray"` runs trials in parallel across the CPUs, GPUs or cluster nodes Ray can
   see, `"optuna"` runs them in one resumable process, and `"auto"` (the default)
@@ -251,6 +279,73 @@ blamed the model, not the split.
 Recorded because copies of the package were in use before this release; none of
 these ever reached a tagged version.
 
+- **`resume="adopt"` for artifacts made before resume manifests existed.** The
+  manifest guard below refuses a directory that holds artifacts but no
+  `resume_manifest.json`, because there is no signature to check — which would
+  otherwise strand every run directory created before it. `resume="adopt"`
+  (`--resume-adopt`) reuses such a directory and records the signature of the
+  current call, so later runs are checked normally. It warns each time, since
+  nothing verified those artifacts came from this data and configuration. It
+  covers only the missing-signature case: a manifest that is present and
+  disagrees still raises, because a disagreement is evidence of a real
+  difference rather than an absent check. `--dry-run` reports which of the three
+  states a directory is in before the job starts.
+
+- **`Optimize(cv_folds="auto")` fits the fold count to the data.** An integer
+  `cv_folds` raises when the rarest class in the training rows has fewer rows
+  than there are folds, since a stratified fold cannot then hold every class.
+  `"auto"` instead uses as many folds as the data supports, up to the default 3,
+  and logs which it chose and why. It still raises for a class with a single row,
+  where no fold count is valid. The resolved count — never the word `"auto"` — is
+  what feeds the search-name signature, the run's reported configuration and the
+  per-fold trial columns, so an artifact always says how many folds ran. All four
+  search paths share one resolver, so the searches and `--dry-run` cannot
+  disagree about what a dataset supports.
+
+- **Resume can no longer mix incompatible runs.** Text, tabular, data fusion,
+  feature fusion, voting and stacking write a content manifest for the consumed
+  split and effective configuration before resumable work starts. Existing
+  artifacts without a matching manifest are refused instead of being inferred
+  compatible from filenames. Default Optuna study names and Ray experiment
+  directories also include a data/configuration signature, so a shared journal
+  or output directory cannot merge trials from a different search. Stacking
+  additionally validates cached OOF shapes, labels, finiteness, probability
+  ranges and row sums.
+- Ray trial exceptions now propagate to Ray as failed trials. They were caught
+  inside the worker and reported as zero/empty scores, so Ray could count a
+  crashed configuration as a successful result. The GPU smoke contract now
+  directly tests this failure path.
+- **Text-only stacking now works.** Its OOF splitter was passed an empty label
+  array unless a tabular base model had also prepared `y_train`. It now takes
+  labels from the text dataset. The class-aware voter's implementation default
+  is Brier score, matching its documented and recorded design.
+- Feature fusion enforces the selected modalities. `text_only` no longer asks
+  for tabular features; `tabular_only` no longer asks for text, resolves a text
+  checkpoint, downloads NLTK data or accepts a text checkpoint setting it will
+  not use. NLTK download failures now raise actionable errors and never disable
+  TLS verification process-wide.
+- Preflight performs the real split and checks HPO folds on the actual training
+  rows. It rejects excess folds, one-model voting, unknown base-model spec keys,
+  constructor-only settings passed to `.run()`, and modality mismatches. Flat
+  single-model `init_kwargs` are now applied instead of being accepted and
+  ignored. `Optimize.metric` is no longer silently repurposed as AutoMM's
+  `eval_metric`; feature fusion names which `Optimize` fields AutoMM ignores.
+- Row identity and imported-result alignment are strict. ID-based splits reject
+  overlaps, absent requested ids, missing ids and duplicate ids. Voting over
+  finished results verifies label maps, truth rows and ids before averaging.
+  Malformed training metadata and unknown tabular inference backend settings
+  raise rather than being ignored.
+- The unfinished InSilicoVA stacking path was removed and its model name is
+  rejected immediately. The supported path remains running it externally and
+  comparing its predictions through `results`.
+- Tabular single-holdout HPO now uses the same resilient split helper as text.
+  Text Optuna CV now rejects more folds than the rarest class instead of letting
+  sklearn run folds with missing classes.
+- Bootstrap confidence intervals generate resample indices in bounded batches
+  instead of allocating an `n_boot × n_rows` matrix (about 8 GB for 10,000 ×
+  100,000). Fused-text generation avoids process startup on small automatic
+  jobs and serializes plain row records for larger jobs; worker/data exceptions
+  now surface once instead of being swallowed and recomputed sequentially.
 - A meta-learner name the package cannot build is refused **before stage 1**,
   with an error naming the ten it accepts and pointing at `oof_only=True` for
   anything else. Every candidate is instantiated in stage 2, so an unknown name
@@ -293,6 +388,89 @@ these ever reached a tagged version.
   downstream could detect it: stage 2 simply fitted a combiner on a matrix that
   was internally inconsistent. The source run records both values, so the
   mismatch was always knowable. A source run too old to record them warns instead.
+- **The Ray search backend ran for real for the first time (2026-09-28, one H200
+  node) and `tests/hpc_ray_smoke.py` found four defects, all fixed here.** None
+  of them touches the Optuna backend, which is the default off a CUDA machine. The
+  smoke test passes 11 of its 12 checks on a two-GPU node, the twelfth reporting
+  that the text search's trials were too short to measure overlap. Two further
+  fixes came out of the same runs:
+  - `tests/hpc_ray_smoke.sbatch` picks a short directory for Ray's session state.
+    Ray's Unix socket path must fit in 107 bytes and Ray appends about 65
+    characters of its own, so a `$TMPDIR` on project storage — the normal case on
+    a cluster — overflowed it and Ray never started
+    (`AF_UNIX path length cannot exceed 107 bytes`). The wrapper now refuses to
+    submit rather than letting Ray fail with an error that looks unrelated.
+  - The trials table carries `datetime_start` and `datetime_complete` on the Ray
+    path, reconstructed from Ray's completion timestamp and trial duration.
+    Optuna writes both, and they are how a reader tells whether trials overlapped.
+  - NumPy RNGs became unpicklable process-wide once a saved tabular model had
+    been loaded. `ensure_numpy_rng_compat()` replaces
+    `numpy.random._pickle._bit_generator_ctor` and never restores it, and the
+    replacement was a nested function — pickle references functions by qualified
+    name, and `…<locals>._compat_ctor` cannot be looked up, so every later pickle
+    of an RNG raised `AttributeError: Can't get local object`. The replacement is
+    a module-level function now. Ray Tune's searcher checkpointing was the first
+    thing to hit this; the blast radius was every caller of `load_joblib_compat()`.
+  - `hpo/hpo_trials.csv` from a Ray search now matches the shape its readers
+    expect. The Ray path wrote Ray's own `ResultGrid` dataframe into a file with
+    the right name — bare metric columns, `config/<name>`, `trial_id`, `logdir` —
+    where `results/validation.py` keys on `value` and `user_attrs_*`. The result
+    was `validation.json` recording `source="none"` for a Ray-searched run, and
+    no fold stability anywhere. The 2026-09-27 cleanup had aligned the file
+    *names*; this aligns the columns.
+  - The Ray trial functions keep their per-fold scores. Tabular averaged
+    `fold_scores` away before returning, so `fold_<i>_<metric>` and
+    `cv_std_<metric>` could not reach the trials table however it was written.
+  - A `RunConfig` is created wherever one can be. Ray ≥ ~2.49 rejects
+    `CheckpointConfig(checkpoint_at_end=...)` outright, while older Ray Train v2
+    requires it pinned to `False`; only an `ImportError` used to fall through to
+    the plain variant, so on ray 2.52 the run got no `RunConfig` at all. That
+    disabled resume *and* dropped `storage_path`, sending the experiment to
+    `~/ray_results` — which exhausted a cluster home quota mid-search
+    (`OSError: [Errno 122] Disk quota exceeded`, repeatedly, from Ray's syncer).
+  - `max_concurrent_trials` is no longer passed to `TuneConfig` as well as to the
+    `ConcurrencyLimiter` around `search_alg`. The cap always took effect through
+    the limiter, but the duplicate made Ray log that it was ignoring the setting,
+    which reads like it did nothing.
+- **A setting the caller passed that a pipeline cannot act on is now named,
+  rather than dropped in silence.** One `Optimize` object is accepted by every
+  task, but not every task honours every field, and a deliberately passed setting
+  vanishing is among the hardest things for a user to notice — especially in a
+  queued cluster job. `warn_unused_settings()` reports the ones that will not be
+  used, naming the pipeline and why, and says nothing about fields left at their
+  defaults. Two places had been silent:
+  - **Feature fusion honours only `n_trials` and `space`.** AutoGluon AutoMM runs
+    the search itself, with its own scheduler and searcher (`hpo_scheduler=` /
+    `hpo_searcher=`), its own holdout, and selection on the classifier's
+    `eval_metric=` — so `backend=`, `metric=`, `cv=`, `cv_folds=`, `pruning=`,
+    `resume=`, `space_profile=` and `extra=` reached nothing.
+  - **`space_profile=` sizes the tabular search space only.** The text spaces
+    adapt to training-set size and class count and have no profiles. The
+    docstring said "Tabular only"; the behaviour said nothing.
+- **The run log now states both halves of how `Optimize(space=...)` is applied.**
+  The behaviour is unchanged and was already correct — a key you name is searched
+  over exactly the range you wrote, because the adaptive adjustments run on the
+  defaults before your keys are applied, and a key you do not name keeps its
+  adaptive value and is still searched. What was missing was saying so: the log
+  reported which default keys had been *replaced*, leaving a reader to work out
+  what the rest of the space was. It now names the caller's keys as "used exactly
+  as passed" and lists the keys that came from the adaptive space and are searched
+  alongside them.
+- **A malformed `Optimize(space=...)` is refused when the `Optimize` is built.**
+  The searches run `study.optimize(..., catch=(Exception,))` so that one bad
+  configuration cannot kill a long search — which meant a bad *space* failed every
+  trial silently and reached the end of its budget with nothing completed, after
+  the queue wait on a cluster. The errors that did escape the sampler were
+  unreadable: a NaN bound arrived as `OverflowError: Range exceeds valid bounds`
+  out of NumPy, a `None` bound as a `TypeError` about comparing `NoneType`. Every
+  malformed entry is now named at once, with what the entry should look like —
+  `None` in place of a range, a non-numeric or non-finite bound, a low above its
+  high, a misspelled kind, an empty choice list, or the wrong number of values.
+- **How to hold one hyperparameter fixed while searching the others is documented**:
+  give it a single-value range, `("categorical", [8])`. `hyperparams=` carries one
+  meaning at a time — a dict of fixed values means no search — so pinning happens
+  inside the space. Omitting a key does the opposite: it keeps that key's adaptive
+  range and searches it.
 - The HPO runtime report is `hpo/runtime/hpo_runtime.json` on both backends. It
   was the one artifact the cleanup above missed: the Ray text search wrote
   `ray_hpo_runtime.json`, so a timing report had to be looked for under two names
@@ -373,19 +551,24 @@ to any published version.
   `batch_size` also shifts probabilities at float32 rounding level, because each
   batch is padded to its own longest sequence; reproducing a saved probability
   file byte-for-byte needs the same `batch_size`.
-- `optimize_tabular`'s single-holdout path (`Optimize(cv=False)`) splits with
-  `StratifiedShuffleSplit` directly rather than through the helper the text path
-  uses, which degrades to an unstratified split when a class is too rare to divide.
-  On a small or very imbalanced training set a tabular search can therefore fail
-  where a text search would warn and continue. Use the default `Optimize(cv=True)`,
-  or group rare causes, until this is routed through the shared helper — a change
-  that moves which rows a tabular search validates on, so it waits for a release
-  where tabular results are re-verified.
-- The Ray search backend is implemented but has not been verified on a real
-  multi-GPU or multi-node run; without a CUDA GPU both entry points redirect to
-  Optuna by design, so that redirect is what the test suite covers.
-  `tests/hpc_ray_smoke.py` exists to close this on a GPU node. Optuna, the
-  default off such a machine, is the backend the package was developed on.
+- A dry run checks the configuration against the data, not the run. It cannot see
+  a batch size that will not fit, a trial budget too small for the search space,
+  an `Optimize(extra=...)` key the backend ignores, or whether a Hugging Face Hub
+  ID exists.
+- The Ray search backend passes all twelve checks of `tests/hpc_ray_smoke.py` on a
+  two-GPU SLURM node — including trials observed running concurrently in both the
+  tabular and the text search — verified twice: once on the original
+  implementation and again on the shipped code, with Ray 2.52.1 and torch 2.14.
+  That is one cluster and two Ray versions, which is what gives any confidence
+  that the `RunConfig` compatibility fallback works across them.
+
+  What those twelve checks do **not** cover: a trial that actually fails (they
+  only run trials that succeed, so the strict re-raise path is exercised by unit
+  tests, not on the cluster), and `cv_folds="auto"` on the Ray path. Off a CUDA
+  machine both entry points redirect to Optuna by design, so the ordinary test
+  suite cannot reach the Ray path at all — it covers the trial functions in
+  process only. Run the smoke test on your own cluster before relying on Ray for a
+  long search.
 
 ### Notes for anyone who used a pre-release copy
 

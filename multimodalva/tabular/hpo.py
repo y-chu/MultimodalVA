@@ -20,6 +20,7 @@ Output: best_hyperparams dict and backend study / ResultGrid object
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
     from ..utils.optimize_config import Optimize
 
 import numpy as np
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedKFold
 
 # -----------------------
 # Package root resolution (mirrors text/hpo.py)
@@ -52,7 +53,20 @@ from ..utils.metrics import (  # noqa: F401
     log_loss_from_full, METRIC_DIRECTION, decode_hyperparams_for_space,
     decode_trials_dataframe_for_space, CV_METRICS, HPO_METRICS,
 )
-from ..utils.ray_compat import to_ray_space
+from ..utils.ray_compat import ray_trials_to_contract, to_ray_space
+
+
+def _tabular_search_signature(X_train, y_train, config: dict) -> str:
+    """Content signature used to isolate default Optuna/Ray resume state."""
+    digest = hashlib.sha256()
+    for array in (X_train, y_train):
+        value = np.ascontiguousarray(array)
+        digest.update(str(value.shape).encode())
+        digest.update(str(value.dtype).encode())
+        digest.update(value.tobytes())
+    digest.update(json.dumps(config, sort_keys=True, default=str).encode())
+    return digest.hexdigest()[:16]
+from ..utils.split import stratified_indices
 from ..utils.hpo_defaults import get_class_tier, merge_search_space
 from .predict import predict_tabular
 from .train import TABULAR_MODELS, train_tabular
@@ -96,7 +110,7 @@ def optimize_tabular(
     n_cv_folds: int = 3,
     random_state: int = 42,
     split_seed: int | None = None,
-    study_name: str = "tabular_hpo",
+    study_name: str | None = None,
     storage_path: str | None = None,
     load_if_exists: bool = True,
     enable_pruning: bool = TABULAR_PRUNING_DEFAULT,
@@ -147,7 +161,9 @@ def optimize_tabular(
                         default) reuses ``random_state``, so existing callers
                         are unaffected. Pass it separately to hold the folds
                         fixed while ``random_state`` reseeds the models.
-        study_name:     Optuna study name. Default "tabular_hpo".
+        study_name:     Optuna study name. By default a content-derived name is
+                        used, so a JournalStorage file cannot silently mix
+                        trials from different data or search configurations.
         storage_path:   Path to the JournalStorage log file for study persistence.
                         Defaults to output_dir/hpo_<model_name>.log.
                         Accepts a bare path (.log) or legacy sqlite:///… / .db paths
@@ -183,8 +199,13 @@ def optimize_tabular(
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
         )
-    if use_cv and n_cv_folds < 2:
-        raise ValueError("n_cv_folds must be >= 2 when use_cv=True.")
+    # Only an explicit integer can be judged this early; "auto" is resolved
+    # against the class counts below.
+    if use_cv and isinstance(n_cv_folds, int) and n_cv_folds < 2:
+        raise ValueError(
+            'n_cv_folds must be >= 2 when use_cv=True, or "auto" to use as many '
+            "folds as the rarest class supports."
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +231,30 @@ def optimize_tabular(
         resolved_profile, get_class_tier(n_classes),
         X_train.shape[0], X_train.shape[1], n_classes,
     )
+
+    # Resolve "auto" here, before anything records the fold count: it feeds
+    # the search-name signature and the configuration this run reports, both
+    # of which have to say how many folds actually ran.
+    if use_cv:
+        from ..utils.optimize_config import resolve_cv_folds  # noqa: PLC0415
+
+        n_cv_folds = resolve_cv_folds(
+            n_cv_folds, y_train, where="the tabular search", log=logger,
+        )
+
+    if study_name is None:
+        signature = _tabular_search_signature(X_train, y_train, {
+            "model_name": model_name,
+            "metric": metric,
+            "space": active_space,
+            "val_size": val_size,
+            "use_cv": use_cv,
+            "n_cv_folds": n_cv_folds,
+            "random_state": random_state,
+            "split_seed": split_seed,
+            "search_space_profile": resolved_profile,
+        })
+        study_name = f"tabular_hpo_{signature}"
 
     # JournalStorage (append-only log + fcntl locking) replaces SQLite as the
     # default backend.  It tolerates cloud-sync folders (Dropbox, iCloud) and
@@ -268,12 +313,9 @@ def optimize_tabular(
             n_cv_folds, len(y_train), len(id2label), n_cv_folds,
         )
     else:
-        sss = StratifiedShuffleSplit(
-            n_splits=1,
-            test_size=val_size,
-            random_state=_split_seed,
+        opt_train_idx, opt_val_idx = stratified_indices(
+            y_train, val_size, _split_seed, what="validation", log=logger,
         )
-        opt_train_idx, opt_val_idx = next(sss.split(X_train, y_train))
         X_opt_train = X_train[opt_train_idx]
         y_opt_train = y_train[opt_train_idx]
         X_opt_val = X_train[opt_val_idx]
@@ -477,6 +519,7 @@ def _tabular_ray_trial_fn(
     X_train: np.ndarray | None = None,
     y_train: np.ndarray | None = None,
     cv_splits: list[tuple[list[int], list[int]]] | None = None,
+    metric_key: str = "f1_macro",
 ) -> dict:
     """Single-trial trainable for Ray Tune (tabular pipeline).
 
@@ -514,14 +557,7 @@ def _tabular_ray_trial_fn(
     _trial_logger.info("Resolved Ray trial artifact directory: %s", trial_dir)
     trial_dir.mkdir(parents=True, exist_ok=True)
 
-    all_scores: dict = {
-        "accuracy": 0.0,
-        "balanced_accuracy": 0.0,
-        "f1_macro": 0.0,
-        "f1_weighted": 0.0,
-        "csmf_accuracy": 0.0,
-        "log_loss": float("inf"),  # minimised — inf signals trial failure
-    }
+    all_scores: dict = {}
     try:
         if cv_splits:
             if X_train is None or y_train is None:
@@ -556,6 +592,14 @@ def _tabular_ray_trial_fn(
 
             all_scores = {m: float(np.mean(fold_scores[m])) for m in fold_scores}
             all_scores["log_loss"] = float(np.mean(fold_log_losses))
+            # Keep the per-fold detail. Ray turns every returned key into a
+            # column, so these reach the trials CSV the way the Optuna backend's
+            # fold_<i>_<metric> user attrs do; averaging them away here was why
+            # fold stability was unreadable for a Ray-searched run.
+            for _fold_idx, _fold_value in enumerate(fold_scores[metric_key]):
+                all_scores[f"fold_{_fold_idx}_{metric_key}"] = float(_fold_value)
+            all_scores[f"cv_std_{metric_key}"] = float(np.std(fold_scores[metric_key]))
+            all_scores["n_cv_folds"] = len(cv_splits)
         else:
             if X_opt_train is None or y_opt_train is None or X_opt_val is None or y_opt_val is None:
                 raise ValueError(
@@ -580,14 +624,39 @@ def _tabular_ray_trial_fn(
             all_scores["log_loss"] = log_loss_from_full(result.full, result.id2label)
     except Exception:
         _trial_logger.exception(
-            "Ray trial failed (config=%s); reporting zero/inf scores.", config
+            "Ray trial failed (config=%s); propagating the error to Ray Tune.",
+            config,
         )
+        # A function trainable that returns normally is a successful Ray trial.
+        # Returning zero/inf placeholders here used to make a completely broken
+        # search pass its health check and could select an invalid configuration.
+        # Ray Tune already isolates trial failures and continues the experiment;
+        # re-raising is what lets Result.error and the all-trials-failed guard work.
+        raise
 
     # Return the metrics dict — Ray Tune treats the return value of a function
     # trainable as the trial's final reported result.  This avoids calling
     # ray.train.report(), which is the Ray Train API and raises or hangs when
     # invoked outside a Train session (e.g. TorchTrainer).
     return all_scores
+
+
+def _run_config_with_checkpoint_config(storage_path: str, name: str):
+    """RunConfig that pins checkpoint_at_end=False (older Ray Train v2)."""
+    from ray.train import CheckpointConfig, RunConfig
+
+    return RunConfig(
+        storage_path=storage_path,
+        name=name,
+        checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
+    )
+
+
+def _run_config_plain(storage_path: str, name: str):
+    """RunConfig without a CheckpointConfig (newer Ray rejects the argument)."""
+    from ray.train import RunConfig
+
+    return RunConfig(storage_path=storage_path, name=name)
 
 
 def optimize_tabular_ray(
@@ -751,8 +820,13 @@ def optimize_tabular_ray(
         raise ValueError(
             f"Unknown metric {metric!r}. Valid metrics: {sorted(_VALID_METRICS)}"
         )
-    if use_cv and n_cv_folds < 2:
-        raise ValueError("n_cv_folds must be >= 2 when use_cv=True.")
+    # Only an explicit integer can be judged this early; "auto" is resolved
+    # against the class counts below.
+    if use_cv and isinstance(n_cv_folds, int) and n_cv_folds < 2:
+        raise ValueError(
+            'n_cv_folds must be >= 2 when use_cv=True, or "auto" to use as many '
+            "folds as the rarest class supports."
+        )
 
     try:
         import ray
@@ -821,9 +895,7 @@ def optimize_tabular_ray(
 
     # --- Experiment storage path (for resume) ---
     safe_model_name = model_name.replace("/", "_")
-    exp_name    = experiment_name or f"ray_hpo_{safe_model_name}"
     exp_storage = output_dir / "ray_experiment"
-    exp_path    = exp_storage / exp_name
 
     # --- Build effective search space: data/class-adaptive base → caller overrides ---
     n_classes = len(id2label)
@@ -842,6 +914,32 @@ def optimize_tabular_ray(
         resolved_profile, get_class_tier(n_classes),
         X_train.shape[0], X_train.shape[1], n_classes,
     )
+    # Resolve "auto" here, before anything records the fold count: it feeds
+    # the search-name signature and the configuration this run reports, both
+    # of which have to say how many folds actually ran.
+    if use_cv:
+        from ..utils.optimize_config import resolve_cv_folds  # noqa: PLC0415
+
+        n_cv_folds = resolve_cv_folds(
+            n_cv_folds, y_train, where="the tabular Ray search", log=logger,
+        )
+
+    if experiment_name is None:
+        signature = _tabular_search_signature(X_train, y_train, {
+            "model_name": model_name,
+            "metric": metric,
+            "space": active_space,
+            "val_size": val_size,
+            "use_cv": use_cv,
+            "n_cv_folds": n_cv_folds,
+            "random_state": random_state,
+            "split_seed": split_seed,
+            "search_space_profile": resolved_profile,
+        })
+        exp_name = f"ray_hpo_{safe_model_name}_{signature}"
+    else:
+        exp_name = experiment_name
+    exp_path = exp_storage / exp_name
 
     # --- Trial evaluation setup (mirrors optimize_tabular()) ---
     # split_seed governs which rows go where, random_state what the model does
@@ -874,10 +972,9 @@ def optimize_tabular_ray(
             n_cv_folds, len(y_train), len(id2label), n_cv_folds,
         )
     else:
-        sss = StratifiedShuffleSplit(
-            n_splits=1, test_size=val_size, random_state=_split_seed
+        opt_train_idx, opt_val_idx = stratified_indices(
+            y_train, val_size, _split_seed, what="validation", log=logger,
         )
-        opt_train_idx, opt_val_idx = next(sss.split(X_train, y_train))
         X_opt_train = X_train[opt_train_idx]
         y_opt_train = y_train[opt_train_idx]
         X_opt_val = X_train[opt_val_idx]
@@ -963,6 +1060,7 @@ def optimize_tabular_ray(
             X_train=X_train,
             y_train=y_train,
             cv_splits=cv_splits,
+            metric_key=metric,
             label2id=label2id,
             id2label=id2label,
             model_name=model_name,
@@ -977,6 +1075,7 @@ def optimize_tabular_ray(
             y_opt_train=y_opt_train,
             X_opt_val=X_opt_val,
             y_opt_val=y_opt_val,
+            metric_key=metric,
             label2id=label2id,
             id2label=id2label,
             model_name=model_name,
@@ -1000,33 +1099,37 @@ def optimize_tabular_ray(
     #      trainables").  This is the preferred path.
     #   2. Plain RunConfig — fallback for older Ray versions that don't have
     #      CheckpointConfig or don't inject checkpoint_at_end.
+    # Losing this costs more than resume: without a RunConfig, Ray has no
+    # storage_path and writes the experiment to ~/ray_results, which on a cluster
+    # with a small home quota fills it up mid-run ("Disk quota exceeded" from the
+    # syncer, observed on a real GPU node 2026-09-28). So every variant that can
+    # set storage_path is tried before giving up.
+    #
+    # Ray versions disagree about CheckpointConfig(checkpoint_at_end=...):
+    #   * older Ray Train v2 auto-injects checkpoint_at_end=True for function
+    #     trainables and raises unless it is explicitly False;
+    #   * ray >= ~2.49 rejects the argument outright ("checkpoint_at_end is
+    #     deprecated since it does not apply to user-defined training functions").
+    # Both are ordinary exceptions, so each variant is tried in turn and only a
+    # failure of *all* of them disables persistence.
     _run_config = None
-    try:
-        from ray.train import RunConfig, CheckpointConfig
-        exp_storage.mkdir(parents=True, exist_ok=True)
-        _run_config = RunConfig(
-            storage_path=str(exp_storage.resolve()),
-            name=exp_name,
-            checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
-        )
-    except ImportError:
-        # CheckpointConfig not available — try plain RunConfig
+    _rc_errors: list[str] = []
+    for _variant, _build in (
+        ("with CheckpointConfig", _run_config_with_checkpoint_config),
+        ("plain", _run_config_plain),
+    ):
         try:
-            from ray.train import RunConfig  # noqa: F811
             exp_storage.mkdir(parents=True, exist_ok=True)
-            _run_config = RunConfig(
-                storage_path=str(exp_storage.resolve()),
-                name=exp_name,
-            )
-        except Exception as _rc_err2:
-            logger.warning(
-                "Could not create RunConfig — experiment state will not be persisted "
-                "(resume disabled for this run): %s", _rc_err2,
-            )
-    except Exception as _rc_err:
+            _run_config = _build(str(exp_storage.resolve()), exp_name)
+            break
+        except Exception as _rc_err:
+            _rc_errors.append(f"{_variant}: {_rc_err}")
+    if _run_config is None:
         logger.warning(
-            "Could not create RunConfig — experiment state will not be persisted "
-            "(resume disabled for this run): %s", _rc_err,
+            "Could not create RunConfig — experiment state will not be persisted, "
+            "resume is disabled for this run, and Ray will write under its default "
+            "~/ray_results instead of %s. Tried %s",
+            exp_storage, "; ".join(_rc_errors),
         )
 
     _tune_config = tune.TuneConfig(
@@ -1034,7 +1137,9 @@ def optimize_tabular_ray(
         mode=_ray_mode,
         num_samples=n_trials,
         search_alg=search_alg,
-        max_concurrent_trials=max_concurrent_trials,
+        # Concurrency is enforced by the ConcurrencyLimiter wrapped around
+        # search_alg above. Passing it here as well makes Ray warn that it is
+        # ignoring this one, which reads like the setting did not take effect.
     )
 
     # --- Build or restore Tuner ---
@@ -1234,7 +1339,9 @@ def optimize_tabular_ray(
     # --- Save all trial results as CSV ---
     if save_trials_csv:
         trials_csv_path = output_dir / "hpo_trials.csv"
-        results.get_dataframe().to_csv(trials_csv_path, index=False)
+        ray_trials_to_contract(results.get_dataframe(), metric).to_csv(
+            trials_csv_path, index=False
+        )
         logger.info("Saved Ray trial results to %s", trials_csv_path)
 
     # --- Remove Ray experiment directory (optional) ---

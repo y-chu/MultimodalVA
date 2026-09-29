@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import inspect
 
+import pandas as pd
 import pytest
 
 import multimodalva as mv
@@ -61,3 +62,72 @@ def test_run_routes_resume_to_the_stacking_object(tmp_path, monkeypatch):
                tabular_models=[{"model_name": "naive_bayes"}], output_dir=tmp_path,
                resume=False)
     assert seen["resume"] is False
+
+
+def test_resume_manifest_accepts_only_the_same_data_and_configuration(tmp_path):
+    from multimodalva.utils.provenance import (
+        enforce_resume_manifest,
+        make_resume_manifest,
+    )
+
+    data = pd.DataFrame({"x": [1, 2], "y": ["a", "b"]})
+    first = make_resume_manifest(dataframes={"train": data}, config={"seed": 7})
+    path = tmp_path / "resume_manifest.json"
+    enforce_resume_manifest(
+        path, first, resume=True, artifacts_exist=False, what="test run"
+    )
+    # recorded_at differs, but the content signature is identical.
+    same = make_resume_manifest(dataframes={"train": data.copy()}, config={"seed": 7})
+    enforce_resume_manifest(
+        path, same, resume=True, artifacts_exist=True, what="test run"
+    )
+
+    changed_data = data.copy()
+    changed_data.loc[0, "x"] = 99
+    changed = make_resume_manifest(
+        dataframes={"train": changed_data}, config={"seed": 7}
+    )
+    with pytest.raises(RuntimeError, match="data/split"):
+        enforce_resume_manifest(
+            path, changed, resume=True, artifacts_exist=True, what="test run"
+        )
+
+    changed_config = make_resume_manifest(
+        dataframes={"train": data}, config={"seed": 8}
+    )
+    with pytest.raises(RuntimeError, match="configuration"):
+        enforce_resume_manifest(
+            path, changed_config, resume=True, artifacts_exist=True, what="test run"
+        )
+
+
+def test_resume_refuses_legacy_artifacts_with_no_manifest(tmp_path):
+    from multimodalva.utils.provenance import (
+        enforce_resume_manifest,
+        make_resume_manifest,
+    )
+
+    expected = make_resume_manifest(
+        dataframes={"train": pd.DataFrame({"x": [1]})}, config={}
+    )
+    with pytest.raises(RuntimeError, match="does not"):
+        enforce_resume_manifest(
+            tmp_path / "resume_manifest.json", expected,
+            resume=True, artifacts_exist=True, what="legacy run",
+        )
+
+
+def test_default_hpo_resume_names_change_with_the_content():
+    import numpy as np
+
+    from multimodalva.tabular.hpo import _tabular_search_signature
+
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    y = np.array([0, 0, 0, 1, 1, 1])
+    config = {"metric": "f1_macro", "space": {"depth": ("int", 2, 4)}}
+    same = _tabular_search_signature(X.copy(), y.copy(), dict(config))
+    assert same == _tabular_search_signature(X, y, config)
+    changed = X.copy()
+    changed[0, 0] = -1
+    assert same != _tabular_search_signature(changed, y, config)
+    assert same != _tabular_search_signature(X, y, {**config, "metric": "accuracy"})

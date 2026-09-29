@@ -23,6 +23,19 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# A config file's keys are passed straight through to run(), so a misspelt one
+# ('lable_col', 'max_lenght') is only noticed once the pipeline is reached —
+# after a cluster job has queued and started. --dry-run does everything up to
+# that point and stops: it checks the keys against the pipeline's own arguments,
+# loads the data, applies the filters, resolves the feature columns, and reports
+# what the run would do without training anything. It exits non-zero if
+# something would stop the run, so this gate is worth its few seconds in front
+# of anything queued on a GPU.
+for cfg in config_tabular_model.yaml config_text_model.yaml \
+           config_ensemble_stacking.yaml; do
+    multimodalva run "${HERE}/${cfg}" --dry-run
+done
+
 multimodalva run "${HERE}/config_tabular_model.yaml"
 multimodalva run "${HERE}/config_text_model.yaml"
 multimodalva run "${HERE}/config_ensemble_stacking.yaml"

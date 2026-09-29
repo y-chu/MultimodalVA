@@ -235,3 +235,12 @@ def test_shared_resamples_across_models():
     three = bootstrap_ci(frame, n_boot=100, metrics=["accuracy"])
     assert two.loc["model_0", "accuracy_ci_lower"] == pytest.approx(
         three.loc["model_0", "accuracy_ci_lower"])
+def test_bootstrap_indices_are_batched_instead_of_allocating_b_by_n():
+    from multimodalva.results.bootstrap import _index_batches
+
+    n, n_boot = 10_000, 10_000
+    start, first = next(_index_batches(n, n_boot, 42, target_bytes=80_000))
+    assert start == 0
+    assert first.shape[1] == n
+    assert first.shape[0] < n_boot
+    assert first.nbytes <= 80_000

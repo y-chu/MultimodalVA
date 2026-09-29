@@ -159,7 +159,8 @@ def resolve_test_ids(
         The identifiers as a list, or ``None`` when ``id_col`` is ``None``.
 
     Raises:
-        ValueError: ``id_col`` is not a column of ``test_df``.
+        ValueError: ``id_col`` is not a column of ``test_df``, or the retained
+                    identifiers are missing or duplicated.
     """
     if id_col is None:
         return None
@@ -169,6 +170,17 @@ def resolve_test_ids(
             f"Available columns: {list(test_df.columns)[:20]}"
         )
     kept = test_df if keep_mask is None else test_df[keep_mask]
+    if kept[id_col].isna().any():
+        raise ValueError(
+            f"id_col {id_col!r} contains missing values in rows being scored."
+        )
+    duplicated = kept.loc[kept[id_col].duplicated(keep=False), id_col]
+    if not duplicated.empty:
+        shown = sorted(map(str, duplicated.unique()))[:10]
+        raise ValueError(
+            f"id_col {id_col!r} is not unique in rows being scored; duplicated "
+            f"identifier(s): {shown}."
+        )
     return kept[id_col].tolist()
 
 

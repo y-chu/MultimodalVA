@@ -51,6 +51,8 @@ from .datasets import data, list_datasets  # noqa: E402
 # (torch/transformers/autogluon) are imported lazily inside run(), so importing
 # this name does not pull the transformer stack.
 from .runner import run, SUPPORTED_TASKS  # noqa: E402
+# Same config as run(), checked without training anything.
+from .runner import preflight  # noqa: E402
 from .utils.optimize_config import Optimize  # noqa: E402
 # Score new data with an already-trained model (local run, Hub id or URL).
 # torch/transformers load only when a text model is used.
@@ -59,5 +61,6 @@ from .inference import (  # noqa: E402
     predict_ensemble_from_pretrained,
 )
 
-__all__ = ["data", "list_datasets", "run", "Optimize", "SUPPORTED_TASKS",
+__all__ = ["data", "list_datasets", "run", "preflight", "Optimize",
+           "SUPPORTED_TASKS",
            "predict_from_pretrained", "predict_ensemble_from_pretrained"]

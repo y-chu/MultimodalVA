@@ -270,8 +270,13 @@ def check_fold_columns(workdir: Path) -> str:
 
     trials = pd.read_csv(_trials_csv(workdir / "tab_ray_cv"))
     cols = list(trials.columns)
-    folds = [c for c in cols if c.startswith("fold_")]
-    stds = [c for c in cols if c.startswith("cv_std_")]
+    # Both backends write the Optuna shape, where user attributes carry a
+    # ``user_attrs_`` prefix; a pre-2026-09-28 Ray run wrote the bare names.
+    def _attr(c: str) -> str:
+        return c[len("user_attrs_"):] if c.startswith("user_attrs_") else c
+
+    folds = [c for c in cols if _attr(c).startswith("fold_")]
+    stds = [c for c in cols if _attr(c).startswith("cv_std_")]
     if not folds and not stds:
         raise AssertionError(
             "no fold_<i>_<metric> or cv_std_<metric> column in the trials CSV. "
@@ -330,14 +335,21 @@ def check_text_ray_cv(workdir: Path) -> str:
     res = mv.run(
         task="text", data=df, label_col="cause_of_death", text_col="narrative",
         model=TEXT_MODEL, output_dir=out, test_size=0.3, max_length=64,
-        hyperparams=mv.Optimize(backend="ray", n_trials=2, cv=True, cv_folds=2,
-                                space={"epochs": ("categorical", [1])},
+        # 4 trials, and 5 epochs rather than 1 — not for model quality (bert-tiny
+        # on synthetic data learns nothing either way) but so that
+        # check_parallelism() can measure anything at all. Ray takes about a
+        # second to place a trial, and at 1 epoch these finished in ~4s: too close
+        # to the placement stagger for overlap to mean anything. At 5 epochs a
+        # trial runs long enough that concurrency is unambiguous.
+        hyperparams=mv.Optimize(backend="ray", n_trials=4, cv=True, cv_folds=2,
+                                space={"epochs": ("categorical", [5])},
                                 extra=dict(RAY_EXTRA)),
         save_diagnostics=False,
     )
     assert res["best_hyperparams"], "no best_hyperparams returned"
     trials = pd.read_csv(_trials_csv(out))
-    fold_cols = [c for c in trials.columns if c.startswith("fold_")]
+    fold_cols = [c for c in trials.columns
+                 if c.removeprefix("user_attrs_").startswith("fold_")]
     assert fold_cols, (
         "the text Ray CV path produced no per-fold columns, so the fold loop in "
         f"_ray_trial_fn did not run as intended. Columns: {list(trials.columns)}"
@@ -377,29 +389,65 @@ def check_parallelism(workdir: Path) -> str:
     """
     import pandas as pd
 
-    for name in ("text_ray_cv", "tab_ray_cv"):
+    verdicts: list[str] = []
+    inconclusive: list[str] = []
+    for name in ("tab_ray_cv", "text_ray_cv"):
         csv = workdir / name / "hpo" / "hpo_trials.csv"
         if not csv.is_file():
             continue
         trials = pd.read_csv(csv)
-        start = next((c for c in trials.columns if "start_time" in c), None)
-        elapsed = next((c for c in trials.columns
-                        if c in ("elapsed_seconds", "time_total_s")), None)
-        if start is None or elapsed is None or len(trials) < 2:
-            continue
-        t = trials[[start, elapsed]].dropna().sort_values(start)
-        if len(t) < 2:
-            continue
-        ends = t[start] + t[elapsed]
-        overlapped = bool((t[start].iloc[1:].to_numpy() < ends.iloc[:-1].to_numpy()).any())
+        # The trials table carries datetime_start / datetime_complete on both
+        # backends (Optuna natively; the Ray mapper reconstructs them from
+        # Ray's timestamp and time_total_s). Older Ray runs had start_time /
+        # elapsed_seconds instead, so both spellings are accepted.
+        if {"datetime_start", "datetime_complete"} <= set(trials.columns):
+            t = trials[["datetime_start", "datetime_complete"]].dropna()
+            if len(t) < 2:
+                continue
+            t = t.assign(
+                datetime_start=pd.to_datetime(t["datetime_start"]),
+                datetime_complete=pd.to_datetime(t["datetime_complete"]),
+            ).sort_values("datetime_start")
+            starts, ends = t["datetime_start"], t["datetime_complete"]
+        else:
+            start = next((c for c in trials.columns if "start_time" in c), None)
+            elapsed = next((c for c in trials.columns
+                            if c in ("elapsed_seconds", "time_total_s")), None)
+            if start is None or elapsed is None or len(trials) < 2:
+                continue
+            t = trials[[start, elapsed]].dropna().sort_values(start)
+            if len(t) < 2:
+                continue
+            starts, ends = t[start], t[start] + t[elapsed]
+        overlapped = bool((starts.iloc[1:].to_numpy() < ends.iloc[:-1].to_numpy()).any())
+        spans = ends - starts
+        longest = float(spans.dt.total_seconds().max()) if hasattr(spans, "dt") \
+            else float(spans.max())
         if overlapped:
-            return f"trials overlapped in {name} — Ray really ran them concurrently"
+            verdicts.append(f"{name}: {len(t)} trials overlapped")
+            continue
+        # Ray takes about a second to place each trial: even where two trials
+        # demonstrably ran at once, consecutive starts were ~1.1s apart. A trial
+        # shorter than a few times that stagger cannot show overlap either way,
+        # so record it as unmeasured. Calling it a failure would report a
+        # scheduling artifact as a Ray misconfiguration.
+        if longest < 10:
+            inconclusive.append(
+                f"{name}: {len(t)} trials, longest {longest:.1f}s — too short to "
+                "tell (Ray needs ~1s to place each trial)"
+            )
+            continue
         raise AssertionError(
-            f"no two trials overlapped in {name}: Ray ran them one after another. "
-            "Check num_gpus_per_trial against the GPUs actually allocated "
-            f"(used {RAY_EXTRA['num_gpus_per_trial']} per trial, "
+            f"no two trials overlapped in {name}, and its trials ran up to "
+            f"{longest:.1f}s each — long enough that they should have. Ray ran "
+            "them one after another. Check num_gpus_per_trial against the GPUs "
+            f"actually allocated (used {RAY_EXTRA['num_gpus_per_trial']} per trial, "
             f"max_concurrent_trials={RAY_EXTRA['max_concurrent_trials']})."
         )
+    if verdicts:
+        return "; ".join(verdicts + inconclusive)
+    if inconclusive:
+        raise _Skip("; ".join(inconclusive))
     raise _Skip("no trials CSV carried both a start time and a duration")
 
 

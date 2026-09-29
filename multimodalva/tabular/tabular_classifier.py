@@ -14,6 +14,7 @@ import pandas as pd
 
 from ..utils.runtime import track_run
 from ..utils.seeds import seed_everything, set_determinism
+from ..utils.provenance import enforce_resume_manifest, make_resume_manifest
 from ..utils.split import split
 from ..utils.types import PredictionResult
 from .dataset import prepare_tabular_dataset, valid_label_mask
@@ -175,6 +176,42 @@ class TabularClassifier:
             split_col=split_col,
         )
         logger.info("Split: %d train, %d test.", len(self.train_df), len(self.test_df))
+
+        signature_cols = list(dict.fromkeys(feature_cols + [label_col]))
+        if id_col is not None:
+            if id_col not in df.columns:
+                raise ValueError(f"id_col {id_col!r} not found in the DataFrame.")
+            if df[id_col].isna().any() or df[id_col].duplicated().any():
+                raise ValueError(
+                    f"id_col {id_col!r} must contain non-missing, unique values."
+                )
+            signature_cols.append(id_col)
+        manifest = make_resume_manifest(
+            dataframes={
+                "train": self.train_df[signature_cols],
+                "test": self.test_df[signature_cols],
+            },
+            config={
+                "pipeline": "tabular", "model_name": self.model_name,
+                "feature_cols": feature_cols, "label_col": label_col,
+                "cat_cols": cat_cols, "num_cols": num_cols,
+                "drop_missing_label": drop_missing_label,
+                "encode_categoricals": encode_categoricals,
+                "scale_numeric": scale_numeric, "hyperparams": hyperparams,
+                "split_seed": split_seed, "train_seed": train_seed,
+                "test_size": test_size, "stratify": stratify,
+                "use_gpu": use_gpu,
+            },
+        )
+        enforce_resume_manifest(
+            self.output_dir / "resume_manifest.json", manifest,
+            resume=resume,
+            artifacts_exist=any(
+                (self.output_dir / name).exists()
+                for name in ("hpo", "final", "predictions")
+            ),
+            what="this tabular run",
+        )
 
         # --- Step 2: prepare datasets ---
         (

@@ -10,6 +10,7 @@ finished run's OOF predictions without retraining anything.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 from pathlib import Path
 
@@ -20,6 +21,17 @@ import multimodalva as mv
 
 SPECS = [{"model_name": "random_forest"}, {"model_name": "naive_bayes"}]
 ALL = ["meta_learner", "class_aware_voting", "ensemble_selection"]
+
+
+def test_class_voter_public_and_internal_metric_defaults_stay_probability_based():
+    """The claimed Brier default must reach both direct and comparison paths."""
+    from multimodalva.ensemble.stacking import (
+        StackingClassifier,
+        _learn_class_voter_weights,
+    )
+
+    assert inspect.signature(_learn_class_voter_weights).parameters["metric"].default == "brier"
+    assert inspect.signature(StackingClassifier.train_class_voter_stage).parameters["metric"].default == "brier"
 
 
 @pytest.fixture(scope="module")
@@ -72,10 +84,9 @@ def test_chosen_meta_learner_is_reported(all_run):
     This used to assert ``best_meta_name == "logistic_regression"``, which held
     only because the default was a single LR candidate — with one candidate the
     winner is a foregone conclusion. Since 2026-09-27 the default compares the
-    four in ``DEFAULT_META_LEARNERS``, so the winner depends on the data. Pinning
-    a different name would just re-pin an accident of this 28-row fixture; what
-    matters is that the reported winner really is the argmax and that the run
-    records all four scores.
+    candidates in ``DEFAULT_META_LEARNERS``; pinning a name would just re-pin an
+    implementation choice. What matters is that the reported winner really is
+    the argmax and that the run records every configured score.
     """
     from multimodalva.ensemble.stacking import DEFAULT_META_LEARNERS
 
@@ -345,3 +356,65 @@ def test_extend_oof_from_warns_when_the_source_records_no_folds(tmp_path, caplog
             _extend_with(tmp_path, src, n_folds=3, split_seed=7)
     warned = " ".join(r.getMessage() for r in caplog.records)
     assert "cannot be checked" in warned
+def test_text_only_stacking_passes_real_labels_to_the_oof_splitter(
+    tmp_path, monkeypatch,
+):
+    import pandas as pd
+
+    import multimodalva.ensemble.stacking as stacking
+    import multimodalva.text.dataset as text_dataset
+
+    class Dataset:
+        def __init__(self, labels):
+            self.labels = labels
+
+    def fake_prepare(train_df, test_df, **kwargs):
+        labels = sorted(set(train_df["cause"]) | set(test_df["cause"]))
+        label2id = {label: i for i, label in enumerate(labels)}
+        return (
+            Dataset([label2id[x] for x in train_df["cause"]]),
+            Dataset([label2id[x] for x in test_df["cause"]]),
+            label2id,
+            {i: label for label, i in label2id.items()},
+        )
+
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_oof(**kwargs):
+        seen["y"] = kwargs["y_train"]
+        raise Stop
+
+    monkeypatch.setattr(text_dataset, "prepare_text_dataset", fake_prepare)
+    monkeypatch.setattr(stacking, "generate_oof_predictions", fake_oof)
+    df = pd.DataFrame({
+        "text": [f"case {i}" for i in range(20)],
+        "cause": ["a", "b"] * 10,
+    })
+    clf = stacking.StackingClassifier(
+        text_models=[{"model_name": "bert-base-uncased", "hyperparams": {}}],
+        tabular_models=[], output_dir=tmp_path, n_folds=2, resume=False,
+    )
+    with pytest.raises(Stop):
+        clf.train_base_models(df, label_col="cause", text_col="text")
+    assert seen["y"].shape == (16,)
+    assert set(seen["y"]) == {0, 1}
+
+
+def test_stacking_probability_cache_validation_is_strict():
+    from multimodalva.ensemble.stacking import _validate_probability_matrix
+
+    good = np.array([[0.7, 0.3], [0.2, 0.8]])
+    np.testing.assert_array_equal(
+        _validate_probability_matrix(good, rows=2, classes=2, source="cache.npy"),
+        good,
+    )
+    with pytest.raises(RuntimeError, match="shape"):
+        _validate_probability_matrix(good[:1], rows=2, classes=2, source="cache.npy")
+    with pytest.raises(RuntimeError, match="do not sum"):
+        _validate_probability_matrix(
+            np.array([[0.4, 0.4], [0.2, 0.8]]),
+            rows=2, classes=2, source="cache.npy",
+        )

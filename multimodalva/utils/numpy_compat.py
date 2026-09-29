@@ -14,6 +14,32 @@ import joblib
 import numpy as np
 
 
+def _bit_generator_compat_ctor(bit_generator: Any):
+    """Replacement for ``numpy.random._pickle._bit_generator_ctor``.
+
+    **Module level on purpose.** ``ensure_numpy_rng_compat()`` installs this in
+    place of NumPy's own constructor, and pickle serialises a function *by
+    qualified name*: it looks the name up in the module and checks it gets the
+    same object back. A nested ``def`` has a qualname like
+    ``ensure_numpy_rng_compat.<locals>._compat_ctor``, which cannot be looked up,
+    so pickling **any** NumPy RNG anywhere in the process failed with
+    ``AttributeError: Can't get local object`` once the patch was applied — and
+    the patch is never undone. Ray Tune's searcher checkpointing was the first
+    thing to hit it (hpc_ray_smoke check 11, 2026-09-28), but nothing about it is
+    Ray-specific. Keep this at module level.
+    """
+    if isinstance(bit_generator, _CompatBitGenerator):
+        return bit_generator
+    if isinstance(bit_generator, type):
+        return bit_generator()
+    if isinstance(bit_generator, str) and hasattr(np.random, bit_generator):
+        return getattr(np.random, bit_generator)()
+    raise ValueError(f"{bit_generator!r} is not a known BitGenerator module.")
+
+
+_bit_generator_compat_ctor._compat_patched = True
+
+
 def ensure_numpy_rng_compat() -> None:
     """Patch NumPy/joblib unpickling to tolerate cross-version NumPy artifacts."""
     import sys
@@ -56,17 +82,7 @@ def ensure_numpy_rng_compat() -> None:
     if getattr(original_ctor, "_compat_patched", False):
         return
 
-    def _compat_ctor(bit_generator: Any):
-        if isinstance(bit_generator, _CompatBitGenerator):
-            return bit_generator
-        if isinstance(bit_generator, type):
-            return bit_generator()
-        if isinstance(bit_generator, str) and hasattr(np.random, bit_generator):
-            return getattr(np.random, bit_generator)()
-        raise ValueError(f"{bit_generator!r} is not a known BitGenerator module.")
-
-    _compat_ctor._compat_patched = True
-    setattr(_nrp, ctor_name, _compat_ctor)
+    setattr(_nrp, ctor_name, _bit_generator_compat_ctor)
 
 
 class _CompatBitGenerator:
@@ -353,6 +369,19 @@ def _build_numpy_unpickler(unpickler_cls, filename, fobj, mmap_mode):
     return unpickler_cls(filename, fobj)
 
 
+def _inert_bit_generator_ctor(bit_generator):
+    """Prediction-time stand-in: always hand back an inert placeholder.
+
+    Module level for the same reason as ``_bit_generator_compat_ctor`` — this one
+    is installed only inside ``_prediction_pickle_rng_compat()`` and restored
+    afterwards, so its window is narrow, but a local function here would make any
+    pickle attempt inside that window fail the same way.
+    """
+    if isinstance(bit_generator, _CompatBitGenerator):
+        return bit_generator
+    return _CompatBitGenerator()
+
+
 @contextlib.contextmanager
 def _prediction_pickle_rng_compat():
     """Force legacy NumPy RNG pickle constructors to return inert placeholders."""
@@ -368,12 +397,7 @@ def _prediction_pickle_rng_compat():
             if hasattr(_nrp, ctor_name):
                 original = getattr(_nrp, ctor_name)
 
-                def _compat_ctor(_bit_generator, _orig=original):
-                    if isinstance(_bit_generator, _CompatBitGenerator):
-                        return _bit_generator
-                    return _CompatBitGenerator()
-
-                setattr(_nrp, ctor_name, _compat_ctor)
+                setattr(_nrp, ctor_name, _inert_bit_generator_ctor)
                 patched.append((_nrp, ctor_name, original))
 
     module_aliases = {

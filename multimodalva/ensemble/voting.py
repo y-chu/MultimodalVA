@@ -92,14 +92,24 @@ from ..utils.predictions import (
 from ..utils.hpo_defaults import TABULAR_SPEC_DEFAULTS, TEXT_SPEC_DEFAULTS
 from ..utils.optimize_config import (
     _log_hp_source, resolve_spec_hyperparams, resolve_search_resume,
+    validate_base_model_specs,
 )
 from ..utils.runtime import track_run
 from ..utils.seeds import seed_everything, set_determinism
+from ..utils.provenance import enforce_resume_manifest, make_resume_manifest
 
 logger = logging.getLogger(__name__)
 
 # Type alias for a base-model specification dict.
 BaseModelSpec = dict
+
+VOTING_TEXT_SPEC_KEYS = frozenset({
+    "model_name", "hyperparams", "max_length", "use_lora", "use_focal",
+    "use_fast", "early_stopping_patience", "gradient_checkpointing",
+})
+VOTING_TABULAR_SPEC_KEYS = frozenset({
+    "model_name", "hyperparams", "encode_categoricals", "scale_numeric",
+})
 
 
 def _write_base_label_maps(model_dir: "Path", label2id: dict, id2label: dict) -> None:
@@ -257,8 +267,10 @@ def vote_from_results(
             weights=[0.5, 0.3, 0.2],
         )
     """
-    if not results:
-        raise ValueError("results must contain at least one PredictionResult.")
+    if len(results) < 2:
+        raise ValueError(
+            "results must contain at least two PredictionResult objects for voting."
+        )
 
     sorted_ids = sorted(id2label.keys())
     prob_cols  = [f"prob_{cid}" for cid in sorted_ids]
@@ -272,17 +284,40 @@ def vote_from_results(
             "Ensure all results share the same id2label."
         )
 
-    # Extract true labels from first result (same for all)
+    if "true_label" not in first_full.columns:
+        raise ValueError(
+            "results[0].full has no 'true_label' column. vote_from_results() "
+            "requires labelled, aligned predictions."
+        )
+
+    # Extract true labels from first result and verify every other result. Equal
+    # matrix shapes alone do not mean row i is the same death.
     true_labels = first_full["true_label"].tolist()
 
     # Build probability matrices in canonical sorted-id order
     prob_matrices = []
     for idx, r in enumerate(results):
+        if getattr(r, "id2label", id2label) != id2label:
+            raise ValueError(
+                f"results[{idx}].id2label differs from the supplied id2label. "
+                "Probability columns cannot be combined across label maps."
+            )
         missing_in = [c for c in prob_cols if c not in r.full.columns]
         if missing_in:
             raise ValueError(
                 f"results[{idx}].full is missing columns {missing_in}.  "
                 "All results must share the same id2label."
+            )
+        if "true_label" not in r.full.columns:
+            raise ValueError(
+                f"results[{idx}].full has no 'true_label' column. Every result "
+                "must be labelled so row alignment can be checked."
+            )
+        if r.full["true_label"].tolist() != true_labels:
+            raise ValueError(
+                f"results[{idx}] has different true labels or row order from "
+                "results[0]. Soft voting requires the same test records in the "
+                "same order."
             )
         prob_matrices.append(r.full[prob_cols].to_numpy(dtype=float))
 
@@ -291,8 +326,22 @@ def vote_from_results(
     # pipeline's output. Voting averages row i of every matrix, so disagreeing
     # ids mean the inputs are not aligned and the vote would be meaningless.
     ids = None
-    if "id" in first_full.columns:
+    has_ids = ["id" in r.full.columns for r in results]
+    if any(has_ids) and not all(has_ids):
+        missing_at = [i for i, present in enumerate(has_ids) if not present]
+        raise ValueError(
+            "Some voting inputs carry row ids and others do not "
+            f"(missing from results {missing_at}), so alignment cannot be "
+            "verified. Run every base model with the same id_col, or none."
+        )
+    if all(has_ids):
         ids = first_full["id"].tolist()
+        id_series = first_full["id"]
+        if id_series.isna().any() or id_series.duplicated().any():
+            raise ValueError(
+                "results[0] has missing or duplicated row ids. Soft voting "
+                "requires one unique id per test record."
+            )
         for idx, r in enumerate(results[1:], start=1):
             if "id" not in r.full.columns:
                 raise ValueError(
@@ -339,10 +388,6 @@ class SoftVotingClassifier:
             "hyperparams":     {"epochs": 5, "learning_rate": 2e-5},
             "max_length":      512,
             "use_lora":        False,
-            "hyperparams":     None,   # dict | Optimize(...) | None
-            "n_trials":        20,
-            "optimize_metric": "f1_macro",
-            "search_space":    None,
         }
 
     Tabular model spec::
@@ -352,10 +397,6 @@ class SoftVotingClassifier:
             "hyperparams":         {"n_estimators": 300},
             "encode_categoricals": "ordinal",
             "scale_numeric":       False,
-            "hyperparams":         None,
-            "n_trials":            20,
-            "optimize_metric":     "f1_macro",
-            "search_space":        None,
         }
 
     Attributes (populated after run())
@@ -392,6 +433,12 @@ class SoftVotingClassifier:
         """
         text_models    = text_models    or []
         tabular_models = tabular_models or []
+        validate_base_model_specs(
+            text_models, VOTING_TEXT_SPEC_KEYS, setting="text_models"
+        )
+        validate_base_model_specs(
+            tabular_models, VOTING_TABULAR_SPEC_KEYS, setting="tabular_models"
+        )
 
         n_models = len(text_models) + len(tabular_models)
         if n_models < 2:
@@ -569,6 +616,51 @@ class SoftVotingClassifier:
             len(self.train_df), len(self.test_df),
         )
 
+        if id_col is not None:
+            if id_col not in df.columns:
+                raise ValueError(f"id_col {id_col!r} not found in the DataFrame.")
+            if df[id_col].isna().any() or df[id_col].duplicated().any():
+                raise ValueError(
+                    f"id_col {id_col!r} must contain non-missing, unique values."
+                )
+
+        signature_cols = [label_col]
+        if self.text_models:
+            signature_cols.append(text_col)
+        if self.tabular_models:
+            signature_cols.extend(feature_cols)
+        if id_col is not None:
+            signature_cols.append(id_col)
+        signature_cols = list(dict.fromkeys(signature_cols))
+        manifest = make_resume_manifest(
+            dataframes={
+                "train": self.train_df[signature_cols],
+                "test": self.test_df[signature_cols],
+            },
+            config={
+                "pipeline": "voting", "text_models": self.text_models,
+                "tabular_models": self.tabular_models,
+                "weights": self.weights, "label_col": label_col,
+                "text_col": text_col, "feature_cols": feature_cols,
+                "split_seed": split_seed, "train_seed": train_seed,
+                "test_size": test_size, "stratify": stratify,
+                "encode_categoricals": encode_categoricals,
+                "scale_numeric": scale_numeric,
+                "gradient_checkpointing": gradient_checkpointing,
+                "early_stopping_patience": early_stopping_patience,
+                "val_size": val_size,
+            },
+        )
+        enforce_resume_manifest(
+            self.output_dir / "resume_manifest.json", manifest,
+            resume=resume,
+            artifacts_exist=any(
+                (self.output_dir / name).exists()
+                for name in ("base_models", "predictions")
+            ),
+            what="this voting run",
+        )
+
         # Identifiers for the scored rows. prepare_*_dataset() keeps every test
         # row, so these line up with the predictions without further masking.
         test_ids = resolve_test_ids(self.test_df, id_col)
@@ -584,6 +676,7 @@ class SoftVotingClassifier:
             model_dir.mkdir(parents=True, exist_ok=True)
             model_name = spec["model_name"]
             max_length = spec.get("max_length", 512)
+            use_fast   = spec.get("use_fast", TEXT_SPEC_DEFAULTS["use_fast"])
             use_lora   = spec.get("use_lora", False)
             esp        = spec.get("early_stopping_patience", early_stopping_patience)
             gc         = spec.get("gradient_checkpointing", gradient_checkpointing)
@@ -594,6 +687,7 @@ class SoftVotingClassifier:
                 self.train_df, self.test_df,
                 text_col=text_col, label_col=label_col,
                 model_name=model_name, max_length=max_length,
+                use_fast=use_fast,
             )
             # Capture label maps from first model; all subsequent calls must match.
             if label2id is None:
@@ -629,6 +723,7 @@ class SoftVotingClassifier:
                     use_focal=spec.get("use_focal", TEXT_SPEC_DEFAULTS["use_focal"]),
                     gradient_checkpointing=gc,
                     early_stopping_patience=esp,
+                    use_fast=use_fast,
                 )
                 final_val = None   # epochs already determined by the search
                 logger.info("Base model text_%d (%s): search finished — best %s.",
@@ -648,12 +743,14 @@ class SoftVotingClassifier:
                 use_lora=use_lora,
                 gradient_checkpointing=gc,
                 early_stopping_patience=esp,
+                resume=resume,
                 # Without this the text base trains at train_text's own default
                 # seed, so the run-level seed reached the split and the search
                 # but not the training — the base model came out the same
                 # whatever seed the caller asked for.
                 random_state=train_seed,
                 split_seed=split_seed,
+                use_fast=use_fast,
             )
 
             result = predict_text(
@@ -663,6 +760,7 @@ class SoftVotingClassifier:
                 top_k=top_k,
                 save_dir=model_dir / "predictions",
                 ids=test_ids,
+                use_fast=use_fast,
             )
             _write_base_label_maps(model_dir, label2id, id2label)
             self.base_predictions.append(result)

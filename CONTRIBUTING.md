@@ -85,6 +85,39 @@ Both run in CI on every push.
 - Add or update a test when you fix a bug or add behaviour.
 - Update the README or FAQ if you change something a user would notice.
 
+## Conventions that carry weight here
+
+These are not style preferences — each one is a class of bug this codebase has
+shipped and fixed, so a change that breaks one is likely to be reverted.
+
+- **A failure must never return a result.** Worker functions (Ray trials, parallel
+  row workers) re-raise; they do not catch broadly and return placeholder scores.
+  A crashed trial that returns zeros is recorded as a poor trial, and a search
+  will then select a "best" and train a final model on it while reporting success.
+  Use `finally` for cleanup, not `except`. A test that asserts a score exists
+  passes on a zero — assert it is non-zero.
+- **Reusable artifacts are keyed on content, not filenames.** Anything a later run
+  may reuse (search state, fitted models, out-of-fold predictions) carries a
+  signature of the consumed rows and the effective configuration, and is refused
+  on mismatch. Existence of a file is not evidence that it matches.
+- **Every accepted setting is honoured, rejected, or warned about.** Silently
+  dropping a keyword is the failure mode to avoid; `warn_unused_settings()` exists
+  for the cases where a pipeline genuinely cannot use one. If a setting cannot
+  apply, raise and name what to use instead.
+- **A validator shares its rule with the code it validates.** `preflight()` calls
+  the same resolvers the pipelines call rather than reimplementing the check, so
+  the two cannot disagree about what a dataset supports. If you add a guard, add
+  both directions of test: a config it accepts really does get past that point,
+  and one it rejects really does fail there.
+- **Derived values are resolved before anything records them.** A value that feeds
+  a run's signature, name or saved metadata is resolved first, so an artifact
+  never records a placeholder instead of what ran.
+- **Library code does not mutate process-wide state.** No global TLS/SSL changes,
+  and a monkeypatched replacement is a module-level function — `pickle` serialises
+  functions by qualified name, so a nested one breaks pickling process-wide.
+- **Do not leave a callable path that cannot work.** Delete it and refuse it at
+  the entry point with a message naming the supported alternative.
+
 ## Adding a model
 
 Text backbones live in `multimodalva/text/models.py` (`TEXT_MODELS`), and

@@ -35,7 +35,7 @@ including LightGBM, XGBoost and CatBoost:
 | Soft voting (`task="voting"`) | ✅ | |
 | Stacking (`task="stacking"`) | ✅ | |
 | Hyperparameter search, all pipelines | ✅ | |
-| **Parallel / distributed search** (`Optimize(backend="ray")`, unverified — see below) | ❌ | `[ray]` |
+| **Parallel / distributed search** (`Optimize(backend="ray")`) | ❌ | `[ray]` |
 | Evaluation, plots, calibration, bootstrap CIs | ✅ | |
 | Publishing models to the Hugging Face Hub | ✅ | |
 | **LoRA fine-tuning** (`use_lora=True`) | ❌ | `[lora]` |
@@ -51,12 +51,15 @@ says so; on a machine where Ray would have helped (a CUDA GPU, or a SLURM
 allocation) it also warns that the extra is missing, so the fallback is never
 silent.
 
-The Ray backend is **implemented but not yet verified on a real multi-GPU or
-multi-node run** — off a CUDA machine it hands the work back to Optuna by design,
-which is the path every test of it has taken so far. `tests/hpc_ray_smoke.py`
-(with a SLURM wrapper beside it) exercises it on a GPU node; run that before
-trusting it with a long search. Optuna is the backend this package was developed
-on and needs no extra.
+The Ray backend has been **verified on a two-GPU SLURM node** —
+`tests/hpc_ray_smoke.py` (with a SLURM wrapper beside it) runs the whole path
+there: both families searched with cross-validation, the same artifacts under the
+same names, trials observed running concurrently in both, and an ensemble base
+model searched on Ray. Run the smoke test on your own cluster before trusting the
+backend with a long search — a Ray
+misconfiguration usually shows up as trials that queue forever or run one at a
+time, neither of which looks like an error. Optuna needs no extra and is what
+`"auto"` picks off a CUDA machine.
 
 ### Extras
 
@@ -114,6 +117,23 @@ multimodalva run --task text --data clean.csv --label-col cause \
 multimodalva run experiment.yaml
 ```
 
+Before submitting it, `--dry-run` checks the configuration against the data and
+stops: it loads, filters, splits and resolves the feature columns, says what the
+run would do, and trains nothing. A misspelt column name, an unknown model, a
+keyword the pipeline does not accept or a filter value that matches no row is
+named in seconds rather than after the job has queued. It exits 2 when anything
+would stop the run, so a job script can gate on it:
+
+```bash
+multimodalva run experiment.yaml --dry-run || exit 1
+multimodalva run experiment.yaml
+```
+
+`preflight(**config)` is the same check from Python, returning a report rather
+than printing one. A clean dry run says the configuration is consistent with the
+data, not that the run will succeed — nothing trains, so it cannot see a batch
+size that will not fit or a trial budget too small for the search space.
+
 Swap `task=` for any other pipeline (`tabular`, `data_fusion`, `feature_fusion`,
 `voting`, `stacking`). Results land in `output_dir/`: `final/` (model and label
 maps), `predictions/` (top-1, top-k and full-probability CSVs), `hpo/` (study,
@@ -122,8 +142,11 @@ best hyperparameters, diagnostics).
 Three arguments every task shares and that are worth knowing early:
 `id_col=` names a record-identifier column, so each prediction carries its `id`;
 `split_seed=` fixes which deaths land in the test set; `train_seed=` fixes the
-model's own randomness. Re-running with the same `output_dir` resumes an
-interrupted run, and finished runs can be reloaded and combined without
+model's own randomness. Re-running the same data, split and configuration with
+the same `output_dir` resumes an interrupted run (`resume="adopt"` accepts a
+directory made before manifests existed). A content manifest refuses
+stale or legacy artifacts whose provenance cannot be verified, rather than
+mixing runs silently. Finished runs can be reloaded and combined without
 retraining — see the [FAQ](FAQ.md).
 
 ### Predicting with a model that is already trained

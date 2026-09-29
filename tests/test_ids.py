@@ -104,6 +104,38 @@ def test_unknown_id_col_is_reported(tmp_path):
                 id_col="not_a_column", hyperparams={"n_estimators": 10})
 
 
+def test_duplicate_id_col_is_rejected_before_training(tmp_path):
+    df = _demo_df()
+    df.loc[1, "record_id"] = df.loc[0, "record_id"]
+    clf = TabularClassifier(model_name="random_forest", output_dir=tmp_path / "run")
+    with pytest.raises(ValueError, match="unique"):
+        clf.run(df=df, feature_cols=FEATURES, label_col="cause",
+                id_col="record_id", hyperparams={"n_estimators": 10})
+
+
+def test_id_split_rejects_overlap_missing_and_duplicate_ids():
+    from multimodalva.runner import _apply_id_split
+
+    df = _demo_df(n=8)
+    with pytest.raises(ValueError, match="both train and test"):
+        _apply_id_split(
+            df.copy(), {"train_ids": ["VA00000"], "test_ids": ["VA00000"]},
+            "record_id",
+        )
+    with pytest.raises(ValueError, match="not in"):
+        _apply_id_split(
+            df.copy(), {"train_ids": ["VA00000"], "test_ids": ["ghost"]},
+            "record_id",
+        )
+    duplicated = df.copy()
+    duplicated.loc[1, "record_id"] = duplicated.loc[0, "record_id"]
+    with pytest.raises(ValueError, match="not unique"):
+        _apply_id_split(
+            duplicated, {"train_ids": ["VA00000"], "test_ids": ["VA00002"]},
+            "record_id",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Identifiers make the downstream comparison guards stronger
 # ---------------------------------------------------------------------------

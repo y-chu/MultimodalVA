@@ -85,8 +85,11 @@ def merge_search_space(active: dict, override: dict | None, logger_) -> dict:
     """Merge a caller's ``search_space`` over the adaptive one, in place.
 
     The caller wins per key: keys present in ``override`` replace the adaptive
-    value, keys absent keep it. What was replaced is logged so the run record
-    shows which space was actually searched.
+    value **exactly as passed** — nothing narrows, rescales or re-profiles a range
+    the caller wrote — and keys absent keep their adaptive value and are still
+    searched. Both halves are logged, because the run record has to make it
+    obvious that the space actually searched is the caller's where they spoke and
+    the adaptive one where they did not.
 
     Args:
         active:   Adaptive search space, already including any LoRA/focal keys.
@@ -102,12 +105,23 @@ def merge_search_space(active: dict, override: dict | None, logger_) -> dict:
     replaced = sorted(k for k in override if k in active and override[k] != active[k])
     added = sorted(k for k in override if k not in active)
     active.update(override)
-    if replaced:
-        logger_.info("search_space= replaced %d/%d default key(s): %s.",
-                     len(replaced), len(active), ", ".join(replaced))
+    from_adaptive = sorted(k for k in active if k not in override)
+
+    logger_.info(
+        "search_space= gave %d key(s), used exactly as passed: %s.",
+        len(override), ", ".join(sorted(override)),
+    )
     if added:
-        logger_.info("search_space= added %d key(s): %s.", len(added), ", ".join(added))
-    if replaced and not (set(active) - set(override)):
-        logger_.info("search_space= covers every default key; the adaptive "
-                     "defaults do not apply to this run.")
+        logger_.info("search_space= added %d key(s) the adaptive space does not "
+                     "have: %s.", len(added), ", ".join(added))
+    if from_adaptive:
+        logger_.info(
+            "The other %d key(s) come from the adaptive space for this data and "
+            "are searched too: %s. Name them in search_space= to set them "
+            "yourself.",
+            len(from_adaptive), ", ".join(from_adaptive),
+        )
+    else:
+        logger_.info("search_space= covers every key, so the adaptive space "
+                     "contributes nothing to this run.")
     return active

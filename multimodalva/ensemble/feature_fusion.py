@@ -68,9 +68,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import platform
-import ssl
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +80,7 @@ from ..utils.predictions import (
 from ..utils.types import PredictionResult
 from ..utils.runtime import track_run
 from ..utils.seeds import seed_everything, set_determinism
+from ..utils.provenance import enforce_resume_manifest, make_resume_manifest
 from ..text.models import resolve_model_name
 
 logger = logging.getLogger(__name__)
@@ -91,6 +89,7 @@ from ..utils.optimize_config import (  # noqa: E402
     Optimize,
     _log_fixed_or_default,
     resolve_hyperparams,
+    warn_unused_settings,
 )
 
 
@@ -187,7 +186,7 @@ def _resolve_checkpoint(model_name: str, cache_dir: str | Path | None = None) ->
 
 
 def _build_automm_hyperparameters(
-    checkpoint_name: str,
+    checkpoint_name: str | None,
     fusion_strategy: str,
     extra: dict | None,
 ) -> dict:
@@ -207,6 +206,10 @@ def _build_automm_hyperparameters(
 
     hp: dict = {}
     if text_in_use:
+        if checkpoint_name is None:
+            raise ValueError(
+                "checkpoint_name is required when the fusion strategy uses text."
+            )
         hp["model.hf_text.checkpoint_name"] = checkpoint_name
     if model_names is not None:
         hp["model.names"] = model_names
@@ -300,32 +303,18 @@ def _align_automm_proba(proba_df: pd.DataFrame, id2label: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Environment setup helpers (SSL + NLTK — required by AutoGluon AutoMM)
+# Environment setup helper (NLTK — required by AutoGluon AutoMM's text branch)
 # ---------------------------------------------------------------------------
 
 def _ensure_nltk_deps() -> None:
-    """Fix macOS SSL certificate errors and ensure NLTK data required by AutoMM.
+    """Ensure NLTK data required by AutoMM's text branch is available.
 
     AutoGluon AutoMM depends on NLTK corpora (wordnet, omw-1.4) and tokenizers
-    (punkt / punkt_tab).  On macOS the system Python SSL bundle may not include
-    the root certificates needed to reach the NLTK data server; this function
-    patches the default HTTPS context before attempting any downloads.
-
-    Safe to call on Linux / Windows — the SSL patch is skipped on non-macOS
-    platforms and all NLTK downloads are no-ops when the data is already present.
+    (punkt / punkt_tab). Downloads use Python's normal verified TLS context.
+    A certificate or network failure is reported with the resource name and a
+    manual recovery command; package code must never weaken HTTPS verification
+    process-wide.
     """
-    # --- macOS SSL patch ---------------------------------------------------
-    # Python installed via python.org ships without the macOS keychain certs.
-    # Patching ssl._create_default_https_context is the standard workaround
-    # (also applied by the Install Certificates.command bundled with python.org).
-    if platform.system() == "Darwin":
-        try:
-            ssl._create_default_https_context = ssl._create_unverified_context
-            logger.debug("macOS SSL: patched default HTTPS context to unverified.")
-        except AttributeError:
-            pass  # ssl module doesn't support this on this build — skip silently
-
-    # --- NLTK data ---------------------------------------------------------
     try:
         import nltk  # noqa: PLC0415 — optional dep, only needed for AutoMM
     except ImportError:
@@ -347,7 +336,20 @@ def _ensure_nltk_deps() -> None:
             nltk.data.find(find_path)
         except (LookupError, OSError):
             logger.info("Downloading NLTK data: %s", name)
-            nltk.download(name, quiet=True)
+            try:
+                downloaded = nltk.download(name, quiet=True, raise_on_error=True)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"Could not download the NLTK resource {name!r} required "
+                    "by AutoMM. Fix this environment's CA certificates/network "
+                    f"access, or run `python -m nltk.downloader {name}` before "
+                    f"training. Original error: {exc}"
+                ) from exc
+            if downloaded is False:
+                raise RuntimeError(
+                    f"NLTK reported that resource {name!r} was not downloaded. "
+                    f"Run `python -m nltk.downloader {name}` and retry."
+                )
 
 
 def _predictions_dir(output_dir: Path) -> Path:
@@ -382,6 +384,11 @@ def _load_saved_prediction_result(output_dir: Path) -> PredictionResult:
 # ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
+
+#: The only ``Optimize`` fields feature fusion can act on. Everything else is
+#: AutoMM's to decide — see ``warn_unused_settings()`` at the call site.
+FEATURE_FUSION_HONOURED_SETTINGS = frozenset({"n_trials", "space"})
+
 
 class FeatureFusionClassifier:
     """End-to-end feature-level fusion classifier via AutoGluon AutoMM.
@@ -527,8 +534,8 @@ class FeatureFusionClassifier:
     def run(
         self,
         df: pd.DataFrame,
-        text_col: str,
-        feature_cols: list[str],
+        text_col: str | None,
+        feature_cols: list[str] | None,
         label_col: str,
         # --- split ---
         test_size: float = 0.2,
@@ -629,11 +636,13 @@ class FeatureFusionClassifier:
                              can be joined back to the source records and
                              matched against other pipelines' predictions.
             resume:          If ``True`` (default), reuse an existing completed
-                             AutoMM run in ``output_dir`` when the saved
-                             predictions match the current deterministic split.
-                             If a checkpoint exists but prediction CSVs are
-                             missing, load the checkpoint and regenerate the
-                             downstream outputs instead of calling ``fit()``.
+                             AutoMM run only when its content manifest exactly
+                             matches the current split, active columns, and
+                             training configuration. If a matching checkpoint
+                             exists but prediction CSVs are missing, load the
+                             checkpoint and regenerate the downstream outputs
+                             instead of calling ``fit()``. Legacy artifacts
+                             without a manifest are rejected rather than reused.
             top_k:           Number of top classes in topk output.  Default 3.
 
         Returns:
@@ -658,6 +667,18 @@ class FeatureFusionClassifier:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         model_dir = self.output_dir / "automm_model"
 
+        uses_text = self.fusion_strategy != "tabular_only"
+        uses_tabular = self.fusion_strategy != "text_only"
+        if uses_text and not text_col:
+            raise ValueError(
+                f"fusion_strategy={self.fusion_strategy!r} requires text_col."
+            )
+        if uses_tabular and not feature_cols:
+            raise ValueError(
+                f"fusion_strategy={self.fusion_strategy!r} requires at least "
+                "one feature column."
+            )
+
         set_determinism(deterministic)
         seed_everything(train_seed)
 
@@ -665,6 +686,7 @@ class FeatureFusionClassifier:
         self.train_df, self.test_df = split(
             df,
             label_col=label_col,
+            text_col=text_col if uses_text else None,
             test_size=test_size,
             random_state=split_seed,
             stratify=stratify,
@@ -686,10 +708,14 @@ class FeatureFusionClassifier:
         logger.info("Label map: %d classes.", len(label2id))
 
         # --- Step 3: prepare input DataFrames ----------------------------
-        # Deduplicate feature_cols preserving order; always include text_col.
+        # Deduplicate only the modalities this strategy actually consumes.
         seen: set = set()
         ordered_cols: list[str] = []
-        for c in ([text_col] + list(feature_cols)):
+        active_cols = (
+            ([text_col] if uses_text else [])
+            + (list(feature_cols or []) if uses_tabular else [])
+        )
+        for c in active_cols:
             if c not in seen and c != label_col:
                 seen.add(c)
                 ordered_cols.append(c)
@@ -704,15 +730,78 @@ class FeatureFusionClassifier:
         if hp_kind == "search":
             hp_search = hp_search.with_defaults(n_trials=10)
             logger.info("Hyperparameters FROM SEARCH — %s.", hp_search.describe())
+            # AutoMM owns this search: it runs its own scheduler and searcher and
+            # selects on the classifier's eval_metric=, so most of Optimize never
+            # reaches anything here. Say which settings were dropped rather than
+            # letting a deliberately passed backend= or metric= vanish.
+            warn_unused_settings(
+                hp_search,
+                FEATURE_FUSION_HONOURED_SETTINGS,
+                pipeline="feature_fusion",
+                note=(
+                    "AutoGluon AutoMM runs the search itself — its own scheduler "
+                    "and searcher (set them with hpo_scheduler= / hpo_searcher=), "
+                    "its own holdout, and selection on this classifier's "
+                    f"eval_metric={self.eval_metric!r}."
+                ),
+                log=logger,
+            )
         else:
             _log_fixed_or_default(logger, self.model_name, hp_fixed)
 
         hyperparameters = hp_fixed
 
+        if id_col is not None:
+            if id_col not in df.columns:
+                raise ValueError(f"id_col {id_col!r} not found in the DataFrame.")
+            if df[id_col].isna().any() or df[id_col].duplicated().any():
+                raise ValueError(
+                    f"id_col {id_col!r} must contain non-missing, unique values."
+                )
+
+        signature_cols = ordered_cols + [label_col]
+        if id_col is not None and id_col not in signature_cols:
+            signature_cols.append(id_col)
+        manifest = make_resume_manifest(
+            dataframes={
+                "train": self.train_df[signature_cols],
+                "test": self.test_df[signature_cols],
+            },
+            config={
+                "pipeline": "feature_fusion", "model_name": self.model_name,
+                "fusion_strategy": self.fusion_strategy,
+                "preset": self.preset, "eval_metric": self.eval_metric,
+                "label_col": label_col, "text_col": text_col,
+                "feature_cols": feature_cols, "hyperparams": hyperparams,
+                "split_seed": split_seed, "train_seed": train_seed,
+                "test_size": test_size, "stratify": stratify,
+                "val_size": val_size, "time_limit": time_limit,
+                "hpo_scheduler": hpo_scheduler,
+                "hpo_searcher": hpo_searcher,
+            },
+        )
+        enforce_resume_manifest(
+            self.output_dir / "resume_manifest.json", manifest,
+            resume=resume,
+            artifacts_exist=(model_dir.exists() or any(
+                (self.output_dir / name).exists()
+                for name in ("hpo", "predictions")
+            )),
+            what="this feature-fusion run",
+        )
+
         # An explicit model.hf_text.checkpoint_name takes precedence over
         # model_name, and model_name is then not resolved (nor downloaded).
         explicit_checkpoint = (hyperparameters or {}).get("model.hf_text.checkpoint_name")
-        if explicit_checkpoint:
+        if not uses_text:
+            if explicit_checkpoint:
+                raise ValueError(
+                    "fusion_strategy='tabular_only' does not use a text "
+                    "backbone, so hyperparameters must not set "
+                    "'model.hf_text.checkpoint_name'."
+                )
+            checkpoint_name = None
+        elif explicit_checkpoint:
             checkpoint_name = resolve_model_name(str(explicit_checkpoint))
             if checkpoint_name != explicit_checkpoint:
                 hyperparameters = {**hyperparameters, "model.hf_text.checkpoint_name": checkpoint_name}
@@ -792,8 +881,10 @@ class FeatureFusionClassifier:
 
         _patch_automm_gpu_logging()
 
-        # Fix macOS SSL cert errors and ensure NLTK corpora required by AutoMM.
-        _ensure_nltk_deps()
+        # NLTK is used only by AutoMM's text branch. A tabular-only ablation
+        # must not perform unrelated network access before training.
+        if uses_text:
+            _ensure_nltk_deps()
 
         reuse_loaded_predictor = False
         if resume and model_dir.exists():

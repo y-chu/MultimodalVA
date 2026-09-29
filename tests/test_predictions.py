@@ -104,3 +104,43 @@ def test_save_predictions_writes_three_csvs(tmp_path):
         path = tmp_path / "out" / f"preds_{name}.csv"
         assert path.exists()
         assert len(pd.read_csv(path)) == 1
+
+
+def test_vote_from_results_rejects_misaligned_truth_ids_and_label_maps():
+    from multimodalva.ensemble.voting import vote_from_results
+
+    id2label = _id2label(2)
+    probs = np.array([[0.8, 0.2], [0.1, 0.9]])
+    first = assemble_predictions(
+        probs, id2label, true_labels=["cause_0", "cause_1"], ids=["a", "b"]
+    )
+    wrong_truth = assemble_predictions(
+        probs, id2label, true_labels=["cause_1", "cause_0"], ids=["a", "b"]
+    )
+    with pytest.raises(ValueError, match="different true labels"):
+        vote_from_results([first, wrong_truth], id2label)
+
+    wrong_ids = assemble_predictions(
+        probs, id2label, true_labels=["cause_0", "cause_1"], ids=["b", "a"]
+    )
+    with pytest.raises(ValueError, match="different row ids"):
+        vote_from_results([first, wrong_ids], id2label)
+
+    second = assemble_predictions(
+        probs, {0: "other_0", 1: "other_1"},
+        true_labels=["cause_0", "cause_1"], ids=["a", "b"],
+    )
+    with pytest.raises(ValueError, match="id2label differs"):
+        vote_from_results([first, second], id2label)
+
+
+def test_vote_from_results_rejects_duplicated_ids():
+    from multimodalva.ensemble.voting import vote_from_results
+
+    id2label = _id2label(2)
+    result = assemble_predictions(
+        np.array([[0.8, 0.2], [0.1, 0.9]]), id2label,
+        true_labels=["cause_0", "cause_1"], ids=["same", "same"],
+    )
+    with pytest.raises(ValueError, match="duplicated row ids"):
+        vote_from_results([result, result], id2label)

@@ -306,15 +306,25 @@ def _resolve_input(data, true_col, model_cols):
     return data, cols
 
 
-def _draw_indices(n: int, n_boot: int, random_state: int) -> np.ndarray:
-    """One resample-index matrix, reused by every model.
+def _index_batches(
+    n: int,
+    n_boot: int,
+    random_state: int,
+    *,
+    target_bytes: int = 16 << 20,
+):
+    """Yield deterministic bootstrap indices without allocating B×N at once.
 
-    Every model is scored on the same resampled cases. Drawing separately per
-    model would make the intervals incomparable and would shift them whenever
-    the set of models changed.
+    A 10,000-resample analysis of 100,000 cases previously allocated roughly
+    8 GB just for the index matrix. Batching keeps that temporary allocation
+    near ``target_bytes`` while every model still sees identical resamples.
     """
     rng = np.random.default_rng(random_state)
-    return rng.integers(0, n, size=(n_boot, n))
+    itemsize = np.dtype(np.int64).itemsize
+    batch_size = max(1, min(n_boot, target_bytes // max(itemsize * n, 1)))
+    for start in range(0, n_boot, batch_size):
+        stop = min(start + batch_size, n_boot)
+        yield start, rng.integers(0, n, size=(stop - start, n))
 
 
 def _topk_hits(topk_df: pd.DataFrame, top_k: int) -> np.ndarray:
@@ -417,7 +427,8 @@ def bootstrap_ci(
     frame, cols = _resolve_input(data, true_col, model_cols)
     y_true, y_pred, n_classes = _encode(frame, true_col, cols)
     n = y_true.size
-    boot_idx = _draw_indices(n, n_boot, random_state)
+    if n == 0:
+        raise ValueError("Cannot bootstrap an empty prediction table.")
     lo_q, hi_q = (100 - ci) / 2, 100 - (100 - ci) / 2
     scale = 100.0 if percentage else 1.0
 
@@ -425,16 +436,13 @@ def bootstrap_ci(
     if topk_dfs:
         topk_metric_names = [f"top{k}_accuracy" for k in range(2, top_k + 1)]
 
-    rows: list[dict] = []
+    points: dict[str, dict[str, float]] = {}
+    all_draws: dict[str, dict[str, np.ndarray]] = {}
+    topk_hits: dict[str, dict[str, np.ndarray]] = {}
     for col in cols:
         yp = y_pred[col]
-        point = _confusion_metrics(y_true, yp, n_classes, metrics)
-        draws = {m: np.empty(n_boot) for m in metrics}
-        for b in range(n_boot):
-            idx = boot_idx[b]
-            values = _confusion_metrics(y_true[idx], yp[idx], n_classes, metrics)
-            for m in metrics:
-                draws[m][b] = values[m]
+        points[col] = _confusion_metrics(y_true, yp, n_classes, metrics)
+        all_draws[col] = {m: np.empty(n_boot) for m in metrics}
 
         if topk_dfs and col in topk_dfs:
             hits = _topk_hits(topk_dfs[col], top_k)
@@ -443,12 +451,34 @@ def bootstrap_ci(
                     f"Model {col!r}: topk table has {hits.size} rows but the "
                     f"predictions have {n}."
                 )
+            topk_hits[col] = {}
             for name in topk_metric_names:
                 k = int(name.split("top")[1].split("_")[0])
                 hits_k = _topk_hits(topk_dfs[col], k)
-                point[name] = float(hits_k.mean())
-                draws[name] = hits_k[boot_idx].mean(axis=1)
+                points[col][name] = float(hits_k.mean())
+                all_draws[col][name] = np.empty(n_boot)
+                topk_hits[col][name] = hits_k
 
+    # One batch of indices is shared by all models; memory is O(batch×N), not
+    # O(B×N). Filling preallocated score vectors keeps the public result stable.
+    for start, index_batch in _index_batches(n, n_boot, random_state):
+        for offset, idx in enumerate(index_batch):
+            draw_i = start + offset
+            for col in cols:
+                values = _confusion_metrics(
+                    y_true[idx], y_pred[col][idx], n_classes, metrics
+                )
+                for metric in metrics:
+                    all_draws[col][metric][draw_i] = values[metric]
+        stop = start + len(index_batch)
+        for col, hit_metrics in topk_hits.items():
+            for name, hits in hit_metrics.items():
+                all_draws[col][name][start:stop] = hits[index_batch].mean(axis=1)
+
+    rows: list[dict] = []
+    for col in cols:
+        point = points[col]
+        draws = all_draws[col]
         for m in metrics + [x for x in topk_metric_names if x in draws]:
             values = draws[m] * scale
             lo, hi = np.percentile(values, [lo_q, hi_q])
@@ -563,6 +593,10 @@ def paired_bootstrap_ci(
         raise ValueError(
             f"Unknown metric(s): {sorted(unknown)}. Supported: {list(REPORT_METRICS)}."
         )
+    if n_boot < 1:
+        raise ValueError("n_boot must be at least 1.")
+    if not 0 < ci < 100:
+        raise ValueError("ci must be between 0 and 100 (exclusive).")
 
     frame, cols = _resolve_input(data, true_col, model_cols)
 
@@ -592,7 +626,8 @@ def paired_bootstrap_ci(
     all_models = sorted(needed)
     y_true, y_pred, n_classes = _encode(frame, true_col, all_models)
     n = y_true.size
-    boot_idx = _draw_indices(n, n_boot, random_state)
+    if n == 0:
+        raise ValueError("Cannot bootstrap an empty prediction table.")
     lo_q, hi_q = (100 - ci) / 2, 100 - (100 - ci) / 2
     scale = 100.0 if percentage else 1.0
 
@@ -603,13 +638,19 @@ def paired_bootstrap_ci(
     for name in all_models:
         yp = y_pred[name]
         point[name] = _confusion_metrics(y_true, yp, n_classes, metrics)
-        draws = {m: np.empty(n_boot) for m in metrics}
-        for b in range(n_boot):
-            idx = boot_idx[b]
-            values = _confusion_metrics(y_true[idx], yp[idx], n_classes, metrics)
-            for m in metrics:
-                draws[m][b] = values[m]
-        per_model[name] = draws
+        per_model[name] = {m: np.empty(n_boot) for m in metrics}
+
+    for start, index_batch in _index_batches(n, n_boot, random_state):
+        for offset, idx in enumerate(index_batch):
+            draw_i = start + offset
+            for name in all_models:
+                values = _confusion_metrics(
+                    y_true[idx], y_pred[name][idx], n_classes, metrics
+                )
+                for metric in metrics:
+                    per_model[name][metric][draw_i] = values[metric]
+
+    for name in all_models:
         logger.info("Paired bootstrap: %s scored (n=%d, B=%d)", name, n, n_boot)
 
     rows: list[dict] = []

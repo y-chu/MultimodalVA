@@ -240,8 +240,11 @@ def _read_training_metadata(root: Path, artifact_dir: Path) -> dict:
         if p.is_file():
             try:
                 meta.update(json.loads(p.read_text()))
-            except ValueError:
-                pass
+            except (ValueError, OSError) as exc:
+                raise ValueError(
+                    f"Cannot read training metadata at {p}: {exc}. Refusing to "
+                    "guess the pipeline while a metadata file is present."
+                ) from exc
     return meta
 
 

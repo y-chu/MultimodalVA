@@ -235,6 +235,7 @@
       <div class="nav-group-title">Package Reference</div>
       <a href="#api">multimodalva.run</a>
       <a href="#api-run" class="sub">run()</a>
+      <a href="#api-preflight" class="sub">preflight()</a>
       <a href="#utils">multimodalva.utils</a>
       <a href="#utils-split" class="sub">split()</a>
       <a href="#utils-types" class="sub">PredictionResult</a>
@@ -491,6 +492,25 @@ Reusing one split across models so the numbers are comparable::
     </table>
     <p><strong>Returns</strong> <code>The underlying results dict</code>: <code>predictions</code> (a <code>PredictionResult</code>), <code>label2id</code>, <code>id2label</code>, <code>output_dir</code>, and pipeline-specific keys.</p>
 
+    <a class="anchor" id="api-preflight"></a>
+    <h3>preflight()</h3>
+    <div class="sig">
+      <span class="fn-name">preflight</span>(<span class="param">**config</span>) → <span class="returns">dict</span>
+    </div>
+    <p>Check a :func:`run` configuration without training anything.</p>
+    <p>Takes the same keyword arguments as :func:`run` and performs every step that happens *before* a model is built — argument policing, loading, filtering, the missing-row drop, the train/test split, feature-column resolution — then stops. On a cluster that turns a mistyped column name from a job that queues, starts, and dies into an answer in seconds on the login node.</p>
+    <p>Unlike :func:`run` it does not raise on a bad configuration. Every problem it finds is collected, so one call names all of them instead of only the first, and <code>ok</code> says whether :func:`run` would get past this point.</p>
+    <p>A report dict:</p>
+    <p><code>ok</code> <code>False</code> if anything in <code>problems</code> would stop the run. <code>task</code> The canonical task name, or <code>None</code> if even that could not be read. <code>problems</code> Configuration errors, each already phrased for a reader. <code>notes</code> Things worth knowing that are not errors — a degradation the run would accept silently, a setting that overrides another. <code>facts</code> Ordered label -&gt; value pairs describing the run that would happen. <code>log</code> The INFO lines the package emitted while checking.</p>
+    <p>What a clean preflight does **not** promise. It checks that the configuration is consistent with the data, not that the run will succeed: nothing here trains, so it cannot tell whether a batch size fits in the GPU, whether the trial budget is enough for the search space, or whether an <code>Optimize(extra=...)</code> key means anything to the backend.</p>
+    <p>Example: ::</p>
+    <p>import multimodalva as mv</p>
+    <p>report = mv.preflight(task="tabular", data="clean.csv", label_col="cause", features="re:^i\d{3}$", model="lightgbm") if not report["ok"]: raise SystemExit("\n".join(report["problems"]))</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>**config</code></td><td>Exactly what :func:`run` takes. Keywords :func:`run` does not name are checked against the signature of the class the task dispatches to, which is where an unrecognised one would land.</td></tr>
+    </table>
+
     <a class="anchor" id="api-optimize"></a>
     <h3>Optimize</h3>
     <div class="sig">
@@ -505,7 +525,7 @@ Reusing one split across models so the numbers are comparable::
       <tr><td><code>n_trials</code></td><td>How many configurations to try. <code>None</code> uses the family default — 30 for text, 50 for tabular, since one text trial costs far more.</td></tr>
       <tr><td><code>space</code></td><td>Overrides the adaptive default space, one key at a time. Keys you leave out keep their adaptive value, and the run log records which ones you replaced. Same spec format as <code>text/search_spaces.py</code>: <code>("float_log", lo, hi)</code>, <code>("float", lo, hi)</code>, <code>("int", lo, hi)</code>, <code>("categorical", [...])</code>.</td></tr>
       <tr><td><code>cv</code></td><td>Score each configuration by cross-validation rather than one validation split. Steadier, and costs <code>cv_folds</code> times more.</td></tr>
-      <tr><td><code>cv_folds</code></td><td>Folds used when <code>cv</code> is True.</td></tr>
+      <tr><td><code>cv_folds</code></td><td>Folds used when <code>cv</code> is True. An integer is taken literally and a search **raises** when the rarest class in the training rows has fewer rows than that, because stratified folds cannot then hold every class. <code>"auto"</code> instead uses as many folds as the data supports, up to :data:`CV_FOLDS_DEFAULT`, and says so in the log — for data whose rarest cause is not known in advance. Default 3.</td></tr>
       <tr><td><code>resume</code></td><td>Reattach to an interrupted search in the same output directory and carry on, instead of starting over. <code>None</code> (default) follows the run's own <code>resume=</code>, so one switch covers the whole run; set it only to treat the search differently from the rest.</td></tr>
       <tr><td><code>pruning</code></td><td>Stop unpromising configurations early. <code>None</code> (default) uses the family default — on for text, off for tabular, because a text trial costs minutes and a tree-model trial costs seconds. On the Optuna backend this is Optuna's <code>MedianPruner</code>, comparing a configuration against the median of the configurations finished so far. **Ignored by the Ray backend**, which has no equivalent: use <code>Optimize(extra={"use_asha": True})</code> there, which terminates unpromising trials by successive halving instead.</td></tr>
       <tr><td><code>backend</code></td><td>Which search engine runs the trials.</td></tr>
@@ -879,7 +899,7 @@ voted = vote_from_results([bert, lgbm], id2label=bert.id2label)</code></pre>
     <p><strong>Returns:</strong> The identifiers as a list, or <code>None</code> when <code>id_col</code> is <code>None</code>.</p>
     <table>
       <tr><th>Raises</th><th>Description</th></tr>
-      <tr><td><code>ValueError</code></td><td><code>id_col</code> is not a column of <code>test_df</code>.</td></tr>
+      <tr><td><code>ValueError</code></td><td><code>id_col</code> is not a column of <code>test_df</code>, or the retained identifiers are missing or duplicated.</td></tr>
     </table>
 
     <a class="anchor" id="utils-datasets"></a>
@@ -1138,7 +1158,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
 
     <h4>optimize_text()</h4>
     <div class="sig">
-      <span class="fn-name">optimize_text</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=30</span>, <span class="param">metric='f1_macro'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">split_seed=None</span>, <span class="param">study_name='text_hpo'</span>, <span class="param">use_lora=False</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=4</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=TEXT_PRUNING_DEFAULT</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">export_best_trial=False</span>, <span class="param">use_fast=True</span>, <span class="param">use_cv=True</span>, <span class="param">n_cv_folds=3</span>) → <span class="returns">(best_hyperparams, study)</span>
+      <span class="fn-name">optimize_text</span>(<span class="param">train_dataset</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=30</span>, <span class="param">metric='f1_macro'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">random_state=42</span>, <span class="param">split_seed=None</span>, <span class="param">study_name=None</span>, <span class="param">use_lora=False</span>, <span class="param">use_focal=False</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">early_stopping_patience=4</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=TEXT_PRUNING_DEFAULT</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">export_best_trial=False</span>, <span class="param">use_fast=True</span>, <span class="param">use_cv=True</span>, <span class="param">n_cv_folds=3</span>) → <span class="returns">(best_hyperparams, study)</span>
     </div>
     <p>Run Optuna hyperparameter search using train_text() and predict_text().</p>
     <p>Internally splits train_dataset into an (1 - val_size) / val_size opt-train / opt-eval split. Each trial trains on opt-train and is scored on opt-eval. The held-out test set from prepare_text_dataset() is never used here.</p>
@@ -1156,7 +1176,7 @@ results = clf.run(df, text_col="narrative", label_col="cause_of_death",
       <tr><td><code>val_size</code></td><td>Fraction of train_dataset held out for trial evaluation. Default 0.2.</td></tr>
       <tr><td><code>random_state</code></td><td>Seed for the Optuna sampler and for model training.</td></tr>
       <tr><td><code>split_seed</code></td><td>Seed for the row partitioning this function does internally — the cross-validation folds and the internal validation split. <code>None</code> (the default) reuses <code>random_state</code>, so existing callers are unaffected. Pass it separately to hold the partition fixed while <code>random_state</code> reseeds the model. Default 42.</td></tr>
-      <tr><td><code>study_name</code></td><td>Name for the Optuna study. Default "text_hpo".</td></tr>
+      <tr><td><code>study_name</code></td><td>Optuna study name. By default a content-derived name is used, so a JournalStorage file cannot silently mix trials from different tokenized data or search configurations.</td></tr>
       <tr><td><code>use_lora</code></td><td>Apply LoRA adapters during each trial. Default False.</td></tr>
       <tr><td><code>use_focal</code></td><td>Use focal loss during each trial.  When True, merges FOCAL_SEARCH_SPACE (focal_gamma, class_weights) and fixes loss_type="focal" in every trial's hyperparams. Recommended for severe class imbalance; pair with metric="f1_macro" or "balanced_accuracy". Default False.</td></tr>
       <tr><td><code>gradient_checkpointing</code></td><td>Enable gradient checkpointing per trial. Default False.</td></tr>
@@ -1385,7 +1405,7 @@ results = clf.run(
 
     <h4>optimize_tabular()</h4>
     <div class="sig">
-      <span class="fn-name">optimize_tabular</span>(<span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=50</span>, <span class="param">metric='f1_macro'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">use_cv=True</span>, <span class="param">n_cv_folds=3</span>, <span class="param">random_state=42</span>, <span class="param">split_seed=None</span>, <span class="param">study_name='tabular_hpo'</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=TABULAR_PRUNING_DEFAULT</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">(best_hyperparams, study)</span>
+      <span class="fn-name">optimize_tabular</span>(<span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">model_name</span>, <span class="param">output_dir</span>, <span class="param">n_trials=50</span>, <span class="param">metric='f1_macro'</span>, <span class="param">search_space=None</span>, <span class="param">val_size=0.2</span>, <span class="param">use_cv=True</span>, <span class="param">n_cv_folds=3</span>, <span class="param">random_state=42</span>, <span class="param">split_seed=None</span>, <span class="param">study_name=None</span>, <span class="param">storage_path=None</span>, <span class="param">load_if_exists=True</span>, <span class="param">enable_pruning=TABULAR_PRUNING_DEFAULT</span>, <span class="param">save_trials_csv=True</span>, <span class="param">cleanup_trials=True</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">search_space_profile='auto'</span>) → <span class="returns">(best_hyperparams, study)</span>
     </div>
     <p>Run Optuna hyperparameter search for a tabular model.</p>
     <p>Uses one of two internal evaluation strategies: - use_cv=True: stratified k-fold CV over X_train/y_train; each trial score is the mean across folds. - use_cv=False: single stratified opt-train / opt-val split. The held-out test set from prepare_tabular_dataset() is never used here.</p>
@@ -1407,7 +1427,7 @@ results = clf.run(
       <tr><td><code>n_cv_folds</code></td><td>Number of CV folds when use_cv=True. Default 3.</td></tr>
       <tr><td><code>random_state</code></td><td>Seed for the Optuna sampler and for each candidate fit. Default 42.</td></tr>
       <tr><td><code>split_seed</code></td><td>Seed for the cross-validation folds / internal validation split this function draws. <code>None</code> (the default) reuses <code>random_state</code>, so existing callers are unaffected. Pass it separately to hold the folds fixed while <code>random_state</code> reseeds the models.</td></tr>
-      <tr><td><code>study_name</code></td><td>Optuna study name. Default "tabular_hpo".</td></tr>
+      <tr><td><code>study_name</code></td><td>Optuna study name. By default a content-derived name is used, so a JournalStorage file cannot silently mix trials from different data or search configurations.</td></tr>
       <tr><td><code>storage_path</code></td><td>Path to the JournalStorage log file for study persistence. Defaults to output_dir/hpo_&lt;model_name&gt;.log. Accepts a bare path (.log) or legacy sqlite:///… / .db paths — .db paths are auto-redirected to .log with a warning.</td></tr>
       <tr><td><code>load_if_exists</code></td><td>Resume an existing study. Default True.</td></tr>
       <tr><td><code>enable_pruning</code></td><td>MedianPruner for early trial termination. Default False (pruning is less useful for fast sklearn fits).</td></tr>
@@ -1778,7 +1798,7 @@ proba = predictor.predict_proba(new_df)</code></pre>
       <tr><td><code>hpo_scheduler</code></td><td>Ray Tune scheduler.  <code>"local"</code> (default, single machine) or <code>"ray"</code> (distributed cluster). Only used when a search runs.</td></tr>
       <tr><td><code>hpo_searcher</code></td><td>Search algorithm.  <code>"bayes"</code> (default, Bayesian optimisation), <code>"random"</code>, or <code>"grid"</code>. Only used when a search runs.</td></tr>
       <tr><td><code>id_col</code></td><td>Optional column holding a row identifier. When given, predictions carry a leading <code>id</code> column so they can be joined back to the source records and matched against other pipelines' predictions.</td></tr>
-      <tr><td><code>resume</code></td><td>If <code>True</code> (default), reuse an existing completed AutoMM run in <code>output_dir</code> when the saved predictions match the current deterministic split. If a checkpoint exists but prediction CSVs are missing, load the checkpoint and regenerate the downstream outputs instead of calling <code>fit()</code>.</td></tr>
+      <tr><td><code>resume</code></td><td>If <code>True</code> (default), reuse an existing completed AutoMM run only when its content manifest exactly matches the current split, active columns, and training configuration. If a matching checkpoint exists but prediction CSVs are missing, load the checkpoint and regenerate the downstream outputs instead of calling <code>fit()</code>. Legacy artifacts without a manifest are rejected rather than reused.</td></tr>
       <tr><td><code>top_k</code></td><td>Number of top classes in topk output.  Default 3.</td></tr>
     </table>
     <table>
@@ -1801,20 +1821,12 @@ proba = predictor.predict_proba(new_df)</code></pre>
     "hyperparams":     {"epochs": 5, "learning_rate": 2e-5},
     "max_length":      512,
     "use_lora":        False,
-    "hyperparams":     None,   # dict | Optimize(...) | None
-    "n_trials":        20,
-    "optimize_metric": "f1_macro",
-    "search_space":    None,
 }</code></pre>
     <pre><code>{
     "model_name":          "lightgbm",
     "hyperparams":         {"n_estimators": 300},
     "encode_categoricals": "ordinal",
     "scale_numeric":       False,
-    "hyperparams":         None,
-    "n_trials":            20,
-    "optimize_metric":     "f1_macro",
-    "search_space":        None,
 }</code></pre>
     <table>
       <tr><th>Parameter</th><th>Description</th></tr>
@@ -1975,14 +1987,14 @@ proba = predictor.predict_proba(new_df)</code></pre>
 
     <h4>.train_class_voter_stage()</h4>
     <div class="sig">
-        <span class="fn-name">train_class_voter_stage</span>(<span class="param">metric='f1'</span>, <span class="param">shrinkage=0.1</span>, <span class="param">min_support_for_trust=20.0</span>, <span class="param">fallback_to_soft=True</span>, <span class="param">fallback_metric='f1_macro'</span>, <span class="param">fallback_cv_folds=3</span>, <span class="param">split_seed=None</span>, <span class="param">fallback_tolerance=0.0</span>) → <span class="returns">dict</span>
+        <span class="fn-name">train_class_voter_stage</span>(<span class="param">metric='brier'</span>, <span class="param">shrinkage=0.1</span>, <span class="param">min_support_for_trust=20.0</span>, <span class="param">fallback_to_soft=True</span>, <span class="param">fallback_metric='f1_macro'</span>, <span class="param">fallback_cv_folds=3</span>, <span class="param">split_seed=None</span>, <span class="param">fallback_tolerance=0.0</span>) → <span class="returns">dict</span>
     </div>
     <p>Stage 2 alternative: learn class-aware voting weights from OOF data.</p>
     <p>Uses only the OOF meta-feature matrix and OOF labels. This is a linear, interpretable combiner that learns a different model-weight profile for each class, without fitting a meta-learner over the concatenated OOF features.</p>
     <p>The learned weights are applied via predicted-class soft-gating (implemented in :func:`_apply_class_voter`): for each sample, each model gets the weight associated with the class that model predicts as most likely, then gates are normalized across models.</p>
     <table>
       <tr><th>Parameter</th><th>Description</th></tr>
-      <tr><td><code>metric</code></td><td>Per-class OOF scoring metric used to rank models within each class.  Default <code>"f1"</code>.  <code>"f1"</code>, <code>"recall"</code> and <code>"precision"</code> use hard argmax decisions.  <code>"brier"</code> computes 1 − mean((p − y_bin)²) from soft probabilities, which degrades more gracefully when a class is rare or absent in OOF data.</td></tr>
+      <tr><td><code>metric</code></td><td>Per-class OOF scoring metric used to rank models within each class.  Default <code>"brier"</code>.  <code>"f1"</code>, <code>"recall"</code> and <code>"precision"</code> use hard argmax decisions.  <code>"brier"</code> computes 1 − mean((p − y_bin)²) from soft probabilities, which degrades more gracefully when a class is rare or absent in OOF data.</td></tr>
       <tr><td><code>shrinkage</code></td><td>Base blend factor toward uniform per-class weights for well-supported classes.  Classes with fewer OOF examples than <code>min_support_for_trust</code> receive additional shrinkage on top of this base (support-adaptive). <code>0.0</code> = trust learned OOF weights for all classes. <code>1.0</code> = uniform voting for all classes.  Default <code>0.1</code>.</td></tr>
       <tr><td><code>min_support_for_trust</code></td><td>OOF training-set count below which a class is considered insufficiently supported and its weights are pulled more strongly toward uniform.  Default <code>20</code>.</td></tr>
       <tr><td><code>fallback_to_soft</code></td><td>If True (default), run a stratified CV safeguard on OOF data comparing learned class-voter vs uniform soft voting. If class-voter underperforms by more than <code>fallback_tolerance</code>, final saved weights are replaced by exact uniform weights (safe fallback).</td></tr>
@@ -2103,12 +2115,11 @@ proba = predictor.predict_proba(new_df)</code></pre>
 
     <h4>generate_oof_predictions()</h4>
     <div class="sig">
-      <span class="fn-name">generate_oof_predictions</span>(<span class="param">text_model_specs</span>, <span class="param">tabular_model_specs</span>, <span class="param">train_text_dataset</span>, <span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">n_folds=5</span>, <span class="param">random_state=42</span>, <span class="param">split_seed=None</span>, <span class="param">output_dir='runs/ensemble/stacking/oof'</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">batch_size=32</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">resume=True</span>, <span class="param">save_fold_models=False</span>, <span class="param">cleanup_fold_files=True</span>, <span class="param">text_best_hp=None</span>, <span class="param">tabular_best_hp=None</span>, <span class="param">train_df=None</span>, <span class="param">feature_cols=None</span>, <span class="param">label_col='cause'</span>) → <span class="returns">(ndarray, ndarray)</span>
+      <span class="fn-name">generate_oof_predictions</span>(<span class="param">text_model_specs</span>, <span class="param">tabular_model_specs</span>, <span class="param">train_text_dataset</span>, <span class="param">X_train</span>, <span class="param">y_train</span>, <span class="param">label2id</span>, <span class="param">id2label</span>, <span class="param">n_folds=5</span>, <span class="param">random_state=42</span>, <span class="param">split_seed=None</span>, <span class="param">output_dir='runs/ensemble/stacking/oof'</span>, <span class="param">gradient_checkpointing=False</span>, <span class="param">batch_size=32</span>, <span class="param">n_jobs=-1</span>, <span class="param">use_gpu=None</span>, <span class="param">resume=True</span>, <span class="param">save_fold_models=False</span>, <span class="param">cleanup_fold_files=True</span>, <span class="param">text_best_hp=None</span>, <span class="param">tabular_best_hp=None</span>) → <span class="returns">(ndarray, ndarray)</span>
     </div>
     <p>Generate out-of-fold probability predictions for all base models.</p>
     <p>For each fold and each base model, trains on the k-1 in-fold samples and predicts probabilities for the held-out fold.  OOF probabilities from all base models are concatenated into a meta-feature matrix covering the full training set.</p>
     <p>Meta-feature matrix column layout (one block of n_classes per model): <code>[text_0_prob_0..C, text_1_prob_0..C, ..., tab_0_prob_0..C, ...]</code></p>
-    <p>Note: When any <code>tabular_model_specs</code> entry has <code>model_name="insilicova"</code>, both <code>train_df</code> and <code>feature_cols</code> must be supplied.  InSilicoVA operates on the raw VA DataFrame (not the preprocessed numpy arrays) and has no separate training phase — the fold val rows are passed directly to :func:`_insilicova_predict_df`.</p>
     <table>
       <tr><th>Parameter</th><th>Description</th></tr>
       <tr><td><code>text_model_specs</code></td><td>List of text base-model spec dicts.</td></tr>
@@ -2130,9 +2141,6 @@ proba = predictor.predict_proba(new_df)</code></pre>
       <tr><td><code>save_fold_models</code></td><td>Keep model weights after extracting OOF probs. <code>False</code> (default) saves disk space.</td></tr>
       <tr><td><code>text_best_hp</code></td><td>Pre-computed HP dicts for text models (from HPO). <code>None</code> → use <code>spec["hyperparams"]</code> as-is.</td></tr>
       <tr><td><code>tabular_best_hp</code></td><td>Pre-computed HP dicts for tabular models.</td></tr>
-      <tr><td><code>train_df</code></td><td>Full training DataFrame (required when any spec has <code>model_name="insilicova"</code>).</td></tr>
-      <tr><td><code>feature_cols</code></td><td>VA indicator columns for InSilicoVA.</td></tr>
-      <tr><td><code>label_col</code></td><td>Cause label column name in *train_df*. Passed to InSilicoVA as <code>causes_train</code>. Default "cause".</td></tr>
     </table>
 
     <a class="anchor" id="ensemble-selection"></a>

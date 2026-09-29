@@ -231,8 +231,8 @@ class EnsembleClassifier:
     def run(
         self,
         df: pd.DataFrame,
-        text_col: str,
-        feature_cols: list[str],
+        text_col: str | None,
+        feature_cols: list[str] | None,
         label_col: str,
         **kwargs,
     ) -> dict:

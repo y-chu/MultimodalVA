@@ -39,7 +39,13 @@ class TabularPretrainedBackend:
     def from_pretrained(cls, artifact_dir: Path, checks: PretrainedChecks, *,
                         feature_cols: list[str] | None = None,
                         missing_feature_method: str = "error",
-                        id2label: dict | None = None, **_ignored):
+                        id2label: dict | None = None, **load_kwargs):
+        if load_kwargs:
+            raise TypeError(
+                "TabularPretrainedBackend does not accept backend_kwargs "
+                f"{sorted(load_kwargs)}. These settings would otherwise be "
+                "silently ignored."
+            )
         bundle = load_joblib_compat(artifact_dir / "model.joblib")
         if isinstance(bundle, dict) and "model" in bundle:
             model, preprocessor = bundle["model"], bundle.get("preprocessor")
