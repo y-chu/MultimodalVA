@@ -14,8 +14,8 @@ Spec format (used by both Optuna and Ray Tune backends in hpo.py):
 Precedence, lowest to highest: TABULAR_DEFAULT_SEARCH_SPACES[model_name] →
 get_tabular_default_search_space(model_name, X_train, ..., n_classes) → the
 caller's ``search_space=``, which overrides per key. The run log records which
-keys the caller replaced. See FAQ.md, "Which search space did my run actually
-use?".
+keys the caller replaced. See FAQ.md, "How do I set the hyperparameter search
+space?".
 """
 
 from __future__ import annotations

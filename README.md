@@ -53,8 +53,8 @@ train, predict on the held-out test set, and write everything to `output_dir/` �
 full-probability CSVs), `hpo/` (search records when there was a search).
 
 **Tune the hyperparameters** by passing `Optimize()` instead of nothing. Each
-pipeline has a default search space adapted to your data, so the only thing you
-have to decide is the budget:
+pipeline has a default search space, rescaled for your training-set size and
+cause count, so the only thing you have to decide is the budget:
 
 ```python
 from multimodalva import Optimize
@@ -65,7 +65,10 @@ run(task="text", ..., hyperparams=Optimize(n_trials=30))
 `Optimize(metric="csmf_accuracy")` changes what is optimised,
 `Optimize(cv=False)` searches on a single holdout instead of 3-fold CV, and
 `Optimize(backend="ray")` runs trials in parallel. Passing a plain dict instead
-(`hyperparams={"learning_rate": 3e-5}`) uses those values and searches nothing.
+(`hyperparams={"learning_rate": 3e-5}`) uses those values and searches nothing;
+passing neither trains with the model's library defaults. To set the ranges
+yourself, see [How do I set the hyperparameter search
+space?](FAQ.md#how-do-i-set-the-hyperparameter-search-space).
 
 The same from the command line, or from a config file:
 
@@ -134,17 +137,51 @@ examples. Start there once the quick start runs.
 
 ## Models
 
-**Text** — 13 backbone aliases (`bioclinicalbert`, `clinicallongformer`,
-`biomedbert`, …), any Hugging Face Hub ID, or a local directory.
-`multimodalva list-models` prints the list with descriptions.
+**Text backbones** — pass an alias, any Hugging Face Hub ID, or a local
+directory. `multimodalva list-models` prints the same list with descriptions.
 
-**Tabular** — `lightgbm`, `xgboost`, `catboost`, `random_forest`, `gbdt`, `mlp`,
-`svm`, `knn`, `naive_bayes`.
+| Alias | Checkpoint | Code |
+|---|---|---|
+| `bioclinicalbert` | [emilyalsentzer/Bio_ClinicalBERT](https://huggingface.co/emilyalsentzer/Bio_ClinicalBERT) | [repo](https://github.com/EmilyAlsentzer/clinicalBERT) |
+| `bert` | [bert-base-uncased](https://huggingface.co/bert-base-uncased) | [repo](https://github.com/google-research/bert) |
+| `biobert` | [dmis-lab/biobert-base-cased-v1.2](https://huggingface.co/dmis-lab/biobert-base-cased-v1.2) | [repo](https://github.com/dmis-lab/biobert) |
+| `bluebert` | [bionlp/bluebert_pubmed_mimic_uncased_L-12_H-768_A-12](https://huggingface.co/bionlp/bluebert_pubmed_mimic_uncased_L-12_H-768_A-12) | [repo](https://github.com/ncbi-nlp/bluebert) |
+| `biomedbert` | [microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext](https://huggingface.co/microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext) |  |
+| `clinicalbert` | [medicalai/ClinicalBERT](https://huggingface.co/medicalai/ClinicalBERT) |  |
+| `biomedroberta` | [allenai/biomed_roberta_base](https://huggingface.co/allenai/biomed_roberta_base) | [repo](https://github.com/allenai/dont-stop-pretraining) |
+| `bioelectra` | [kamalkraj/bioelectra-base-discriminator-pubmed](https://huggingface.co/kamalkraj/bioelectra-base-discriminator-pubmed) | [repo](https://github.com/kamalkraj/BioELECTRA) |
+| `longformer` | [allenai/longformer-base-4096](https://huggingface.co/allenai/longformer-base-4096) | [repo](https://github.com/allenai/longformer) |
+| `clinicallongformer` | [yikuan8/Clinical-Longformer](https://huggingface.co/yikuan8/Clinical-Longformer) | [repo](https://github.com/luoyuanlab/Clinical-Longformer) |
+| `bigbird` | [google/bigbird-roberta-base](https://huggingface.co/google/bigbird-roberta-base) | [repo](https://github.com/google-research/bigbird) |
+| `clinicalbigbird` | [yikuan8/Clinical-BigBird](https://huggingface.co/yikuan8/Clinical-BigBird) | [repo](https://github.com/luoyuanlab/Clinical-Longformer) |
+| `roberta-pm` | RoBERTa-base-PM-M3-Voc-distill-hf — not on the Hub; downloaded once to `~/.cache/multimodalva/` | [repo](https://github.com/facebookresearch/bio-lm) |
+
+**Tabular models**
+
+| Alias | Estimator |
+|---|---|
+| `lightgbm` | [LGBMClassifier](https://lightgbm.readthedocs.io/en/latest/Python-Intro.html) |
+| `xgboost` | [XGBClassifier](https://xgboost.readthedocs.io/en/stable/python/python_intro.html) |
+| `catboost` | [CatBoostClassifier](https://catboost.ai/docs/en/concepts/python-quickstart) |
+| `random_forest` | [RandomForestClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.RandomForestClassifier.html) |
+| `gbdt` | [GradientBoostingClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.GradientBoostingClassifier.html) |
+| `mlp` | [MLPClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.neural_network.MLPClassifier.html) |
+| `svm` | [SVC](https://scikit-learn.org/stable/modules/generated/sklearn.svm.SVC.html) |
+| `knn` | [KNeighborsClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.neighbors.KNeighborsClassifier.html) |
+| `naive_bayes` | [GaussianNB](https://scikit-learn.org/stable/modules/generated/sklearn.naive_bayes.GaussianNB.html) |
+
+**Evaluation** — the `results` subpackage: multi-model leaderboard (accuracy,
+balanced accuracy, macro/weighted F1, CSMF accuracy, chance-corrected CSMF
+accuracy, top-*k*), cause-specific heatmaps, confusion matrices, CSMF scatter
+plots, HPO diagnostics, bootstrap confidence intervals and calibration.
 
 ## Why use it
 
 - **One interface across six pipelines**, so a text model, a tabular model and
   three kinds of fusion are comparable instead of scattered across scripts.
+- **Nine tabular models and thirteen text backbones**, with or without
+  hyperparameter search, all taking the same input and producing the same
+  output.
 - **VA-specific evaluation** — CSMF accuracy and its chance-corrected form,
   cause-specific breakdowns, bootstrap intervals, calibration.
 - **The same code on a laptop and a cluster** — Optuna by default, Ray for
@@ -152,16 +189,15 @@ examples. Start there once the quick start runs.
 - **Runs are reproducible and self-describing**: seeds for splitting and for
   training, and artifacts that record what produced them.
 
-## Why not use it
-
-- **It learns from labelled records.** InterVA and InSilicoVA assign causes from
-  a fixed symptom–cause model and need no training data; this package needs
-  records whose cause is already known. With no labelled data, it is not the
-  tool. (You can still evaluate their output alongside yours — see the FAQ.)
-- **If you only need one model family**, scikit-learn or Transformers directly
-  is simpler.
-- **It expects VA-shaped data**: one row per death, a cause label, and a
-  narrative, indicators, or both. It is not general-purpose AutoML.
+**Before you start: the text pipelines need real compute.** The nine tabular
+models train on any laptop in seconds. Fine-tuning a transformer wants a CUDA
+GPU or Apple Silicon — one text fit is minutes, and a 30-trial search with
+3-fold cross-validation is hours to half a day depending on the machine and the
+number of records. Long-context data fusion and feature fusion want 16 GB of GPU
+memory. Sizes and timings per pipeline are in the FAQ:
+[what you need](FAQ.md#what-computing-environment-do-i-need) ·
+[how long it takes](FAQ.md#how-long-does-a-run-take) ·
+[SLURM resources](FAQ.md#what-slurm-resources-should-i-request).
 
 ## Examples
 
@@ -177,12 +213,17 @@ in the [FAQ](FAQ.md#what-data-does-the-package-expect).
 | [`01_start_here_text_and_tabular.ipynb`](examples/01_start_here_text_and_tabular.ipynb) | load → train on the narrative → train on the indicators → compare → save |
 | [`02_combine_text_and_tabular_fusion.ipynb`](examples/02_combine_text_and_tabular_fusion.ipynb) | data, feature and decision fusion, compared |
 | [`03_evaluate_and_compare_results.ipynb`](examples/03_evaluate_and_compare_results.ipynb) | leaderboards, confidence intervals, confusion matrices, CSMF, top-k, calibration |
-| [`08_predict_with_a_trained_model.py`](examples/08_predict_with_a_trained_model.py) | score new records with a run that has already finished |
+| [`04_python_script_template.py`](examples/04_python_script_template.py) | a Python script to modify, customise and run |
+| [`05_command_line_template.sh`](examples/05_command_line_template.sh) | the same from the command line, for cluster jobs |
+| [`06_config_file_template.sh`](examples/06_config_file_template.sh) + `config_*.yaml` | settings files, so the config *is* the record of the run |
 | [`07_publish_to_hub.py`](examples/07_publish_to_hub.py) | publish a text or data-fusion model to the Hugging Face Hub |
-| `04_python_script_template.py` · `05_command_line_template.sh` · `06_config_file_template.sh` | templates to copy |
+| [`08_predict_with_a_trained_model.py`](examples/08_predict_with_a_trained_model.py) | score new records with a run that has already finished |
 
 Hyperparameter search and checking a config before submitting a job are covered
 in the templates. See [`examples/README.md`](examples/README.md).
+
+For what a run needs to run on — hardware, GPU memory, run time, disk, SLURM
+resources — see the [FAQ](FAQ.md#what-computing-environment-do-i-need).
 
 Check the install:
 
@@ -241,6 +282,9 @@ For the methods:
 - Chu Y, Wu Z, McCormick T, Li R, Clark SJ. *Multimodal Artificial Intelligence for
   Cause-of-Death Assignment From Verbal Autopsy Records: A Nationally Representative
   Evaluation in South Africa.* 2026.
+- Chu Y. *Leveraging Language Models and Machine Learning in Verbal Autopsy Analysis.*
+  PhD thesis, The Ohio State University, 2025.
+  [arXiv:2508.19274](https://arxiv.org/abs/2508.19274)
 
 ## License
 

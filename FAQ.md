@@ -418,6 +418,15 @@ not what a dependency changes between its own releases.
 ## Which model should I pick?
 
 - **Starting out:** `bioclinicalbert` for narratives, `lightgbm` for indicators.
+  The biomedical BERTs are close enough to each other that which one wins depends
+  on the dataset, so treat this as a starting point and compare a few.
+- **A checkpoint that is not in the list:** any Hugging Face Hub ID
+  (`"emilyalsentzer/Bio_ClinicalBERT"`) or local model directory works anywhere a
+  text model name is accepted — the text pipeline, the text bases of voting and
+  stacking, and the feature-fusion backbone all resolve names the same way. A Hub
+  ID cannot be checked without network access, so `preflight()` reports it as
+  unverified rather than failing; a name close to a package alias is flagged as a
+  likely typo.
 - **Long narratives (over ~512 tokens) or data fusion:** `clinicalbigbird` or
   `clinicallongformer`. On Apple Silicon, prefer BigBird (see above).
 - **Limited GPU memory:** enable LoRA (`use_lora=True`) — only the adapters
@@ -430,14 +439,81 @@ not what a dependency changes between its own releases.
 
 ## How do I set the hyperparameter search space?
 
-Precedence, lowest to highest: the balanced reference space, then the adaptive
-adjustment for your training-set size and cause count, then LoRA or focal
-additions if those are on, then `Optimize(space=...)`.
+`hyperparams=` is one argument with four settings, and it decides both *whether*
+there is a search and *what* it searches:
 
-**A key you name is searched over exactly the range you wrote.** The adaptive
-machinery runs on the defaults *before* your keys are applied, so nothing narrows,
-rescales or re-profiles a range you set. **A key you do not name keeps its adaptive
-value and is still searched** — a partial dict never silently shrinks the search.
+| `hyperparams=` | Search? | Values used |
+| --- | --- | --- |
+| omitted, or `"default"` | no | the model library's own defaults |
+| a dict | no | exactly the dict, for every key in it |
+| `Optimize(...)` | yes | the package's default space |
+| `Optimize(space={...})` | yes | your ranges where you named a key, the default space elsewhere |
+
+### No search, library defaults
+
+Leaving `hyperparams=` out means **no search and no values of your own** — every
+hyperparameter falls back to whatever the underlying library ships (scikit-learn's,
+LightGBM's, the Hugging Face `TrainingArguments` defaults). This is rarely what
+anyone wants on purpose, so it is logged as a warning:
+
+```
+No hyperparameters given and no search requested — training lightgbm with its library defaults.
+```
+
+### No search, your own values
+
+Pass a dict. Nothing is searched; these values are used as written, and keys you
+leave out still fall back to the library defaults:
+
+```python
+run(..., hyperparams={"learning_rate": 3e-5, "batch_size": 16, "epochs": 5})
+```
+
+To re-use the values a previous search found, read that run's
+`best_hyperparams.json` and pass it straight back — it is a flat dict written for
+exactly this:
+
+```python
+import json
+best = json.load(open("runs/text/hpo/best_hyperparams.json"))
+run(..., hyperparams=best)          # retrain on the tuned values, no new search
+```
+
+### A search, over the default space
+
+`Optimize()` on its own is complete: it searches the package's default space —
+a reference space per model, rescaled for your training-set size and cause count,
+so a 200-row 25-cause dataset and a 5,000-row 10-cause one are not handed the same
+ranges. LoRA and focal loss add their own keys when those are on.
+
+The exact ranges are one commented dict per model in
+[`text/search_spaces.py`](multimodalva/text/search_spaces.py) and
+[`tabular/search_spaces.py`](multimodalva/tabular/search_spaces.py); every
+`Optimize` field is listed in the
+[user manual](https://y-chu.github.io/MultimodalVA/#api-optimize).
+
+### A search, over ranges you set
+
+Name only the keys you want to control:
+
+```python
+from multimodalva import Optimize
+
+run(..., hyperparams=Optimize(n_trials=30, space={
+    "learning_rate": ("float_log", 1e-5, 1e-3),   # your range
+    "batch_size":    ("categorical", [8]),        # pinned at 8
+}))
+```
+
+Spec forms are `("float", lo, hi)`, `("float_log", lo, hi)`, `("int", lo, hi)`
+and `("categorical", [values])`.
+
+**A key you do not name keeps its default range and is still searched** — a partial
+dict never silently shrinks the search. **A key you do name is searched over exactly
+the range you wrote**: the rescaling runs on the defaults *before* your keys are
+applied, so nothing narrows or re-profiles a range you set. A single-value
+`categorical` is how you hold one hyperparameter fixed while the others are
+searched, since a plain dict would turn the search off altogether.
 
 The run log states both halves:
 
@@ -449,30 +525,15 @@ colsample_bytree, max_depth, min_child_samples, num_leaves, reg_alpha, reg_lambd
 subsample. Name them in search_space= to set them yourself.
 ```
 
-So the space that actually ran is yours where you spoke and adaptive where you did
-not, and the log says which is which.
-
-**To hold one hyperparameter fixed while searching the others, give it a
-single-value range.** `hyperparams=` is one argument with one meaning at a time —
-a dict of fixed values means no search at all — so a search that pins a value does
-it inside the space:
-
-```python
-hyperparams=Optimize(space={
-    "learning_rate": ("float_log", 1e-5, 1e-3),   # searched
-    "batch_size":    ("categorical", [8]),        # pinned at 8
-})
-```
-
-Every trial then gets `batch_size=8`. Omitting a key does something different: it
-keeps that key's adaptive range and searches it.
+This matters most for data fusion, where `batch_size` and
+`gradient_accumulation_steps` are calibrated so a long-context model fits on a GPU:
+a partial space keeps them rather than dropping them.
 
 **A malformed space is refused when you build the `Optimize`, not when the search
-starts.** The searches run with per-trial errors caught so one bad configuration
-cannot kill a long search, which means a bad *space* would otherwise fail every
-trial quietly and reach the end of its budget with nothing completed — after the
-queue wait, on a cluster. So `None` in place of a range, a NaN bound, an empty
-choice list, a misspelled kind and a low above its high are all named up front:
+starts.** Trials run with per-trial errors caught, so a bad *space* would otherwise
+fail every trial quietly and burn the whole budget — after the queue wait, on a
+cluster. `None` in place of a range, a NaN bound, an empty choice list, a
+misspelled kind and a low above its high are all named up front:
 
 ```
 ValueError: Optimize(space=...) is malformed:
@@ -482,22 +543,6 @@ ValueError: Optimize(space=...) is malformed:
   pins the value, which is how a hyperparameter is held fixed while others are
   searched.
 ```
-
-This matters most for data fusion, where `batch_size` and
-`gradient_accumulation_steps` are calibrated so a long-context model fits on a GPU:
-a partial space keeps them rather than dropping them, which is what stops a
-two-key space from running out of memory.
-
-The run also says where the hyperparameters came from at all:
-
-```
-Hyperparameters FROM SEARCH — metric=csmf_accuracy, n_trials=50, cv=True/3 folds, space overrides 1 key(s): learning_rate.
-Hyperparameters FROM CALLER — 6 key(s): batch_size, epochs, ...
-No hyperparameters given and no search requested — training lightgbm with its library defaults.
-```
-
-The last of those is a warning, because it is the case most easily reached by
-accident.
 
 ## Optuna or Ray — which search backend, and does it change my results?
 
