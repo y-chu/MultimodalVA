@@ -84,6 +84,11 @@ Both run in CI on every push.
   message when validating inputs.
 - Add or update a test when you fix a bug or add behaviour.
 - Update the README or FAQ if you change something a user would notice.
+- If you edit a docstring, rebuild the API page — `python docs/build_docs.py` —
+  and commit `docs/index.html` with your change. CI runs
+  `python docs/build_docs.py --check` and fails if the page is out of date. The
+  page is published at <https://y-chu.github.io/MultimodalVA/> from `docs/` on
+  `main`.
 
 ## Conventions that carry weight here
 

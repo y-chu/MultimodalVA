@@ -231,9 +231,7 @@ multimodalva = "multimodalva.cli:main"
 [project.urls]
 Homepage = "https://github.com/y-chu/MultimodalVA"
 Repository = "https://github.com/y-chu/MultimodalVA"
-# The FAQ is the entry point that renders on GitHub; docs/index.html is the
-# generated API reference, which GitHub serves as source rather than as a page.
-Documentation = "https://github.com/y-chu/MultimodalVA/blob/main/FAQ.md"
+Documentation = "https://y-chu.github.io/MultimodalVA/"
 
 [tool.setuptools.packages.find]
 where = ["."]

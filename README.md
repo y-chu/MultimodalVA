@@ -1,199 +1,127 @@
 # MultimodalVA
 
-Cause-of-death classification from verbal autopsy (VA) data, in one Python package.
+Cause-of-death classification from verbal autopsy (VA) records, in one Python
+package.
 
 VA data is multimodal: a free-text narrative plus structured symptom indicators.
-MultimodalVA lets you train, tune and compare text models, tabular models and
+MultimodalVA trains, tunes and compares text models, tabular models and
 multimodal fusion at all three levels — **data**, **feature** and **decision** —
-through a single interface, so results are comparable across model families
-instead of scattered across ad hoc scripts.
-
-Every pipeline follows the same steps — **split → prepare → [HPO] → train →
-predict** — and returns the same `PredictionResult`: `top1` (predicted label and
-confidence), `full` (all class probabilities), `topk`, and `id2label`.
+through a single interface.
 
 ## Installation
-
-The package is not on PyPI yet, so install from GitHub:
 
 ```bash
 pip install git+https://github.com/y-chu/MultimodalVA.git
 ```
 
-Requires Python 3.12 or 3.13. Runs on CUDA, Apple Silicon (MPS) or CPU.
+Python 3.12 or 3.13. Runs on CUDA, Apple Silicon (MPS) or CPU.
 
-### What the default install gives you
-
-The base install covers five of the six pipelines and all nine tabular models,
-including LightGBM, XGBoost and CatBoost:
-
-| | Default install | Needs an extra |
-|---|---|---|
-| Text classification (`task="text"`) | ✅ | |
-| Tabular, all 9 models (`task="tabular"`) | ✅ | |
-| Data fusion (`task="data_fusion"`) | ✅ | |
-| Soft voting (`task="voting"`) | ✅ | |
-| Stacking (`task="stacking"`) | ✅ | |
-| Hyperparameter search, all pipelines | ✅ | |
-| **Parallel / distributed search** (`Optimize(backend="ray")`) | ❌ | `[ray]` |
-| Evaluation, plots, calibration, bootstrap CIs | ✅ | |
-| Publishing models to the Hugging Face Hub | ✅ | |
-| **LoRA fine-tuning** (`use_lora=True`) | ❌ | `[lora]` |
-| **Feature fusion** (`task="feature_fusion"`) | ❌ | `[feature_fusion]` |
-
-So: **the default install does not include LoRA.** Text models train with full
-fine-tuning unless you install the extra and pass `use_lora=True`.
-
-Hyperparameter search itself needs no extra — it runs on Optuna, one trial at a
-time. `[ray]` only adds the option of running those trials **in parallel** across
-the CPUs, GPUs or cluster nodes Ray can see. Without it, `Optimize(backend="auto")` resolves to Optuna and
-says so; on a machine where Ray would have helped (a CUDA GPU, or a SLURM
-allocation) it also warns that the extra is missing, so the fallback is never
-silent.
-
-The Ray backend has been **verified on a two-GPU SLURM node** —
-`tests/hpc_ray_smoke.py` (with a SLURM wrapper beside it) runs the whole path
-there: both families searched with cross-validation, the same artifacts under the
-same names, trials observed running concurrently in both, and an ensemble base
-model searched on Ray. Run the smoke test on your own cluster before trusting the
-backend with a long search — a Ray
-misconfiguration usually shows up as trials that queue forever or run one at a
-time, neither of which looks like an error. Optuna needs no extra and is what
-`"auto"` picks off a CUDA machine.
-
-### Extras
+That covers five of the six pipelines, all nine tabular models, hyperparameter
+search and evaluation. Three things need an extra:
 
 ```bash
-pip install "multimodalva[all] @ git+https://github.com/y-chu/MultimodalVA.git"             # recommended — adds every extra
-pip install "multimodalva[lora] @ git+https://github.com/y-chu/MultimodalVA.git"            # LoRA fine-tuning (PEFT)
-pip install "multimodalva[ray] @ git+https://github.com/y-chu/MultimodalVA.git"             # parallel search on a GPU box or cluster
-pip install "multimodalva[feature_fusion] @ git+https://github.com/y-chu/MultimodalVA.git"  # AutoGluon AutoMM
+# parallel search across CPUs, GPUs or cluster nodes — Optimize(backend="ray")
+pip install "multimodalva[ray] @ git+https://github.com/y-chu/MultimodalVA.git"
+
+# LoRA fine-tuning — use_lora=True
+pip install "multimodalva[lora] @ git+https://github.com/y-chu/MultimodalVA.git"
+
+# the feature_fusion pipeline — AutoGluon AutoMM
+pip install "multimodalva[feature_fusion] @ git+https://github.com/y-chu/MultimodalVA.git"
+
+# all three
+pip install "multimodalva[all] @ git+https://github.com/y-chu/MultimodalVA.git"
 ```
 
-**On an HPC cluster with more than one GPU, `[ray]` is the extra to consider.** It
-is the one whose absence costs you nothing but time: the search still runs and the
-results are the same, just sequentially. `[ray]` adds about 360 MB (Ray itself
-plus pyarrow and grpcio), which is why it is not in the default install — a laptop
-running the Optuna backend never needs any of it. Note `[feature_fusion]` pulls Ray in regardless,
-because AutoGluon uses it internally.
-
-Once the package is on PyPI the shorter form works — `pip install "multimodalva[all]"`.
-
-⚠️ **`[feature_fusion]` narrows your environment.** AutoGluon AutoMM pins
-`torch>=2.6,<2.10` and `transformers>=4.51,<4.58`, where the rest of the package
-accepts `torch>=2.1` and `transformers>=4.38,<5`, and it pulls in a large
-dependency tree of its own. Install it when you want feature fusion; skip it on a
-cluster where the available torch is outside that window. The other five
-pipelines are unaffected either way. See the
+⚠️ `[feature_fusion]` pins torch and transformers tighter than the rest of the
+package — install it into a clean environment, and see the
 [FAQ](FAQ.md#feature-fusion-fails-to-install-or-conflicts-with-my-torch-version)
-if the install conflicts.
+if it conflicts.
 
-InSilicoVA is not supported yet. `pyinsilicova` does not install on Python 3.12+,
-which this package requires, and it cannot train a probbase against your own
-cause list — only InSilicoVA's native causes. Run it separately (in R, or with
-`pyinsilicova` if its native causes fit your study) and bring the assignments
-back: the leaderboard, bootstrap intervals and plots all accept predictions from
-any source, so an externally produced model is compared on the same footing.
-
-## How to use
-
-One call runs a whole pipeline — loading, splitting, HPO, training, prediction
-and saving:
+## Quick start
 
 ```python
-from multimodalva import Optimize, run
+from multimodalva import run
 
 run(task="text", data="clean.csv", label_col="cause", text_col="narrative",
-    model="bioclinicalbert", output_dir="runs/text",
-    hyperparams=Optimize(n_trials=30))
+    model="bioclinicalbert", output_dir="runs/text")
 ```
 
-The same call from the command line, or from a config file:
+One call does the whole thing: split the records, prepare them for the model,
+train, predict on the held-out test set, and write everything to `output_dir/` —
+`final/` (model and label maps), `predictions/` (top-1, top-k and
+full-probability CSVs), `hpo/` (search records when there was a search).
+
+**Tune the hyperparameters** by passing `Optimize()` instead of nothing. Each
+pipeline has a default search space adapted to your data, so the only thing you
+have to decide is the budget:
+
+```python
+from multimodalva import Optimize
+
+run(task="text", ..., hyperparams=Optimize(n_trials=30))
+```
+
+`Optimize(metric="csmf_accuracy")` changes what is optimised,
+`Optimize(cv=False)` searches on a single holdout instead of 3-fold CV, and
+`Optimize(backend="ray")` runs trials in parallel. Passing a plain dict instead
+(`hyperparams={"learning_rate": 3e-5}`) uses those values and searches nothing.
+
+The same from the command line, or from a config file:
 
 ```bash
 multimodalva run --task text --data clean.csv --label-col cause \
   --text-col narrative --model bioclinicalbert --output-dir runs/text --optimize
 
 multimodalva run experiment.yaml
+multimodalva run experiment.yaml --dry-run    # check the config, train nothing
 ```
 
-Before submitting it, `--dry-run` checks the configuration against the data and
-stops: it loads, filters, splits and resolves the feature columns, says what the
-run would do, and trains nothing. A misspelt column name, an unknown model, a
-keyword the pipeline does not accept or a filter value that matches no row is
-named in seconds rather than after the job has queued. It exits 2 when anything
-would stop the run, so a job script can gate on it:
-
-```bash
-multimodalva run experiment.yaml --dry-run || exit 1
-multimodalva run experiment.yaml
-```
-
-`preflight(**config)` is the same check from Python, returning a report rather
-than printing one. A clean dry run says the configuration is consistent with the
-data, not that the run will succeed — nothing trains, so it cannot see a batch
-size that will not fit or a trial budget too small for the search space.
-
-Swap `task=` for any other pipeline (`tabular`, `data_fusion`, `feature_fusion`,
-`voting`, `stacking`). Results land in `output_dir/`: `final/` (model and label
-maps), `predictions/` (top-1, top-k and full-probability CSVs), `hpo/` (study,
-best hyperparameters, diagnostics).
-
-Three arguments every task shares and that are worth knowing early:
-`id_col=` names a record-identifier column, so each prediction carries its `id`;
-`split_seed=` fixes which deaths land in the test set; `train_seed=` fixes the
-model's own randomness. Re-running the same data, split and configuration with
-the same `output_dir` resumes an interrupted run (`resume="adopt"` accepts a
-directory made before manifests existed). A content manifest refuses
-stale or legacy artifacts whose provenance cannot be verified, rather than
-mixing runs silently. Finished runs can be reloaded and combined without
-retraining — see the [FAQ](FAQ.md).
-
-### Predicting with a model that is already trained
-
-A finished run — yours, a colleague's, or one published on the Hugging Face Hub —
-scores new records without retraining. Give it a label column and you get
-performance as well; leave it out and you simply get predictions:
+<details>
+<summary><b>The same call for each pipeline</b></summary>
 
 ```python
-from multimodalva import predict_from_pretrained
+from multimodalva import Optimize, run
 
-res = predict_from_pretrained("runs/text", new_df, text_col="narrative")
-res.top1.head()          # predicted_label, predicted_prob (+ id, + true_label)
-res.checks               # what was detected about the model and your input
+# 1. Text — fine-tune a transformer on the narrative
+run(task="text", data="clean.csv", label_col="cause", text_col="narrative",
+    model="bioclinicalbert", output_dir="runs/text",
+    hyperparams=Optimize(n_trials=30))
+
+# 2. Tabular — an ML model on the indicator columns
+run(task="tabular", data="clean.csv", label_col="cause",
+    features="re:^i\d{3}[a-z]$",       # a list of names, "auto", or a regex
+    model="lightgbm", output_dir="runs/tabular",
+    hyperparams=Optimize(n_trials=50))
+
+# 3. Data fusion — indicators rendered as sentences, appended to the narrative,
+#    then one long-context model over the result
+run(task="data_fusion", data="clean.csv", label_col="cause",
+    text_col="narrative", features="auto", model="clinicallongformer",
+    output_dir="runs/data_fusion", hyperparams=Optimize(n_trials=20))
+
+# 4. Feature fusion — a joint text + tabular model (needs [feature_fusion])
+run(task="feature_fusion", data="clean.csv", label_col="cause",
+    text_col="narrative", features="auto", output_dir="runs/feature_fusion")
+
+# 5. Stacking — out-of-fold predictions from several base models, then a
+#    combiner fitted on them
+run(task="stacking", data="clean.csv", label_col="cause",
+    text_col="narrative", features="auto",
+    text_models=[{"model_name": "bioclinicalbert"}],
+    tabular_models=[{"model_name": "lightgbm"}, {"model_name": "catboost"}],
+    output_dir="runs/stacking")
 ```
 
-```bash
-multimodalva predict --source runs/text --data new.csv \
-  --text-col narrative --label-col cause --output-dir preds/
+Soft voting is the same as stacking with `task="voting"` — it averages the base
+models' probabilities instead of learning a combiner.
 
-# What would happen, without scoring anything — worth a few seconds
-# in front of a queued job
-multimodalva predict --source runs/text --data new.csv --dry-run
-```
+</details>
 
-One command covers every pipeline: what kind of run it is is read from the
-artifact, so a voting or stacking run is combined the way that run combined it
-(`predict_ensemble_from_pretrained()` in Python). Columns are matched by name,
-never by position, and a column the model was trained on that is missing from
-your data is an error rather than a silently confident guess. The
-[FAQ](FAQ.md) covers which artifacts can be loaded and what each message means.
+**📖 [User manual](https://y-chu.github.io/MultimodalVA/)** — every argument, with
+examples. Start there once the quick start runs.
 
-No data of your own yet? Everything works on the built-in synthetic datasets:
-
-```python
-from multimodalva import data
-df = data("va_sample")
-```
-
-For finer control, the classifiers are available directly — `TextClassifier`,
-`TabularClassifier` and `EnsembleClassifier`, each with a `.run()` method.
-Stacking additionally exposes its stages (`train_base_models()`,
-`train_meta_learner_stage()`, `predict_test()`) so a long run can be done in
-steps. Several combiners can be computed from one set of out-of-fold
-predictions and reported side by side. See the examples below.
-
-## Pipelines and models
+## Pipelines
 
 | Pipeline | `task=` | What it does |
 |---|---|---|
@@ -202,110 +130,81 @@ predictions and reported side by side. See the examples below.
 | Data fusion | `data_fusion` | Render indicators as sentences, append to the narrative, fine-tune a long-context model |
 | Feature fusion | `feature_fusion` | Joint text + tabular model via AutoGluon AutoMM |
 | Soft voting | `voting` | Average the probabilities of independently trained models |
-| Stacking | `stacking` | Out-of-fold base predictions, then a combiner — meta-learner (default), simple average, class-aware voter, ensemble selection, several at once, or `"best"` chosen on training data alone (`combiner=`) |
+| Stacking | `stacking` | Out-of-fold base predictions, then a combiner — meta-learner (default), simple average, class-aware voter, ensemble selection, or `"best"` (`combiner=`) |
 
-**Text backbones** — pass an alias, a Hugging Face Hub ID, or a local directory.
-`multimodalva list-models` prints the list.
+## Models
 
-| Alias | Checkpoint |
-|---|---|
-| `bioclinicalbert` | `emilyalsentzer/Bio_ClinicalBERT` |
-| `bert` | `bert-base-uncased` |
-| `biobert` | `dmis-lab/biobert-base-cased-v1.2` |
-| `bluebert` | `bionlp/bluebert_pubmed_mimic_uncased_L-12_H-768_A-12` |
-| `biomedbert` | `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext` |
-| `clinicalbert` | `medicalai/ClinicalBERT` |
-| `biomedroberta` | `allenai/biomed_roberta_base` |
-| `bioelectra` | `kamalkraj/bioelectra-base-discriminator-pubmed` |
-| `longformer` | `allenai/longformer-base-4096` |
-| `clinicallongformer` | `yikuan8/Clinical-Longformer` |
-| `bigbird` | `google/bigbird-roberta-base` |
-| `clinicalbigbird` | `yikuan8/Clinical-BigBird` |
-| `roberta-pm` | `RoBERTa-base-PM-M3-Voc-distill-hf` (not on the Hub; downloaded once) |
+**Text** — 13 backbone aliases (`bioclinicalbert`, `clinicallongformer`,
+`biomedbert`, …), any Hugging Face Hub ID, or a local directory.
+`multimodalva list-models` prints the list with descriptions.
 
-`biomedroberta` and `roberta-pm` are **different models** with different
-vocabularies — see the [FAQ](FAQ.md#which-model-should-i-pick).
+**Tabular** — `lightgbm`, `xgboost`, `catboost`, `random_forest`, `gbdt`, `mlp`,
+`svm`, `knn`, `naive_bayes`.
 
-**Tabular models** — `lightgbm`, `xgboost`, `catboost`, `random_forest`, `gbdt`,
-`mlp`, `svm`, `knn`, `naive_bayes`.
+## Why use it
 
-**Evaluation** — the `results` subpackage provides a multi-model leaderboard
-(accuracy, balanced accuracy, macro/weighted F1, CSMF accuracy, chance-corrected
-CSMF accuracy, top-*k*), cause-specific heatmaps, confusion matrices, CSMF
-scatter plots and HPO diagnostics.
+- **One interface across six pipelines**, so a text model, a tabular model and
+  three kinds of fusion are comparable instead of scattered across scripts.
+- **VA-specific evaluation** — CSMF accuracy and its chance-corrected form,
+  cause-specific breakdowns, bootstrap intervals, calibration.
+- **The same code on a laptop and a cluster** — Optuna by default, Ray for
+  parallel search, resumable either way.
+- **Runs are reproducible and self-describing**: seeds for splitting and for
+  training, and artifacts that record what produced them.
+
+## Why not use it
+
+- **It learns from labelled records.** InterVA and InSilicoVA assign causes from
+  a fixed symptom–cause model and need no training data; this package needs
+  records whose cause is already known. With no labelled data, it is not the
+  tool. (You can still evaluate their output alongside yours — see the FAQ.)
+- **If you only need one model family**, scikit-learn or Transformers directly
+  is simpler.
+- **It expects VA-shaped data**: one row per death, a cause label, and a
+  narrative, indicators, or both. It is not general-purpose AutoML.
 
 ## Examples
 
-All examples live in [`examples/`](examples/README.md) and run on the built-in
-synthetic data, so they need no external files.
+<details>
+<summary>Notebooks, templates and a prediction demo — all run on built-in synthetic data</summary>
 
-**New here? Read the three notebooks in order** — they are the files that explain
-what is happening, one step per section.
+Everything below runs as-is on built-in synthetic data — no files needed. What
+the package expects of your own data, and how to look at the synthetic shape, is
+in the [FAQ](FAQ.md#what-data-does-the-package-expect).
 
-| Read first | |
+| | |
 |---|---|
-| [`01_start_here_text_and_tabular.ipynb`](examples/01_start_here_text_and_tabular.ipynb) | the whole workflow: load → explore → train on the narrative → train on the indicators → compare → save and reuse |
-| [`02_combine_text_and_tabular_fusion.ipynb`](examples/02_combine_text_and_tabular_fusion.ipynb) | using both together: data, feature and decision fusion (voting, stacking), compared |
-| [`03_evaluate_and_compare_results.ipynb`](examples/03_evaluate_and_compare_results.ipynb) | what to do with the output: several models at once, leaderboards, confidence intervals, confusion matrices, CSMF, top-k, calibration |
+| [`01_start_here_text_and_tabular.ipynb`](examples/01_start_here_text_and_tabular.ipynb) | load → train on the narrative → train on the indicators → compare → save |
+| [`02_combine_text_and_tabular_fusion.ipynb`](examples/02_combine_text_and_tabular_fusion.ipynb) | data, feature and decision fusion, compared |
+| [`03_evaluate_and_compare_results.ipynb`](examples/03_evaluate_and_compare_results.ipynb) | leaderboards, confidence intervals, confusion matrices, CSMF, top-k, calibration |
+| [`08_predict_with_a_trained_model.py`](examples/08_predict_with_a_trained_model.py) | score new records with a run that has already finished |
+| [`07_publish_to_hub.py`](examples/07_publish_to_hub.py) | publish a text or data-fusion model to the Hugging Face Hub |
+| `04_python_script_template.py` · `05_command_line_template.sh` · `06_config_file_template.sh` | templates to copy |
 
-| Then copy a template | |
-|---|---|
-| `04_python_script_template.py` | if you write Python |
-| `05_command_line_template.sh` | if you would rather not, or you submit cluster jobs |
-| `06_config_file_template.sh` + `config_*.yaml` | if you want the settings file itself to be the record of the run |
+Hyperparameter search and checking a config before submitting a job are covered
+in the templates. See [`examples/README.md`](examples/README.md).
 
-To run any of them on your own data you change four things — your file, and the
-names of your label, narrative and indicator columns. The config files tag every
-other setting as `[CHANGE]`, `[KEEP]` or `[TUNE]`, and
-[`examples/README.md`](examples/README.md) explains which are worth your time.
-
-Check your install end-to-end (offline, no GPU):
+Check the install:
 
 ```bash
-python tests/smoke_test.py      # is it working? ~45 s
-python tests/diagnose.py        # which pipelines and models work here? ~3 min
+python tests/smoke_test.py      # ~45 s
+python tests/diagnose.py        # which pipelines and models work here, ~3 min
 ```
 
-Both use only the standard library and the package itself, and both ship in the
-distribution, so they run straight after `pip install` with nothing else to add.
-`diagnose.py` reports a missing optional dependency as `SKIP` with the install
-command, so it doubles as an environment check.
-
-If you will need to reproduce a run later, save the environment next to it
-(`pip freeze > runs/text/environment.txt`): seeds fix everything this package
-controls, but not what a dependency changes between its own releases. The
-[FAQ](FAQ.md#how-do-i-make-a-run-reproducible) has the details and one measured
-example.
-
-## What is coming
-
-Planned work, with the reasoning, is kept in [CHANGELOG.md](CHANGELOG.md) under
-*Unreleased → Planned*. The next release, **0.2.0**, adds a converter that
-builds data-fusion long text from a DataFrame plus a standardised questionnaire,
-so a data-fusion model can be used without preparing that text by hand. Further
-out: image as a third modality, log-probability inputs for the stacking
-meta-learner, and InSilicoVA as a base learner. Versions follow semantic
-versioning; `1.0.0` will mark the API as stable rather than any one feature.
+</details>
 
 ## Documentation
 
-- [FAQ](FAQ.md) — hardware, run time, disk use, reproducibility, resuming,
-  publishing models to the Hugging Face Hub, common errors
-- API reference — `docs/index.html`, one self-contained page generated from the
-  docstrings. GitHub serves `.html` as source rather than as a page, so open the
-  file after cloning (`open docs/index.html`) or rebuild it with
-  `python docs/build_docs.py`.
+- **[User manual](https://y-chu.github.io/MultimodalVA/)** — every argument, with examples
+- [FAQ](FAQ.md) — common questions about using the package
 - [Examples](examples/README.md)
+- [CHANGELOG](CHANGELOG.md) — changes between releases
 
-## Questions and contributions
-
-Questions, bug reports and feature requests are welcome as
-[GitHub issues](https://github.com/y-chu/MultimodalVA/issues). See
+Questions and bug reports are welcome as
+[GitHub issues](https://github.com/y-chu/MultimodalVA/issues); see
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 ## Built on
-
-`MultimodalVA` is a layer over existing tools rather than a reimplementation:
 
 | | |
 |---|---|
@@ -324,9 +223,8 @@ If you use the feature-fusion pipeline, please also cite AutoMM:
 
 ## Citation
 
-A software paper is in preparation. Until it appears, please cite the software
-(GitHub reads `CITATION.cff`, so the "Cite this repository" button gives the same
-metadata):
+Please cite the software (GitHub reads `CITATION.cff`, so the "Cite this
+repository" button gives the same metadata):
 
 ```bibtex
 @software{chu_multimodalva,
@@ -338,13 +236,11 @@ metadata):
 }
 ```
 
-For the methods themselves, cite the research they come from:
+For the methods:
 
-- Chu Y, Wu Z, Li R, McCormick T, Clark SJ. *Multimodal Artificial Intelligence for
+- Chu Y, Wu Z, McCormick T, Li R, Clark SJ. *Multimodal Artificial Intelligence for
   Cause-of-Death Assignment From Verbal Autopsy Records: A Nationally Representative
-  Evaluation in South Africa.* Manuscript submitted for publication, 2026.
-- Chu Y. *Leveraging Language Models and Machine Learning in Verbal Autopsy Analysis.*
-  PhD thesis, The Ohio State University, 2025. [arXiv:2508.19274](https://arxiv.org/abs/2508.19274)
+  Evaluation in South Africa.* 2026.
 
 ## License
 

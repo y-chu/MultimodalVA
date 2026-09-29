@@ -19,6 +19,8 @@ none is more capable than the others.
 
 | File | Copy this if | Note |
 |---|---|---|
+| `08_predict_with_a_trained_model.py` | You have a finished run and new records to score | Runs as-is; no GPU, no data of your own |
+| `07_publish_to_hub.py` | You want to share a text or data-fusion model | Checks the artifact first; uploads only when you pass a repo id |
 | `04_python_script_template.py` | You write Python, and your data needs cleaning in pandas first | `run()` accepts a DataFrame directly |
 | `05_command_line_template.sh` | You would rather not write Python, or you submit cluster jobs | One command per run |
 | `06_config_file_template.sh` + `config_*.yaml` | You want the settings themselves to be the record of what you ran | The only comfortable way to set up voting and stacking |
