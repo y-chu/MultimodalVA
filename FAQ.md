@@ -28,6 +28,7 @@ Practical questions, in the order you are likely to hit them.
 - [Some of my causes are very rare — what does the package do?](#some-of-my-causes-are-very-rare--what-does-the-package-do)
 - [How does stacking combine its base models, and can I change it?](#how-does-stacking-combine-its-base-models-and-can-i-change-it)
 - [How do I choose a representative model without touching the test set?](#how-do-i-choose-a-representative-model-without-touching-the-test-set)
+- [Can I prompt a language model instead of training one?](#can-i-prompt-a-language-model-instead-of-training-one)
 
 **Using a trained model**
 
@@ -175,6 +176,7 @@ key, in either format, so a typo cannot silently change what is trained.
 | Text (BERT-family, 512 tokens) | Laptop with Apple Silicon (MPS) or 8 GB GPU | One CUDA GPU, 16 GB |
 | Data fusion (long-context, 1024–4096 tokens) | 16 GB GPU | One A100/H100, or an HPC allocation |
 | Feature fusion (AutoGluon AutoMM) | 16 GB GPU | One CUDA GPU |
+| LLM (prompting, no training) | depends on the model — see [the LLM question](#can-i-prompt-a-language-model-instead-of-training-one) | |
 
 The package runs on CUDA, Apple Silicon (MPS) and CPU, and picks the device
 automatically. Two Apple Silicon caveats:
@@ -355,6 +357,11 @@ reused only when that signature matches exactly. A changed split, feature set,
 model spec, hyperparameter configuration or fused text raises and tells you to
 use a new `output_dir` or move the old artifacts. Pass `resume=False` only when
 you intend to rebuild the directory's artifacts from the current call.
+
+Raising `Optimize(n_trials=...)` is the exception for text, tabular and data
+fusion: the search continues to the new total, then the final model is refitted.
+Stacking, voting and feature fusion still raise, because they keep results built
+from the earlier best hyperparameters.
 
 **Artifacts made before manifests existed: `resume="adopt"`.** A directory with
 artifacts but no `resume_manifest.json` is refused by default, because there is
@@ -754,6 +761,7 @@ comes from is in the `source` column:
 | `early_stopping` | the best epoch on the early-stopping slice (text, fixed hyperparameters) |
 | `automm_holdout` | AutoMM's best validation score on its holdout (feature fusion) |
 | `meta_cv` | the chosen stacking meta-learner's cross-validated score |
+| `dev_slice` | a prompted model's score on the dev slice carved from the training rows (`task="llm"`) |
 | `none` | nothing — no validation data was used. Left missing, never filled from the test set |
 
 Compare runs that share a `source`. A best-epoch score on one holdout runs
@@ -764,6 +772,55 @@ report: each is the best of several trials, epochs or candidates.
 Runs made before `validation.json` existed are read from the files they left
 (`hpo_trials.csv`, the AutoMM training log, the training history), so the
 leaderboard works on runs already on disk.
+
+## Can I prompt a language model instead of training one?
+
+Yes — `task="llm"`. Nothing is trained: each record goes to a chat model with
+a fixed prompt, and the model returns a ranked list of causes with
+probabilities, a confidence level, a rationale and quoted evidence. The run
+writes the same prediction tables as every other task, plus the model's full
+answer per record.
+
+**The prompt** is a fixed base — the task, WHO's definition of the underlying
+cause, the output contract — plus four modules you can switch: M1 study context
+(a sentence or two on the population, `context=`), M2 a reasoning scaffold, M3
+what each of your causes covers, M4 the WHO cross-cause rules. The cause list
+is read from your label column; a small JSON **cause schema** supplies M3's
+definitions (`multimodalva llm-schema` writes a template to fill in, and
+`multimodalva llm-prompt` prints the prompt a schema produces). A record is
+one text column, or several named sections (narrative, questionnaire, anything
+else) that the model's evidence refers to by name. By default every row you
+pass is prompted, with no split and with or without a label column — plain
+zero-shot use; split the data yourself if you want a holdout. Module choice
+and the generation settings go through `hyperparams=`; to have the package
+pick them, `evaluate_on="test"` makes its usual train/test split and selects
+on a dev slice of the training rows (`Optimize()`), and `evaluate_on="dev"`
+tries things on that slice without touching the test rows.
+
+**Models.** Any Hugging Face chat model, run in-process through transformers
+(default `openai/gpt-oss-20b`), or any model served by a local
+[ollama](https://ollama.com) server (`model="ollama:<tag>"`).
+
+**Resources.** The model, not the package, sets the bill:
+
+| | Hugging Face (transformers) | ollama |
+|---|---|---|
+| Install | the core package; `[llm]` adds the MXFP4 kernels for gpt-oss | the ollama app, `ollama pull <tag>` |
+| gpt-oss-20b | ≈16 GB on a CUDA Hopper-class GPU with `[llm]`; ≈42 GB (bf16) elsewhere | ≈13 GB, Apple Silicon / CUDA / CPU |
+| gpt-oss-120b | ≈61 GB on one H100-class GPU with `[llm]`; ≈240 GB elsewhere | ≈65 GB |
+
+Every record is one generation over a prompt of a few thousand tokens, so a
+run is minutes to hours depending on the model and the machine; a selection
+multiplies that by the number of configurations. Before loading a Hub
+checkpoint the run estimates what it needs here and refuses a load that cannot
+fit. Measure on a small `evaluate_on="dev"` run first; `llm_metadata.csv`
+records tokens and seconds per record. A finished llm run has no trained
+artifact, so `predict_from_pretrained()` does not apply: run `task="llm"` on
+the new records with the same settings.
+
+Code: [`examples/09_prompt_a_language_model.py`](examples/09_prompt_a_language_model.py)
+(your own cause list, the prompt it produces, a run) and the
+[user manual](https://y-chu.github.io/MultimodalVA/#llm).
 
 ## I have no labelled data — can I just use a trained model to predict?
 

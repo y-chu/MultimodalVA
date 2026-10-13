@@ -4,6 +4,21 @@ All notable changes to MultimodalVA are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — unreleased
+
+### Added
+
+- `task="llm"`: assign causes by prompting a language model — a Hugging Face
+  chat model or one served by ollama — instead of training one. See the
+  [README](README.md) and the
+  [FAQ](FAQ.md#can-i-prompt-a-language-model-instead-of-training-one).
+
+### Changed
+
+- A finished `text`, `tabular` or `data_fusion` search can be topped up by
+  raising `Optimize(n_trials=...)` on the same `output_dir`. Runs written
+  before this need `resume="adopt"` once.
+
 ## [0.1.0] — 2026-09-28
 
 First public release.

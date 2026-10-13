@@ -272,8 +272,9 @@ def optimize_tabular(
             logger.warning(
                 "storage_path points to a SQLite .db file; the HPO backend is now "
                 "JournalStorage (.log).  Redirecting to %s.  "
-                "To migrate existing trials: "
-                "python Analysis/utils/migrate_hpo_storage.py <dir>",
+                "Trials in the .db are not carried over; to keep them, copy each "
+                "study with optuna.copy_study(from_storage='sqlite:///<file>.db', "
+                "to_storage=<JournalStorage on the .log>) before resuming.",
                 _sp,
             )
         storage_path = _sp

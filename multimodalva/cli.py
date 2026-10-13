@@ -35,6 +35,15 @@ Examples
     # Check a submitted job before it spends an hour: nothing is scored
     multimodalva predict --source runs/stacking --data new.csv --dry-run
 
+    # Prompt a language model instead of training one
+    multimodalva run --task llm --data clean.csv --label-col cause \
+        --text-col narrative --model openai/gpt-oss-20b --cause-schema causes.json \
+        --context "Deaths from a rural district." --output-dir runs/llm
+
+    # Read the prompt an llm run would send, and write a cause schema to fill in
+    multimodalva llm-prompt --data clean.csv --label-col cause --cause-schema causes.json
+    multimodalva llm-schema --data clean.csv --label-col cause --out causes.json
+
     # Helpers
     multimodalva list-datasets
     multimodalva list-models
@@ -50,6 +59,8 @@ from pathlib import Path
 from typing import Any
 
 from .inference.backends import PRETRAINED_MISSING_FEATURE_METHODS
+from .llm.backends import LLM_BACKENDS, LLM_REASONING_EFFORTS
+from .llm.llm_classifier import LLM_EVALUATE_ON, LLM_PROB_SOURCES
 from .utils.optimize_config import BACKENDS, Optimize, optimize_from_flags
 
 
@@ -78,6 +89,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(args)
     if args.command == "predict":
         return _cmd_predict(args)
+    if args.command == "llm-prompt":
+        return _cmd_llm_prompt(args)
+    if args.command == "llm-schema":
+        return _cmd_llm_schema(args)
 
     parser.print_help()
     return 1
@@ -103,7 +118,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional YAML/JSON config file. CLI flags override its values.",
     )
     run_p.add_argument("--task", help="text | tabular | data_fusion | "
-                       "feature_fusion | voting | stacking")
+                       "feature_fusion | voting | stacking | llm")
     run_p.add_argument("--data", help="CSV/Parquet path (or 'demo' for the "
                        "built-in synthetic dataset).")
     run_p.add_argument("--label-col", dest="label_col",
@@ -185,6 +200,39 @@ def _build_parser() -> argparse.ArgumentParser:
                        "(text / data_fusion).")
     run_p.add_argument("--hub-repo-id", dest="hub_repo_id",
                        help="Target HF Hub repo id (e.g. user/model).")
+    llm = run_p.add_argument_group(
+        "task llm", "Prompting a language model (see multimodalva.llm.LLMClassifier.run)")
+    llm.add_argument("--backend", choices=list(LLM_BACKENDS),
+                     help="Where the model runs: transformers (default for a Hub "
+                          "id) or ollama ('ollama:<tag>' selects it by itself).")
+    llm.add_argument("--cause-schema", dest="cause_schema",
+                     help="Cause schema JSON: what each label covers (llm-schema "
+                          "writes a template).")
+    llm.add_argument("--context", help="Study context sentence(s) for module M1.")
+    llm.add_argument("--sections", help="Several text columns as named sections, "
+                                        "e.g. 'narrative=nar,questionnaire=q'.")
+    llm.add_argument("--section-markers", dest="section_markers",
+                     help="Split --text-col on marker lines, e.g. "
+                          "'narrative=none,questionnaire=QUESTIONNAIRE' (none = "
+                          "from the start).")
+    llm.add_argument("--sex-col", dest="sex_col", help="Sex column for the demographics line.")
+    llm.add_argument("--age-col", dest="age_col", help="Age (years) column for the demographics line.")
+    llm.add_argument("--evaluate-on", dest="evaluate_on", choices=list(LLM_EVALUATE_ON),
+                     help="all (default): every row, no split; test: the package's "
+                          "test partition; dev: a dev slice of the training rows only.")
+    llm.add_argument("--dev-size", dest="dev_size", type=float,
+                     help="Share of the training rows carved out as the dev slice (default 0.1).")
+    llm.add_argument("--dev-ids", dest="dev_ids",
+                     help="Path of a dev_ids.json from an earlier run (needs --id-col).")
+    llm.add_argument("--prob-source", dest="prob_source", choices=list(LLM_PROB_SOURCES),
+                     help="How predictions_full.csv is built (default stated).")
+    llm.add_argument("--modules", help="Prompt modules, e.g. 'M1,M2,M3,M4' (default all four).")
+    llm.add_argument("--reasoning-effort", dest="reasoning_effort",
+                     choices=list(LLM_REASONING_EFFORTS) + ["none"],
+                     help="For models that take one (default low).")
+    llm.add_argument("--temperature", type=float, help="Sampling temperature (default 0).")
+    llm.add_argument("--max-new-tokens", dest="max_new_tokens", type=int,
+                     help="Generation budget per record (default 2048).")
 
     predict_p = sub.add_parser(
         "predict",
@@ -248,6 +296,43 @@ def _build_parser() -> argparse.ArgumentParser:
                                 "combiner, columns present and missing — then "
                                 "stop without scoring anything.")
 
+    prompt_p = sub.add_parser(
+        "llm-prompt",
+        help="Print the system prompt a task-llm run would send.",
+        description=(
+            "Assemble and print the prompt for a cause list, a cause schema and a "
+            "module set, so it can be read before any model is loaded. The causes "
+            "come from --data/--label-col, from --causes, or from the bundled "
+            "WHO target-list schema when neither is given."
+        ),
+    )
+    prompt_p.add_argument("--data", help="CSV/Parquet whose label column lists the causes.")
+    prompt_p.add_argument("--label-col", dest="label_col", help="Label column in --data.")
+    prompt_p.add_argument("--causes", help="Comma-separated cause names instead of --data.")
+    prompt_p.add_argument("--cause-schema", dest="cause_schema",
+                          help="Cause schema JSON, or the bundled 'who_target_list_adult'.")
+    prompt_p.add_argument("--context", help="Study context sentence(s) for M1.")
+    prompt_p.add_argument("--modules", help="e.g. 'M1,M2,M3,M4' (default), 'none' for the base.")
+    prompt_p.add_argument("--sections", help="Comma-separated section names (default "
+                                             "narrative,questionnaire).")
+    prompt_p.add_argument("--response-schema", dest="response_schema", action="store_true",
+                          help="Print the JSON response schema instead of the prompt.")
+
+    schema_p = sub.add_parser(
+        "llm-schema",
+        help="Write a cause-schema template for the causes in a data file.",
+        description=(
+            "One entry per cause found in --label-col, its definition marked TODO "
+            "for you to fill in, with the WHO target-list categories beside it to "
+            "copy codes and scope from. The loader refuses a schema that still "
+            "carries a TODO."
+        ),
+    )
+    schema_p.add_argument("--data", required=True, help="CSV/Parquet with the label column.")
+    schema_p.add_argument("--label-col", dest="label_col", required=True)
+    schema_p.add_argument("--context", help="Study context to write into _meta.population_context.")
+    schema_p.add_argument("--out", help="Where to write the JSON. Omitted: printed.")
+
     sub.add_parser("list-datasets", help="List built-in synthetic datasets.")
     sub.add_parser("list-models", help="List supported text model aliases.")
     return parser
@@ -277,9 +362,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
     except ValueError:
         reuses_oof = False  # preflight/run will report the unknown task itself
-    if not reuses_oof and ("data" not in cfg or "label_col" not in cfg):
+    llm_all = False
+    try:
+        llm_all = (_normalize_task(cfg["task"]) == "llm"
+                   and cfg.get("evaluate_on", "all") == "all")
+    except ValueError:
+        pass
+    missing = [k for k in ("data", "label_col") if k not in cfg]
+    if missing and not reuses_oof and not (llm_all and missing == ["label_col"]):
         print("error: --data and --label-col are required (via flags or config "
-              "file), except for stacking with --oof-from.", file=sys.stderr)
+              "file), except for stacking with --oof-from and for task llm on "
+              "every row (unlabelled data; give --cause-schema).", file=sys.stderr)
         return 2
     cfg.setdefault("output_dir", "runs/mmva")
 
@@ -525,6 +618,61 @@ _SOURCE_WORDING = {
 }
 
 
+def _llm_causes(args: argparse.Namespace) -> list[str]:
+    from .runner import _load_df
+
+    if getattr(args, "causes", None):
+        return [c.strip() for c in args.causes.split(",") if c.strip()]
+    if args.data:
+        if not args.label_col:
+            raise SystemExit("error: --label-col is required with --data.")
+        df = _load_df(args.data)
+        if args.label_col not in df.columns:
+            raise SystemExit(f"error: label column {args.label_col!r} is not in {args.data}.")
+        return sorted({str(c) for c in df[args.label_col].dropna()})
+    return []
+
+
+def _cmd_llm_prompt(args: argparse.Namespace) -> int:
+    from .llm.cause_schema import LLM_SCHEMA_EXAMPLE, load_cause_schema
+    from .llm.selection import validate_llm_fixed
+
+    causes = _llm_causes(args)
+    cause_schema = args.cause_schema
+    if not causes:
+        cause_schema = cause_schema or str(LLM_SCHEMA_EXAMPLE)
+        causes = sorted(json.loads(Path(cause_schema).read_text())["causes"]) \
+            if Path(cause_schema).is_file() else []
+        if not causes:
+            raise SystemExit("error: give --data/--label-col, --causes, or a --cause-schema file.")
+    modules = validate_llm_fixed(
+        {"modules": [] if (args.modules or "").lower() == "none" else args.modules}
+        if args.modules else None
+    )["modules"]
+    sections = [s.strip() for s in args.sections.split(",") if s.strip()] if args.sections else None
+    spec = load_cause_schema(cause_schema, causes, context=args.context, sources=sections)
+    if args.response_schema:
+        print(json.dumps(spec.response_schema(True, True), indent=2))
+    else:
+        print(spec.system_prompt(modules=modules))
+    return 0
+
+
+def _cmd_llm_schema(args: argparse.Namespace) -> int:
+    from .llm.cause_schema import cause_schema_template
+
+    causes = _llm_causes(args)
+    doc = cause_schema_template(causes, context=args.context)
+    text = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+    if args.out:
+        Path(args.out).write_text(text)
+        print(f"Wrote a cause-schema template for {len(causes)} causes to {args.out}. "
+              "Fill in every TODO before passing it as --cause-schema.")
+    else:
+        print(text, end="")
+    return 0
+
+
 def _cmd_list_datasets() -> int:
     from .datasets import list_datasets
 
@@ -664,6 +812,60 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
         out["features"] = _parse_features(args.features)
     if args.filters is not None:
         out["filters"] = _parse_filters(args.filters)
+    out.update(_llm_overrides(args, search is not None))
+    return out
+
+
+def _llm_overrides(args: argparse.Namespace, searching: bool) -> dict:
+    """The task-llm flags, mapped to LLMClassifier.run() arguments."""
+    out: dict[str, Any] = {}
+    for key in ("backend", "cause_schema", "context", "sex_col", "age_col",
+                "evaluate_on", "dev_ids", "prob_source"):
+        val = getattr(args, key, None)
+        if val is not None:
+            out[key] = val
+    if getattr(args, "dev_size", None) is not None:
+        out["dev_size"] = args.dev_size
+    if getattr(args, "sections", None):
+        out["sections"] = _parse_pairs(args.sections, "--sections")
+    if getattr(args, "section_markers", None):
+        markers = _parse_pairs(args.section_markers, "--section-markers")
+        out["section_markers"] = {k: (None if v.lower() == "none" else v) for k, v in markers.items()}
+    prompt: dict[str, Any] = {}
+    if getattr(args, "modules", None):
+        prompt["modules"] = [] if args.modules.lower() == "none" else [
+            m.strip() for m in args.modules.split(",") if m.strip()]
+    if getattr(args, "reasoning_effort", None):
+        prompt["reasoning_effort"] = None if args.reasoning_effort == "none" else args.reasoning_effort
+    if getattr(args, "temperature", None) is not None:
+        prompt["temperature"] = args.temperature
+    if getattr(args, "max_new_tokens", None) is not None:
+        prompt["max_new_tokens"] = args.max_new_tokens
+    if prompt:
+        if searching:
+            raise SystemExit(
+                "--modules, --reasoning-effort, --temperature and --max-new-tokens "
+                "fix the prompt configuration, which --optimize selects instead. "
+                "Drop --optimize, or put the choices in a config file under "
+                "hyperparams.optimize.space / extra."
+            )
+        out["hyperparams"] = prompt
+    return out
+
+
+def _parse_pairs(raw: str, flag: str) -> dict[str, str]:
+    """Parse 'name=value,name=value' keeping the order given."""
+    out: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise SystemExit(f"bad {flag} entry {pair!r}; expected name=value.")
+        name, value = pair.split("=", 1)
+        out[name.strip()] = value.strip()
+    if not out:
+        raise SystemExit(f"{flag} is empty.")
     return out
 
 

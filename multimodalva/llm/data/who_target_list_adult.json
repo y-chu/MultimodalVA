@@ -1,0 +1,203 @@
+{
+  "_meta": {
+    "name": "who_target_list_adult",
+    "description": "Example cause schema: the Level-2 cause categories of the WHO 2022 target list for verbal autopsy, adult deaths, with each category's WHO VA codes and ICD-10 scope. Site-neutral: population_context is empty. Copy it and keep only the causes your data uses, or use it as the reference for the analysis_va_codes of your own schema.",
+    "age_group": "adult",
+    "population_context": "",
+    "n_causes": 21,
+    "generated_from": "cause_master.json + who_kb.json"
+  },
+  "causes": {
+    "Assault": {
+      "analysis_va_codes": [
+        "VAs-12.09"
+      ],
+      "icd10_scope": "X85-Y09",
+      "scope_note": "the WHO VA category Assault."
+    },
+    "Cardiac disease": {
+      "analysis_va_codes": [
+        "VAs-04.01",
+        "VAs-04.99"
+      ],
+      "icd10_scope": "I00-I15; I20-I52; I70-I99",
+      "scope_note": "the WHO VA categories Acute cardiac disease; Sickle cell with crisis; Other and unspecified cardiac dis."
+    },
+    "Cerebrovascular disease": {
+      "analysis_va_codes": [
+        "VAs-04.02"
+      ],
+      "icd10_scope": "I60-I69",
+      "scope_note": "the WHO VA category Stroke."
+    },
+    "Chronic pulmonary disease and asthma": {
+      "analysis_va_codes": [
+        "VAs-05.01",
+        "VAs-05.02"
+      ],
+      "icd10_scope": "J40-J44; J45-J46",
+      "scope_note": "the WHO VA categories Chronic obstructive pulmonary dis; Asthma."
+    },
+    "Diabetes": {
+      "analysis_va_codes": [
+        "VAs-03.03"
+      ],
+      "icd10_scope": "E10-E14",
+      "scope_note": "the WHO VA category Diabetes mellitus."
+    },
+    "Diarrhea": {
+      "analysis_va_codes": [
+        "VAs-01.04"
+      ],
+      "icd10_scope": "A00-A09",
+      "scope_note": "the WHO VA category Diarrhoeal diseases."
+    },
+    "HIV/AIDS": {
+      "analysis_va_codes": [
+        "VAs-01.03"
+      ],
+      "icd10_scope": "B20-B24",
+      "scope_note": "the WHO VA category HIV/AIDS related death."
+    },
+    "Indeterminate": {
+      "analysis_va_codes": [
+        "VAs-99"
+      ],
+      "icd10_scope": "R95-R99",
+      "scope_note": "the WHO VA category Cause of death unknown."
+    },
+    "Liver cirrhosis": {
+      "analysis_va_codes": [
+        "VAs-06.02"
+      ],
+      "icd10_scope": "K70-K76",
+      "scope_note": "the WHO VA category Liver cirrhosis."
+    },
+    "Malaria": {
+      "analysis_va_codes": [
+        "VAs-01.05"
+      ],
+      "icd10_scope": "B50-B54",
+      "scope_note": "the WHO VA category Malaria."
+    },
+    "Malnutrition and anaemia": {
+      "analysis_va_codes": [
+        "VAs-03.01",
+        "VAs-03.02"
+      ],
+      "icd10_scope": "D50-D64; E40-E46",
+      "scope_note": "the WHO VA categories Severe anaemia; Severe malnutrition."
+    },
+    "Maternal conditions": {
+      "analysis_va_codes": [
+        "VAs-09.01",
+        "VAs-09.02",
+        "VAs-09.03",
+        "VAs-09.04",
+        "VAs-09.05",
+        "VAs-09.06",
+        "VAs-09.07",
+        "VAs-09.08",
+        "VAs-09.99"
+      ],
+      "icd10_scope": "O00; O03-O08; O10-O16; O46; O67; O72; O63-O66; O85; O75.3; O99.0; O71; O01-O02; O20-O45; O47-O62; O68-O70; O73-O84; O86-O99",
+      "scope_note": "the WHO VA categories Ectopic pregnancy; Abortion-related death; Pregnancy-induced hypertension; Obstetric haemorrhage; Obstructed labour; Pregnancy-related sepsis; Anaemia of pregnancy; Ruptured uterus; Other and unspecified maternal CoD."
+    },
+    "Meningitis and encephalitis": {
+      "analysis_va_codes": [
+        "VAs-01.07"
+      ],
+      "icd10_scope": "A39; G00-G05",
+      "scope_note": "the WHO VA category Meningitis and encephalitis."
+    },
+    "Neoplasms": {
+      "analysis_va_codes": [
+        "VAs-02.01",
+        "VAs-02.02",
+        "VAs-02.03",
+        "VAs-02.04",
+        "VAs-02.05",
+        "VAs-02.06",
+        "VAs-02.99"
+      ],
+      "icd10_scope": "C00-C06; C15-C26; C30-C39; C50; C51-C58; C60-C63; C07-C14; C40-C49; C60-D48",
+      "scope_note": "the WHO VA categories Oral neoplasms; Digestive neoplasms; Respiratory neoplasms; Breast neoplasms; Reproductive neoplasms M, F; Other and unspecified neoplasms; Digestive neoplasms Oesophageal cancer; Respiratory neoplasms Throat cancer; Female reproductive neoplasms; Male reproductive neoplasms."
+    },
+    "Other and unspecified external causes": {
+      "analysis_va_codes": [
+        "VAs-12.03",
+        "VAs-12.04",
+        "VAs-12.05",
+        "VAs-12.06",
+        "VAs-12.07",
+        "VAs-12.10",
+        "VAs-12.99"
+      ],
+      "icd10_scope": "W00-W19; W65-W74; X00-X19; X20-X29; X40-X49; X30-X39; S00-T99; W20-W64; W75-W99; X50-X59; Y10-Y98",
+      "scope_note": "the WHO VA categories Accid fall; Accid drowning and submersion; Accid expos to smoke, fire \\; Contact with venomous plant/animal; Accid poisoning and noxious subs; Exposure to force of nature; Other and unspecified external CoD."
+    },
+    "Other and unspecified infections": {
+      "analysis_va_codes": [
+        "VAs-01.01",
+        "VAs-01.06",
+        "VAs-01.07",
+        "VAs-01.08",
+        "VAs-10.05",
+        "VAs-01.10",
+        "VAs-01.11",
+        "VAs-01.99"
+      ],
+      "icd10_scope": "A17-A38; A40-A99; B00-B19; B25-B49; B55-B99",
+      "scope_note": "the WHO VA categories Sepsis (non-obstetric); Measles; Meningitis and encephalitis; Tetanus; Pertussis; Haemorrhagic fever; Other and unspecified infect dis; Sepsis; Neonatal tetanus; Unspecified infectious disease."
+    },
+    "Other and unspecified non communicable diseases": {
+      "analysis_va_codes": [
+        "VAs-03.01",
+        "VAs-03.02",
+        "VAs-06.01",
+        "VAs-07.01",
+        "VAs-08.01",
+        "VAs-98",
+        "VAs-10.01",
+        "VAs-10.02",
+        "VAs-10.03",
+        "VAs-10.04",
+        "VAs-10.06",
+        "VAs-10.99",
+        "VAs-11.01",
+        "VAs-11.02"
+      ],
+      "icd10_scope": "D65-D89; E00-E07; E15-E35; E50-E90; F00-F99; G06-G09; G10-G37; G40-G41; G50-G99; H00-H95; J30-J39; J47-J99; K00-K31; K35-K38; K40-K93; L00-L99; M00-M99; N00-N16; N17-N19; N20-N99; R00-R09; R10; R11-R94; D57; P00-P96; Q00-Q99",
+      "scope_note": "the WHO VA categories Severe anaemia; Severe malnutrition; Acute abdomen; Renal failure; Epilepsy; Other and unspecified NCD; Prematurity; Birth asphyxia; Neonatal pneumonia; Neonatal sepsis; Congenital malformation; Other and unspecified neonatal CoD; Fresh stillbirth; Macerated stillbirth."
+    },
+    "Pneumonia": {
+      "analysis_va_codes": [
+        "VAs-01.02"
+      ],
+      "icd10_scope": "J00-J22",
+      "scope_note": "the WHO VA category Acute resp infect, incl pneumonia."
+    },
+    "Pulmonary tuberculosis": {
+      "analysis_va_codes": [
+        "VAs-01.09"
+      ],
+      "icd10_scope": "A15-A16",
+      "scope_note": "the WHO VA category Pulmonary tuberculosis."
+    },
+    "Suicide": {
+      "analysis_va_codes": [
+        "VAs-12.08"
+      ],
+      "icd10_scope": "X60-X84",
+      "scope_note": "the WHO VA category Intentional self-harm."
+    },
+    "Traffic / transport accident": {
+      "analysis_va_codes": [
+        "VAs-12.01",
+        "VAs-12.02"
+      ],
+      "icd10_scope": "V01-V89; V90-V99",
+      "scope_note": "the WHO VA categories Road traffic accident; Other transport accident."
+    }
+  }
+}

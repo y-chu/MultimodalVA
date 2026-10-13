@@ -252,6 +252,37 @@ def _remove_checkpoint_dirs(output_dir: Path) -> int:
     return removed
 
 
+#: Written beside the ``checkpoint-*/`` directories before training starts, so a
+#: resume can tell whether they were trained with the hyperparameters now asked for.
+_CHECKPOINT_HP_RECORD = "checkpoint_hyperparams.json"
+
+
+def _as_record(hp: dict) -> dict:
+    """``hp`` as it reads back from JSON, so a saved record compares equal."""
+    return json.loads(json.dumps(hp, sort_keys=True, default=str))
+
+
+def _read_hp_record(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _set_aside_checkpoints(output_dir: Path) -> Path:
+    """Move every ``checkpoint-{step}/`` under output_dir aside, unharmed."""
+    aside = output_dir / f"stale_checkpoints_{time.strftime('%Y%m%d_%H%M%S')}"
+    aside.mkdir()
+    for ckpt in output_dir.iterdir():
+        if (
+            ckpt.is_dir()
+            and ckpt.name.startswith("checkpoint-")
+            and ckpt.name.split("-")[-1].isdigit()
+        ):
+            shutil.move(str(ckpt), str(aside / ckpt.name))
+    return aside
+
+
 
 def freeze_model_layers(model, freeze_layers: int):
     """Freeze the embedding layer and the first N encoder layers.
@@ -1046,10 +1077,28 @@ def train_text(
         pass
 
     # --- Resolve resume checkpoint ---
+    # A checkpoint is only resumable under the hyperparameters it was trained
+    # with. A search topped up after an interrupted final fit can pick a new
+    # best, and Trainer would carry the old optimiser state on under it.
+    hp_record = output_dir / _CHECKPOINT_HP_RECORD
+    is_zero = (
+        not hasattr(trainer, "is_world_process_zero") or trainer.is_world_process_zero()
+    )
     resume_checkpoint = None
     if resume:
         resume_checkpoint = _find_latest_checkpoint(output_dir)
-        if resume_checkpoint is not None:
+        if resume_checkpoint is not None and _read_hp_record(hp_record) != _as_record(hp):
+            if is_zero:
+                aside = _set_aside_checkpoints(output_dir)
+                logger.warning(
+                    "Checkpoint %s was trained with different hyperparameters (or "
+                    "carries no record of them), so it cannot be resumed under "
+                    "these. Training from scratch; the old checkpoints were moved "
+                    "to %s.",
+                    resume_checkpoint, aside,
+                )
+            resume_checkpoint = None
+        elif resume_checkpoint is not None:
             logger.info("Resuming from checkpoint: %s", resume_checkpoint)
         else:
             logger.warning(
@@ -1063,6 +1112,9 @@ def train_text(
                 "instead of starting from scratch.",
                 existing,
             )
+
+    if is_zero:
+        hp_record.write_text(json.dumps(_as_record(hp), indent=2))
 
     # --- Train ---
     with runtime_tracker.stage(
@@ -1114,6 +1166,7 @@ def train_text(
             # Runs only here (post trainer.save_model), so interrupted-run resume is safe.
             if cleanup_checkpoints:
                 _remove_checkpoint_dirs(output_dir)
+                hp_record.unlink(missing_ok=True)
 
             # --- Save label maps and hyperparams ---
             with open(output_dir / "label2id.json", "w") as f:

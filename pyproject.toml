@@ -8,12 +8,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multimodalva"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cause of death classification using text and tabular data from verbal autopsies"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "multimodalva/llm/data/WHO_NOTICE.md"]
 authors = [
     {name = "Yue Chu", email = "ychu612@gmail.com"},
 ]
@@ -176,6 +176,16 @@ feature_fusion = [
 # autogluon.core[raytune]'s own `ray[default,tune]>=2.43,<2.53`, so [ray] and
 # [feature_fusion] resolve together instead of pip having to backtrack — and it
 # keeps Ray inside the 2.x API surface that utils/ray_compat.py shims.
+# task="llm" on a Hugging Face checkpoint needs nothing beyond core: transformers
+# and accelerate are already there. This extra adds the native MXFP4 kernel path
+# for the gpt-oss checkpoints on a CUDA Hopper-class GPU; without it those
+# weights are dequantised to bf16 at load (about four times the stored size).
+# Serving the model with ollama ("ollama:<tag>") needs nothing either.
+llm = [
+    "kernels>=0.6",
+    "triton>=3.4; platform_system=='Linux'",
+]
+
 ray = [
     "ray[tune]>=2.9,<2.53",
     # Required by Ray Tune's OptunaSearch, which is the search algorithm the Ray
@@ -241,4 +251,4 @@ include = ["multimodalva*"]
 # multimodalva.ensemble.data_fusion.load_qdesc() and by
 # multimodalva.datasets. They must ship with the wheel.
 [tool.setuptools.package-data]
-multimodalva = ["utils/*.csv", "py.typed"]
+multimodalva = ["utils/*.csv", "py.typed", "llm/data/*.json", "llm/data/*.md"]

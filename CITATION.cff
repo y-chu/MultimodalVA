@@ -25,8 +25,9 @@ keywords:
   - health surveillance
   - global health
 license: MIT
-version: 0.1.0
-# Keep in step with the git tag and with CHANGELOG.md's [0.1.0] heading.
+version: 0.2.0
+# Keep in step with the git tag and with CHANGELOG.md's [0.2.0] heading;
+# set date-released on the day the tag is made.
 date-released: "2026-09-28"
 # After archiving the tagged release (e.g. on Zenodo), add its DOI here as:
 # doi: "10.5281/zenodo.XXXXXXX"

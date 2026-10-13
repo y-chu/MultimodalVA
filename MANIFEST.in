@@ -10,6 +10,12 @@ include CITATION.cff
 # see what changed between versions, or to find the pre-release rename table.
 include CHANGELOG.md
 
+# The llm task's data: the WHO knowledge base (with its own licence notice —
+# WHO material under CC BY-ND 4.0, not MIT), the cross-site master and the
+# bundled example cause schema. ~90 KB. Loaded at runtime by multimodalva.llm.
+include multimodalva/llm/data/*.json
+include multimodalva/llm/data/*.md
+
 # The three scripts under tests/ that are not named test_*.py, so setuptools
 # does not pick them up by itself:
 #   smoke_test.py      "is the install alive?" — README and CONTRIBUTING both

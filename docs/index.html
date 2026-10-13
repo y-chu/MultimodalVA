@@ -220,7 +220,7 @@
      SIDEBAR
      ==================================================================== -->
 <nav id="sidebar">
-  <div class="logo"><span>Multimodal</span>VA <span style="color:#8b949e;font-weight:400;font-size:0.8rem;">v0.1.0</span></div>
+  <div class="logo"><span>Multimodal</span>VA <span style="color:#8b949e;font-weight:400;font-size:0.8rem;">v0.2.0</span></div>
   <nav>
 
     <div class="nav-group">
@@ -257,6 +257,12 @@
       <a href="#tabular-hpo" class="sub">optimize_tabular()</a>
       <a href="#tabular-models" class="sub">Supported models</a>
 
+      <a href="#llm">multimodalva.llm</a>
+      <a href="#llm-classifier" class="sub">LLMClassifier</a>
+      <a href="#llm-schema" class="sub">Cause schemas and the prompt</a>
+      <a href="#llm-backends" class="sub">Backends</a>
+      <a href="#llm-selection" class="sub">Hyperparameters and selection</a>
+
       <a href="#ensemble">multimodalva.ensemble</a>
       <a href="#ensemble-dispatcher" class="sub">EnsembleClassifier</a>
       <a href="#ensemble-data-fusion" class="sub">DataFusionClassifier</a>
@@ -289,7 +295,7 @@
   <p class="subtitle">
     Cause of death classification for verbal autopsy data —
     text-only, tabular-only, and multimodal ensemble pipelines.
-    <span class="version">v0.1.0</span>
+    <span class="version">v0.2.0</span>
   </p>
   <p>
     MultimodalVA provides a unified <code>split → prepare → [HPO →] train → predict</code>
@@ -465,10 +471,17 @@ Both together, fused before the model sees them::
 Reusing one split across models so the numbers are comparable::
 
     out = mv.run(task="text", data=(train_df, test_df), label_col="cause",
-                 text_col="narrative", output_dir="runs/fixed_split")</code></pre>
+                 text_col="narrative", output_dir="runs/fixed_split")
+
+Prompting a language model instead of training one::
+
+    out = mv.run(task="llm", data="clean.csv", label_col="cause",
+                 text_col="narrative", model="openai/gpt-oss-20b",
+                 cause_schema="causes.json", context="Deaths from ...",
+                 output_dir="runs/llm")</code></pre>
     <table>
       <tr><th>Parameter</th><th>Description</th></tr>
-      <tr><td><code>task</code></td><td>One of <code>SUPPORTED_TASKS</code> (aliases like <code>"voting"</code> accepted).</td></tr>
+      <tr><td><code>task</code></td><td>One of <code>SUPPORTED_TASKS</code> (aliases like <code>"voting"</code> accepted). <code>"llm"</code> prompts a language model instead of training one; its own arguments (<code>cause_schema</code>, <code>context</code>, <code>sections</code>, <code>evaluate_on</code>, <code>dev_size</code>, <code>prob_source</code>, <code>backend</code> …) travel in <code>**run_kwargs</code> and are documented on :meth:`multimodalva.llm.LLMClassifier.run`.</td></tr>
       <tr><td><code>data</code></td><td>CSV/Parquet path, an in-memory DataFrame, or an explicit <code>(train_df, test_df)</code> tuple (which also fixes the split).</td></tr>
       <tr><td><code>label_col</code></td><td>Label (cause-of-death) column name.</td></tr>
       <tr><td><code>output_dir</code></td><td>Root directory for all artifacts.</td></tr>
@@ -1513,6 +1526,199 @@ results = clf.run(
       <tr><td><code>"knn"</code></td><td>sklearn KNeighborsClassifier</td><td>—</td><td>✓</td></tr>
       <tr><td><code>"naive_bayes"</code></td><td>sklearn GaussianNB</td><td>—</td><td>—</td></tr>
     </table>
+  </section>
+
+  <hr>
+
+  <!-- ====================================================
+       LLM
+       ==================================================== -->
+  <section id="llm">
+    <a class="anchor" id="llm"></a>
+    <h2>multimodalva.llm <span class="badge green">Complete</span></h2>
+    <p>Cause assignment by prompting a language model, with no training. A fixed
+    prompt (a base plus the modules M1&ndash;M4), a cause schema stating what each
+    label covers, and a chat model that returns a ranked list of causes with
+    probabilities, a confidence level, a rationale and quoted evidence. The model
+    runs through transformers or on a local ollama server; <code>run(task="llm")</code>
+    takes every argument of <code>LLMClassifier.run()</code>.</p>
+
+    <!-- AUTODOC:start:llm -->
+    <a class="anchor" id="llm-classifier"></a>
+    <h3>LLMClassifier</h3>
+    <div class="sig">
+      <span class="cls-name">LLMClassifier</span>(<span class="param">model_name=LLM_DEFAULT_MODEL</span>, <span class="param">output_dir='runs/llm'</span>, <span class="param">backend='auto'</span>, <span class="param">backend_kwargs=None</span>, <span class="param">backend_instance=None</span>)
+    </div>
+    <p>Cause assignment by prompting a language model.</p>
+    <p>Typical usage:</p>
+    <pre><code>clf = LLMClassifier(model_name="openai/gpt-oss-20b", output_dir="runs/llm")
+results = clf.run(df, text_col="narrative", label_col="cause",
+                  cause_schema="causes.json", context="Rural ...")</code></pre>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>model_name</code></td><td>A Hugging Face Hub id or local directory of a chat model, or <code>"ollama:&amp;lt;tag&amp;gt;"</code> for a model served by ollama.</td></tr>
+      <tr><td><code>output_dir</code></td><td>Root directory for all outputs.</td></tr>
+      <tr><td><code>backend</code></td><td><code>"auto"</code> (transformers, or ollama for an <code>ollama:</code> model), <code>"transformers"</code> or <code>"ollama"</code>.</td></tr>
+      <tr><td><code>backend_kwargs</code></td><td>Settings for the backend's constructor — <code>device_map</code>, <code>dtype</code>, <code>force_load</code>, <code>trust_remote_code</code> for transformers; <code>host</code>, <code>timeout</code> for ollama.</td></tr>
+      <tr><td><code>backend_instance</code></td><td>A ready backend object (tests pass a fake). Overrides <code>model_name</code> and <code>backend</code>.</td></tr>
+    </table>
+
+    <h4>.run()</h4>
+    <div class="sig">
+        <span class="fn-name">run</span>(<span class="param">df</span>, <span class="param">label_col=None</span>, <span class="param">text_col=None</span>, <span class="param">sections=None</span>, <span class="param">section_markers=None</span>, <span class="param">cause_schema=None</span>, <span class="param">context=None</span>, <span class="param">sex_col=None</span>, <span class="param">age_col=None</span>, <span class="param">hyperparams=None</span>, <span class="param">evaluate_on='all'</span>, <span class="param">dev_size=0.1</span>, <span class="param">dev_ids=None</span>, <span class="param">prob_source='stated'</span>, <span class="param">rules_arm='literature'</span>, <span class="param">batch_size=1</span>, <span class="param">timeout=900</span>, <span class="param">test_size=0.2</span>, <span class="param">split_seed=42</span>, <span class="param">train_seed=42</span>, <span class="param">deterministic=False</span>, <span class="param">stratify=True</span>, <span class="param">split_col=None</span>, <span class="param">top_k=3</span>, <span class="param">id_col=None</span>, <span class="param">resume=True</span>) → <span class="returns">dict</span>
+    </div>
+    <p>Prompt the model for every record of the target partition.</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>df</code></td><td>The records, one per row.</td></tr>
+      <tr><td><code>label_col</code></td><td>The cause-of-death column. Its values are the causes the model may return, and the tables gain a <code>true_label</code> column. May be omitted with <code>evaluate_on="all"</code> (unlabelled data); the cause list then comes from <code>cause_schema</code>, which is required in that case.</td></tr>
+      <tr><td><code>text_col</code></td><td>The record text, as one section (<code>narrative</code>). With <code>section_markers</code> it is the column to split.</td></tr>
+      <tr><td><code>sections</code></td><td><code>{section name: column}</code> for records with several sources, in record order. Replaces <code>text_col</code>.</td></tr>
+      <tr><td><code>section_markers</code></td><td><code>{section name: marker line}</code> to split <code>text_col</code> on whole-line markers. The first section may have marker <code>None</code> (it starts at the beginning). Every marker must appear exactly once, in order, or the row is refused.</td></tr>
+      <tr><td><code>cause_schema</code></td><td>Path or dict giving each cause's definition and optional WHO mapping (see :mod:`multimodalva.llm.cause_schema`). <code>None</code> uses the cause names alone.</td></tr>
+      <tr><td><code>context</code></td><td>One or two sentences on the population, for M1. Overrides the schema's; <code>""</code> turns M1 off.</td></tr>
+      <tr><td><code>sex_col / age_col</code></td><td>Columns rendered on the record's demographics line.</td></tr>
+      <tr><td><code>hyperparams</code></td><td>The prompt configuration: <code>None</code> for the defaults (M1–M4, low reasoning effort, temperature 0), a dict of <code>modules</code> / <code>reasoning_effort</code> / <code>temperature</code> / <code>top_p</code> / <code>max_new_tokens</code>, or <code>Optimize(...)</code> to select a configuration on the dev slice (see :mod:`multimodalva.llm.selection`).</td></tr>
+      <tr><td><code>evaluate_on</code></td><td><code>"all"</code> (default) prompts every row given, with no split — plain zero-shot use, on labelled or unlabelled data; split the data yourself if you want a holdout. <code>"test"</code> makes the package's train/test split and predicts the test partition, so the run is comparable with trained models on the same split; <code>"dev"</code> predicts a dev slice of the training rows only, under <code>dev/</code>, and never touches the test rows.</td></tr>
+      <tr><td><code>dev_size</code></td><td>Share (float) or count (int) of the **training** rows carved out as the dev slice, stratified, with <code>split_seed</code>.</td></tr>
+      <tr><td><code>dev_ids</code></td><td>Explicit dev rows by <code>id_col</code> — a list, or the path of a <code>dev_ids.json</code> an earlier run wrote. Must not overlap the test partition.</td></tr>
+      <tr><td><code>prob_source</code></td><td>How <code>predictions_full.csv</code> is built: <code>"stated"</code> (the model's own probabilities, zero outside the ranked causes, renormalised), <code>"alpha"</code> (rank and confidence through fixed a priori weights) or <code>"topk"</code> (stated head, uniform tail).</td></tr>
+      <tr><td><code>rules_arm</code></td><td><code>"literature"</code> (the WHO rules) or <code>"none"</code> for M4.</td></tr>
+      <tr><td><code>batch_size</code></td><td>Records generated per call on the transformers backend.</td></tr>
+      <tr><td><code>timeout</code></td><td>Seconds per request on the ollama backend.</td></tr>
+      <tr><td><code>test_size / split_seed / stratify / split_col</code></td><td>As for every task.</td></tr>
+      <tr><td><code>train_seed</code></td><td>The generation seed. Changes nothing at temperature 0.</td></tr>
+      <tr><td><code>deterministic</code></td><td>Accepted for uniformity; recorded, nothing to switch.</td></tr>
+      <tr><td><code>top_k</code></td><td>Classes listed in the topk table.</td></tr>
+      <tr><td><code>id_col</code></td><td>Row identifier, carried into every table and used for resume.</td></tr>
+      <tr><td><code>resume</code></td><td>Continue an interrupted run from <code>records.jsonl</code> when the run's signature matches; <code>False</code> starts over.</td></tr>
+    </table>
+    <p><strong>Returns</strong> <code>The usual result dict</code>: <code>predictions</code>, <code>train_metadata</code>, <code>best_hyperparams</code>, <code>label2id</code>, <code>id2label</code>, <code>output_dir</code>, plus <code>records</code> (the per-record answers) and <code>dev_scores</code> for a dev run.</p>
+
+    <a class="anchor" id="llm-schema"></a>
+    <h3>Cause schemas and the prompt</h3>
+
+    <h4>load_cause_schema()</h4>
+    <div class="sig">
+      <span class="fn-name">load_cause_schema</span>(<span class="param">cause_schema</span>, <span class="param">causes=None</span>, <span class="param">context=None</span>, <span class="param">sources=None</span>, <span class="param">task=COD</span>) → <span class="returns">A</span>
+    </div>
+    <p>Join a cause schema (or none) against the WHO knowledge base.</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>cause_schema</code></td><td>A path to a schema JSON, a dict of the same shape, the name of the bundled example (<code>"who_target_list_adult"</code>), or <code>None</code> for a schema built from the cause names alone.</td></tr>
+      <tr><td><code>causes</code></td><td>The labels found in the data. These are the causes the model may return; each must have an entry when a schema is given. <code>None</code> (unlabelled data) takes every cause the schema lists.</td></tr>
+      <tr><td><code>context</code></td><td>Study context for M1. Overrides the schema's <code>_meta.population_context</code>; <code>""</code> turns M1 off.</td></tr>
+      <tr><td><code>sources</code></td><td>Record section names the model may cite evidence from. Defaults to narrative + questionnaire.</td></tr>
+      <tr><td><code>task</code></td><td>The question asked; :data:`multimodalva.llm.prompts.COD` unless a caller defines another.</td></tr>
+    </table>
+    <p><strong>Returns</strong> <code>A</code>: class:`~multimodalva.llm.prompts.PromptSpec` restricted to <code>causes</code>.</p>
+    <table>
+      <tr><th>Raises</th><th>Description</th></tr>
+      <tr><td><code>ValueError</code></td><td>A label in the data has no schema entry, a field is still marked TODO, an entry has an unknown key, or <code>master_category</code> names no known category.</td></tr>
+      <tr><td><code>FileNotFoundError</code></td><td><code>cause_schema</code> is a path that does not exist.</td></tr>
+    </table>
+
+    <h4>cause_schema_template()</h4>
+    <div class="sig">
+      <span class="fn-name">cause_schema_template</span>(<span class="param">causes</span>, <span class="param">context=None</span>) → <span class="returns">dict</span>
+    </div>
+    <p>A schema document to fill in: one entry per cause, definitions marked TODO.</p>
+    <p>The WHO target-list categories are listed under <code>_who_target_list</code> for copying codes and scope from; the loader ignores keys starting with <code>_</code>.</p>
+
+    <h4>describe_modules()</h4>
+    <div class="sig">
+      <span class="fn-name">describe_modules</span>(<span class="param">spec</span>, <span class="param">modules=LIVE</span>, <span class="param">rules_arm='literature'</span>) → <span class="returns">list[str]</span>
+    </div>
+    <p>Warnings about modules that cannot do their full job with this schema.</p>
+    <p>Nothing here changes the prompt: :meth:`PromptSpec.system_prompt` already leaves out an M1 with no context and an M4 with no applicable rule. This says so, before any model is loaded, so the gap is a message rather than a silent absence.</p>
+
+    <h4>build_system_prompt()</h4>
+    <div class="sig">
+      <span class="fn-name">build_system_prompt</span>(<span class="param">causes</span>, <span class="param">cause_schema=None</span>, <span class="param">modules=LIVE</span>, <span class="param">context=None</span>, <span class="param">sources=None</span>, <span class="param">rules_arm='literature'</span>, <span class="param">probabilities=True</span>, <span class="param">evidence=True</span>) → <span class="returns">str</span>
+    </div>
+    <p>The system prompt a run would send, for reading before spending GPU time.</p>
+
+    <h4>format_record()</h4>
+    <div class="sig">
+      <span class="fn-name">format_record</span>(<span class="param">narrative=None</span>, <span class="param">structured_responses=None</span>, <span class="param">sex=None</span>, <span class="param">age_years=None</span>, <span class="param">demographics=True</span>, <span class="param">sections=None</span>) → <span class="returns">str</span>
+    </div>
+    <p>Render one record as the user message.</p>
+    <p>Two forms. The positional one takes a narrative and a questionnaire rendering, which are the <code>narrative</code> and <code>questionnaire</code> sections. The keyword form takes <code>sections</code>, an ordered mapping of section name to text, for records with any number of sources; a section whose text is empty or missing is left out, with no empty header.</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>narrative</code></td><td>The free text.</td></tr>
+      <tr><td><code>structured_responses</code></td><td>The questionnaire rendered as text.</td></tr>
+      <tr><td><code>sex</code></td><td>Rendered on the demographics line when given.</td></tr>
+      <tr><td><code>age_years</code></td><td>Age in years, rendered on the demographics line when given.</td></tr>
+      <tr><td><code>demographics</code></td><td>Whether to render the demographics line at all.</td></tr>
+      <tr><td><code>sections</code></td><td><code>{section name: text}</code> in record order. Mutually exclusive with the positional sections.</td></tr>
+    </table>
+    <table>
+      <tr><th>Raises</th><th>Description</th></tr>
+      <tr><td><code>ValueError</code></td><td>No section carries any text.</td></tr>
+    </table>
+
+    <a class="anchor" id="llm-backends"></a>
+    <h3>Backends</h3>
+
+    <h4>build_llm_backend()</h4>
+    <div class="sig">
+      <span class="fn-name">build_llm_backend</span>(<span class="param">model</span>, <span class="param">backend='auto'</span>, <span class="param">**backend_kwargs</span>) → <span class="returns">LLMBackend</span>
+    </div>
+    <p>Construct the backend for <code>model</code> (loads the model or contacts the server).</p>
+
+    <h4>check_transformers_memory()</h4>
+    <div class="sig">
+      <span class="fn-name">check_transformers_memory</span>(<span class="param">model_id</span>, <span class="param">force_load=False</span>) → <span class="returns">dict</span>
+    </div>
+    <p>Estimate what loading <code>model_id</code> needs here, and refuse an impossible load.</p>
+    <p>Reads the same <code>config.json</code> the loader reads. A checkpoint stored in MXFP4 keeps that size only on the native kernel path (CUDA Hopper or later, with <code>kernels</code> and <code>triton&amp;gt;=3.4</code>); everywhere else transformers dequantises the experts to bf16 at load, about four times the stored size. When that estimate exceeds the memory the device can give, loading is refused with the ollama backend named as the way to run the same model on this machine. <code>force_load=True</code> overrides the refusal.</p>
+    <p>Returns the estimate, so it can be recorded. Never raises on a network or metadata failure: it logs and returns what it has.</p>
+
+    <a class="anchor" id="llm-transformers-backend"></a>
+    <h3>TransformersBackend</h3>
+    <div class="sig">
+      <span class="cls-name">TransformersBackend</span>(<span class="param">model_id</span>, <span class="param">device_map='auto'</span>, <span class="param">dtype='auto'</span>, <span class="param">force_load=False</span>, <span class="param">trust_remote_code=False</span>)
+    </div>
+    <p>A causal LM loaded with transformers, generating in this process.</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>model_id</code></td><td>Hub id or local directory of a chat model.</td></tr>
+      <tr><td><code>device_map</code></td><td>Passed to <code>from_pretrained</code>; <code>"auto"</code> spreads a large model over the visible accelerators.</td></tr>
+      <tr><td><code>dtype</code></td><td><code>"auto"</code> keeps the checkpoint's dtype (or dequantises MXFP4 where the native path is unavailable).</td></tr>
+      <tr><td><code>force_load</code></td><td>Skip the memory refusal in :func:`check_transformers_memory`.</td></tr>
+      <tr><td><code>trust_remote_code</code></td><td>Forwarded to transformers.</td></tr>
+    </table>
+
+    <a class="anchor" id="llm-ollama-backend"></a>
+    <h3>OllamaBackend</h3>
+    <div class="sig">
+      <span class="cls-name">OllamaBackend</span>(<span class="param">model_tag</span>, <span class="param">host=None</span>, <span class="param">timeout=900</span>)
+    </div>
+    <p>A model served by a local ollama server, with grammar-constrained JSON output.</p>
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><code>model_tag</code></td><td>The ollama tag, e.g. <code>"gpt-oss:20b"</code>.</td></tr>
+      <tr><td><code>host</code></td><td>Server URL; defaults to <code>$OLLAMA_HOST</code> or <code>http://127.0.0.1:11434</code>.</td></tr>
+      <tr><td><code>timeout</code></td><td>Seconds to wait for one completion (also settable per call through <code>settings["timeout"]</code>).</td></tr>
+    </table>
+
+    <a class="anchor" id="llm-selection"></a>
+    <h3>Hyperparameters and selection</h3>
+
+    <h4>resolve_llm_hyperparams()</h4>
+    <div class="sig">
+      <span class="fn-name">resolve_llm_hyperparams</span>(<span class="param">value</span>) → <span class="returns">(str, dict, 'Optimize | None', 'list[dict] | None')</span>
+    </div>
+    <p><code>(kind, fixed, search, grid)</code> for a prompt run.</p>
+    <p><code>kind</code> is <code>"default"</code>, <code>"fixed"</code> or <code>"search"</code>. <code>fixed</code> is the complete configuration for the first two; for a search it is the first cell of <code>grid</code> until the selection picks one.</p>
+
+    <h4>validate_llm_search()</h4>
+    <div class="sig">
+      <span class="fn-name">validate_llm_search</span>(<span class="param">search</span>) → <span class="returns">list[dict]</span>
+    </div>
+    <p>The grid an <code>Optimize</code> describes for a prompt, or a <code>ValueError</code>.</p>
+    <!-- AUTODOC:end:llm -->
   </section>
 
   <hr>
@@ -2764,7 +2970,7 @@ python tests/demo_results.py heatmaps</code></pre>
 
   <hr>
   <p style="color:#8b949e;font-size:0.82rem;text-align:center;">
-    MultimodalVA v0.1.0 &nbsp;·&nbsp;
+    MultimodalVA v0.2.0 &nbsp;·&nbsp;
     <a href="https://github.com/y-chu/MultimodalVA" style="color:#58a6ff;">GitHub</a>
   </p>
 

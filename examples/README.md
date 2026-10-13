@@ -20,6 +20,7 @@ none is more capable than the others.
 | File | Copy this if | Note |
 |---|---|---|
 | `08_predict_with_a_trained_model.py` | You have a finished run and new records to score | Runs as-is; no GPU, no data of your own |
+| `09_prompt_a_language_model.py` | You want to prompt a language model (`task="llm"`) instead of training one | Defines a cause list of its own and prints the prompt as-is; `--run` loads the model (a large download) |
 | `07_publish_to_hub.py` | You want to share a text or data-fusion model | Checks the artifact first; uploads only when you pass a repo id |
 | `04_python_script_template.py` | You write Python, and your data needs cleaning in pandas first | `run()` accepts a DataFrame directly |
 | `05_command_line_template.sh` | You would rather not write Python, or you submit cluster jobs | One command per run |

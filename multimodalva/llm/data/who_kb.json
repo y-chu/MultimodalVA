@@ -1,0 +1,532 @@
+{
+ "_meta": {
+  "who_pcva_guidance": {
+   "title": "Cause of death assignment by physicians from verbal autopsy data: Manual for physician reviewers",
+   "publisher": "World Health Organization",
+   "year": 2026,
+   "version": "V1",
+   "section": "6 Diagnostic guidance for the WHO target list of causes of death for verbal autopsy",
+   "printed_pages": "56-75",
+   "pdf_pages": "63-82",
+   "publication_page": "https://www.who.int/publications/m/item/cause-of-death-assignment-by-physicians-from-verbal-autopsy-data---pcva-manual-for-physician-reviewers",
+   "pdf_url": "https://cdn.who.int/media/docs/default-source/classification/other-classifications/autopsy/varg-workplans/pcva_manual-for-physician-reviewers_2026.pdf?download=true&sfvrsn=1974637e_1",
+   "pdf_sha256": "6ec869bb71b33f11deca1556ed6f92698a3b21e0197df1e11920f3c2e001680c",
+   "licence_as_stated_in_pdf": "CC BY-ND 4.0",
+   "quotation_boundary": "Verbatim WHO text lives in exactly these fields: criteria[<code>], criteria_footnotes[<code>][*].who_quote, group_notes[<group>].who_quote, shared_guidance[<name>].guidance, and cross_cause_rules[*].who_quote (plus who_quote_2 / who_quote_3 where a summary needed a second span). Everything else - cause keys, analysis_va_codes, icd10_scope, scope_note, summary, why_it_matters_here, and all _meta prose - is study-authored.",
+   "excerpt_conventions": "Line and page wraps are flattened. Superscript footnote callouts are removed from the quoted text, and from schema version 2 the footnote BODIES are kept in criteria_footnotes rather than discarded, so no inclusion or exclusion scope is lost. Where the PDF page footer was extracted into the middle of an entry, the footer text is moved to the object it belongs to: footnote 34 appears inside the VAs-04.02 raw text but belongs to VAs-04.01, and the VAs-04 group NOTE was contiguous with footnote 33 for the same reason. who_pcva_section6_raw.txt keeps the unmodified extraction for verification.",
+   "licence_caution": "This file records source and quotation boundaries but does not make a legal determination about redistribution of reformatted excerpts. Check the licence and obtain appropriate advice before public redistribution."
+  },
+  "icd10_reference": {
+   "title": "International Statistical Classification of Diseases and Related Health Problems, 10th Revision, Version 2019",
+   "publisher": "World Health Organization",
+   "url": "https://icd.who.int/browse10/2019/en",
+   "use_here": "Category scope and terminology only; ICD-10 is not used here as symptom-based diagnostic guidance."
+  },
+  "provenance": {
+   "analysis_va_codes": "Study-defined grouping labels and WHO VA-code crosswalk; VAs-09.99 is present in the study crosswalk but not in WHO 2026 Section 6.",
+   "icd10_scope": "Study grouping/recoding scope, checked against the WHO ICD-10 2019 browser.",
+   "scope_note": "Study-authored explanation of broad and residual categories.",
+   "empirical_content": "No labelled example, observed class frequency, or study-derived diagnostic rule is included.",
+   "criteria": "Verbatim excerpts from WHO 2026 Section 6, with layout flattened and source footnote callouts/bodies omitted as documented.",
+   "criteria_footnotes": "Verbatim footnote bodies from WHO 2026 Section 6, recovered 2026-10-05. These carry inclusion and exclusion scope and were previously dropped entirely.",
+   "group_notes": "Verbatim WHO group-level NOTE text."
+  },
+  "coverage": "64 WHO VA cause codes parsed from Section 6. Codes used by the SANCODV schema carry the earlier verified text; the rest were parsed with the same cleaning. Codes WHO gives no entry for carry 'No specific guidelines.' verbatim or a stated absence.",
+  "known_absences": [
+   "VAs-09.99 Other and unspecified maternal cause: WHO Section 6 has guidance for VAs-09.01 through VAs-09.08 but no 09.99 entry."
+  ],
+  "cross_cause_rule_sources": "Sections 4.1.2 to 4.1.5. Section 4.1.2 (maternal) was added 2026-10-05. Section 4.1.1 (perinatal) is DELIBERATELY EXCLUDED, not missing: its arbitration is about prematurity and low birth weight as underlying cause of a perinatal death, which no age group in scope can take. If a neonate schema is ever run, the rule to add is Section 4.1.3's instruction that prematurity or low birth weight is underlying only when it is the single mentioned cause, and a coexisting specific condition is selected instead. Section 3.1 yields no usable rules: it describes selecting an underlying cause from a completed death certificate's Part I and Part II lines, which this task does not produce, and names the ICD rules (Steps SP1-SP8, M1-M4, Rules A-D) without reproducing their text.",
+  "rule_text_fields": "who_quote (and who_quote_2 / who_quote_3) are verbatim and safe to reproduce under the manual's terms. summary is this study's condensation for prompt use, which is an adaptation; keep the verbatim fields alongside it and publish those. age_scope is study-authored and is enforced in prompts.py, so a rule drawn from a childhood section cannot reach an adult prompt.",
+  "layer": "Site-independent WHO knowledge base. Keyed by WHO VA cause code, so it is reused unchanged across sites, cause schemas and age groups. Criteria text is verbatim and was carried over from the verified extraction, not re-parsed.",
+  "criteria_source": "Maps each WHO VA code to the printed/PDF page its Section 6 entry starts on, so any criteria string can be checked against the manual. 53 of 64 were read off the PDF. The other 11 are marked UNVERIFIED, UNUSED and carry a range bracketed by the nearest codes with a confirmed page, not a confirmed page: the PDF is not held in this repository. They are ranges rather than omissions so the gap stays visible, and they are UNUSED because `criteria` reaches a prompt only through the held module M6 - see _meta.held_and_unconsumed. This first pass is complete and is meant to be built on: check and amend these entries against the PDF if M6 is ever revived or if exact page claims have to ship, rather than redoing the mapping. `prompts.py --check` lists them. Inverted from the former who_guidance_start_page_index on 2026-10-05.",
+  "schema_version": 2,
+  "schema_version_history": {
+   "1": "Until 2026-10-05. Page-indexed guidance; several provenance claims named JSON paths that did not exist.",
+   "2": "2026-10-05. Footnote bodies and group notes recovered into structured fields, extraction artifacts corrected and declared, age scope made explicit on every cross-cause rule, unverifiable page numbers marked as such instead of being omitted silently."
+  },
+  "normalisation_classes": {
+   "flatten_wraps": "Line and page breaks collapsed to single spaces, EXCEPT at an end-of-line hyphenation, where the break is removed and the hyphen kept: the PDF writes non-communicable and breaks it as 'non-' + newline, so flattening that to 'non- communicable' invents a space. 12 such breaks exist in the raw text and all 12 are genuine hyphenated compounds (non-communicable, pre-existing, symptom-based, sub-national), verified individually.",
+   "remove_footnote_callout": "Superscript digits removed from quoted text; the body is retained in criteria_footnotes. Seven callouts (31-37). VAs-01.13 kept an orphan '.33' until 2026-10-05, where it read as a version number ('COVID-19.33').",
+   "repair_split_word": "PDF extraction broke words with a stray space. Corrected: 'ch ildren' (VAs-01.05), 's upporting' (VAs-09.01). WHO's text reads children, supporting.",
+   "repair_split_hyphen": "A space beside a hyphen on one line: 'non -communicable' (VAs-98), and previously 'non- communicable' / 'symptom- based' in three cross-cause quotes, which turned out to be the flatten_wraps defect above rather than damage in the source. Both forms are corrected.",
+   "repair_split_bracket": "'( information' -> '(information' (VAs-01.11, VAs-04.03).",
+   "relocate_footer": "Page-footer text extracted inside another entry is moved to the entry it belongs to; see excerpt_conventions.",
+   "note": "These classes mean a stored quote can differ from who_pcva_section6_raw.txt while being closer to the PDF. Compare against the PDF, not the raw extraction, when auditing.",
+   "raw_source_repaired": "who_source/*_raw.txt was itself repaired on 2026-10-05 for in-line extraction damage: 'ch ildren', 's upporting', 'epidemio logical', 'c ondition', 'such a s radiation', 'cause of dea th', '( information' x2, 'non -drinkers', 'non -smokers', 'ill -defined', 'non -communicable', and 'non- \\ncommunicable' (space before the line break). End-of-line hyphenation was NOT touched: that is the PDF's own layout. Byte snapshot and per-string log in _rollback_who_kb_2026-10-05/. With the raw text repaired and the hyphenation rejoined correctly, ALL 19 who_quote values, all 7 footnotes and the group note now match the source verbatim."
+  },
+  "held_and_unconsumed": {
+   "criteria": "The 64 Section 6 entries reach a prompt only through module M6, which is declared but held, so no live prompt contains them. prompts.py rejects M6 before it can be switched on.",
+   "criteria_footnotes": "Held with M6. When M6 is implemented, an entry's footnotes must be emitted with it: they carry the inclusions and exclusions that bound the category.",
+   "group_notes": "Held with M6.",
+   "shared_guidance": "No code path consumes it. It is held with M6, where it belongs with the external-cause entries it qualifies.",
+   "cross_cause_rules": "Reach a prompt through module M4. M4 was dropped from the selected configuration on 2026-10-05 after it measured worse than its absence, so no live prompt contains these either.",
+   "consequence": "Every field in this file is currently out of the live prompt. Corrections here change provenance and future use, not any model output. A change that WOULD alter a prompt must be versioned; see MODULES.md."
+  },
+  "field_naming": "'criteria' is a legacy key name and a misnomer WHO explicitly warns against: Section 6 says this is 'general diagnostic guidelines', not specific diagnostic algorithms or criteria. The key is kept for consumer compatibility; the code already labels the block 'WHO DIAGNOSTIC GUIDANCE' and states it is not a gate. Rename to diagnostic_guidance behind an alias if the schema is versioned again.",
+  "applies_to_limitation": "applies_to names this study's display labels, and a rule is emitted only when every label it arbitrates is present in the schema. Labels differ across sites, so a semantically applicable rule can disappear for naming reasons: Karonga collapses Assault and Suicide and therefore loses external_cause_uncertainty_prefers_undetermined, 15 of 17 rules rather than 17. Keying to WHO VA codes and translating through each schema's crosswalk would fix this. Not done: M4 is not in the selected configuration and Karonga is not run, so no result depends on it."
+ },
+ "criteria": {
+  "VAs-01.01": "Sepsis 1. Fever AND mental confusion for less than 1 week AND one of the following: • Inability to stand up (information needs to come from the open narrative) • Lethargy (information needs to come from the open narrative). NOTE: If there is a more specific cause, like pneumonia, that would be the underlying cause. Sepsis in those cases would be considered the direct cause.",
+  "VAs-01.02": "Acute respiratory infection, including pneumonia 1. Acute cough (dry or productive) AND fever AND any of the following: • Fast breathing/breathlessness • Chest pain • Cough up blood (i.e., blood in sputum) • Wheezing. AND none of the following: • Swelling of legs • Distension of abdomen.",
+  "VAs-01.03": "HIV/AIDS related death 1. H/O severe weight loss in less than 3 months (information on duration needs to come from the open narrative ) AND HIV +ve serology. OR 2. H/O severe weight loss in less than 3 months (information on duration needs to come from the open narrative ) AND any two of the following: • History of prolonged unexplained fever • Persistent diarrhoea • Persistent cough for more than 1 month (intermittent or continuous) • Mouth sores/white patches in mouth • Skin rash for prolonged periods of time • Generalised swelling of nodes (i.e., lumps) in armpits, neck, groin • History of spouse/partner with similar illness/death of spouse partner from similar illness (information needs to come from the open narrative).",
+  "VAs-01.04": "Diarrheal diseases 1. Three or more loose/liquid/watery stools per day over < 2 weeks AND any two of the following: • Eyes sunken/depressed fontanelle • Low/nil urine output • Vomiting • Intravenous fluid intake/ORS • Mental confusion OR dizziness (information needs to come from the open narrative) • Unconsciousness/lethargy (information needs to come from the open narrative) • Decreased fluid intake (information needs to come from the open narrative). OR 2. Three or more loose/liquid/watery stools per day over < 2 weeks AND blood in stool.",
+  "VAs-01.05": "Malaria 1. Acute onset of severe fever (may be intermittent) AND NO stiff neck AND NO bulging of fontanelle (for children under 12 months old) AND any three of the following: • Convulsions • Unconscious • Breathlessness • Pallor (pale palms, eyes, nail beds) • Jaundice • Severe headache • Chills/rigor (information needs to come from the open narrative). OR 2. Acute onset of severe fever (may be intermittent) AND recent test positive for malaria AND any two of the following: • Convulsions • Unconscious • Breathlessness • Pallor (pale palms, eyes, nail beds) • Jaundice • Severe headache • Chills/rigor (information needs to come from the open narrative). NOTE: Presence of symptoms of ARI, diarrhoea or burning during micturition could be suggestive of immediate or contributory causes.",
+  "VAs-01.06": "Measles 1. Age > 4 months AND rash all over body > 3 days AND fever > 3 days AND any of the following: • Rash started on the face (measles rash) • Cough • Red or watery eyes (information needs to come from the open narrative) • Running nose (information needs to come from the open narrative).",
+  "VAs-01.07": "Meningitis and encephalitis 1. (Continuous fever OR hypothermia in children < 3 months old (information needs to come from the open narrative)) AND any two of the following: • Neck stiffness • Convulsions • Bulging fontanelle • Severe headache • Prolonged loss of consciousness • Vomiting/ Poor feeding (children) • Mental confusion • Irritability or lethargy (information needs to come from the open narrative) • Ear discharge (information needs to come from the open narrative).",
+  "VAs-01.08": "Tetanus 1. (Stiffness of the whole body AND/OR unable to open the mouth) AND any of the following: • Arching of the back/whole body • History of injury (cut or pierced) • Difficulty breathing.",
+  "VAs-01.09": "Pulmonary tuberculosis 1. Chronic cough of ≥ 2 weeks AND fever AND any two of the following: • Cough up blood (i.e., blood in sputum) • Chest pain • Breathlessness • Diagnosis and/or treatment history of TB • Known HIV positive serology (especially if not on ART) • Loss of appetite (information needs to come from the open narrative) • Chronic weight loss (information on duration needs to come from the open narrative).",
+  "VAs-01.10": "Pertussis 1. Severe cough AND any of the following: • “whooping” sound when coughing • Stridor • Vomiting after coughing (information needs to come from the open narrative) • Breathlessness in the neonate (information needs to come from the open narrative).",
+  "VAs-01.11": "Haemorrhagic fever 1. Fever > 3 days AND bleeding from nose, mouth or anus AND blood test for dengue fever negative (information needs to come from the open narrative).",
+  "VAs-01.12": "Dengue fever 1. Sudden onset of severe fever AND any 2 of the following: • Vomiting • Bleeding from nose, mouth, or anus • Severe pain in muscles, bones, forehead and behind eyeballs (information needs to come from the open narrative). OR 2. Diagnosis of dengue fever by a health professional.",
+  "VAs-01.13": "COVID-19 1. Severe difficulty breathing or breathlessness (i.e., shortness of breath) until death AND positive test for COVID-19 OR 2. Severe difficulty breathing or breathlessness until death AND not vaccinated against COVID-19 AND any three of the following: • Fever/chills • Loss or change of smell/taste • Extreme fatigue • Cough • Known exposure to COVID-19 • Diarrhoea/vomiting • Sore throat (information needs to come from the open narrative) • Muscle or body aches (information needs to come from the open narrative). NOTE: The open narrative is very important to elicit the necessary details to make a correct diagnosis for COVID-19.",
+  "VAs-01.99": "Unspecified infectious disease 1. Fever with no other specific signs or symptoms.",
+  "VAs-02.01": "Oral neoplasms 1. (Lump or sores OR mass OR swelling on tongue/ cheek/ mouth cavity/ gum/ palate, usually progressive (information on swelling needs to come from the open narrative)) AND any of the following: • H/O chewing tobacco • Weight loss • Non-healing sore or ulcer (information needs to come from the narrative) • Restriction/difficulty in opening mouth (information needs to come from the open narrative) • Bleeding on touch from the lump/mass/swelling (information needs to come from the open narrative). OR 2. Diagnosed as oral cancer.",
+  "VAs-02.02": "Digestive neoplasms Oesophageal cancer 1. Progressive difficulty in taking foods AND weight loss over several months (information on duration needs to come from the open narrative). OR 2. Diagnosed as oesophageal cancer. Stomach cancer 1. Vomiting AND mass in upper abdomen (information on location needs to come from the open narrative) AND any of the following: • Blood in vomit • Weight loss • Difficulty in swallowing • Black stools (information needs to come from the open narrative) • Black vomit. OR 2. Diagnosed as stomach cancer. Colorectal cancer 1. Bleeding from anal opening AND any of the following: • Chronic H/O constipation alternating with loose stools OR constipation alone (information needs to come from the open narrative) • Weight loss • Painful abdominal distension • Lump in lower part of abdomen (information on location needs to come from the open narrative). OR 2. Diagnosed as colorectal cancer. Liver cancer 1. Mass in the abdomen in the right upper quadrant (information on location needs to come from the open narrative) AND any two of the following: • Protrusion of abdomen developed slowly over months • Weight loss • Jaundice. OR 2. Diagnosed as liver cancer.",
+  "VAs-02.03": "Respiratory neoplasms Throat cancer 1. (Hoarseness of voice slowly developed over months (information needs to come from the open narrative) OR swelling inside the throat (information needs to come from the open narrative)) AND weight loss over several months (information on duration needs to come from the open narrative). OR 2. Diagnosed as throat cancer. Lung cancer 1. Chronic cough AND coughing blood AND NO diagnosis of Tuberculosis during final illness AND any of the following: • H/O smoking daily over a long period • Noticeable loss of weight • Recurrent H/O Pneumonia (information needs to come from the open narrative). OR 2. Diagnosed as lung cancer.",
+  "VAs-02.04": "Breast neoplasms 1. Painless lump in one or both breasts (information on pain needs to come from the open narrative) AND any of the following: • Skin ulceration over breast • Enlarged glands (i.e., lumps) in the neck/axilla • Discharge from nipple (information needs to come from the open narrative). OR 2. Diagnosed as breast cancer.",
+  "VAs-02.05": "Female reproductive neoplasms 1. (Vaginal bleeding after menopause OR pre-menopausal foul smelling vaginal discharge with blood (information needs to come from the open narrative)) AND any of the following: • Weight loss • HIV positive/AIDS diagnosis • Bleeding after sex (information needs to come from the open narrative) • HPV positive (information needs to come from the open narrative). OR 2. Diagnosed as Carcinoma cervix, uterus, ovarian, vulva.",
+  "VAs-02.06": "Male reproductive neoplasms 1. (Palpable lesion/Ulcer in the penis of prolonged duration (information needs to come from the open narrative) OR hard swelling/lump on the testicle(s) (information needs to come from the open narrative) OR difficulty in passing urine) AND chronic loss of weight (information on duration needs to come from the open narrative). OR 2. Diagnosed as prostate, penile, or testicular carcinoma.",
+  "VAs-02.99": "Other and unspecified neoplasms No specific guidelines.",
+  "VAs-03.01": "Severe anaemia 1. Pallor (palms, eyes, oral mucous membranes) AND NO diagnosis of any cancer/malaria/sickle cell disease/ TB/HIV/AIDS/cardiac failure AND any three of the following: • Weight loss • Fatigue/weakness • Breathlessness on exertion • Swollen legs and feet • H/O bleeding anywhere • Dizziness (information needs to come from the narrative). OR 2. Diagnosed as Anaemia.",
+  "VAs-03.02": "Severe malnutrition 1. (Not growing properly OR losing weight and becoming very thin over months (information on duration needs to come from the open narrative)) AND any 2 of the following: • Recurrent febrile illness • Reddish brown discoloration of hair • Flaking of skin • Pallor • Protruding abdomen • Swelling of feet • Night-blindness (information needs to come from the open narrative).",
+  "VAs-03.03": "Diabetes mellitus 1. H/O diabetes AND any of the following: • Ulcer(s) in the foot over long period (information on duration needs to come from the open narrative) • Frequent urination (information needs to come from the open narrative) • Increased thirst/increased hunger (information needs to come from the open narrative) • Recurrent infection (particularly respiratory) (information needs to come from the open narrative). • Tingling or numbness of toes (information needs to come from the open narrative) • Fruity-scented breath (information needs to come from the open narrative). OR 2. H/O diabetes AND no other cause of death identified.",
+  "VAs-04.01": "Acute cardiac disease 1. Severe chest pain lasting for more than ½ hour but less than 24 hours AND any 2 of the following: • Breathlessness (i.e., shortness of breath) • Nausea/vomiting • Sudden death • Pain radiating to left arm back, jaw or shoulders (information needs to come from the open narrative) • Pain between the shoulder blades (information needs to come from the open narrative) • Sweating (information needs to come from the open narrative). OR 2. Sudden death with acute breathlessness AND (previous H/O heart disease OR hypertension). NOTE: See Section 4.1.1.1 for definition of sudden death. OR 3. Diagnosed heart attack/Myocardial infarction.",
+  "VAs-04.02": "Stroke 1. Sudden onset of paralysis of one side of the body in the month preceding death (information on onset and timing needs to come from the open narrative) AND any of the following: • Unconsciousness • Headache • Loss of vision (information needs to come from the open narrative) • Urinary incontinence (information needs to come from the open narrative) • Loss of sensations on one side of the body (information needs to come from the open narrative) • Altered speech (information needs to come from the open narrative) • Face pulled skew (information needs to come from open narrative). NOTE: In long standing cases, commonly leading to development of bed sores with septicaemia, or features of pneumonia as the immediate cause of death.",
+  "VAs-04.03": "Sickle cell with crisis 1. Pallor AND fast breathing AND H/O joint and bone pain (information needs to come from the narrative) AND any of the following: • Fever • Jaundice • H/O sickle cell • H/O blood transfusion • Fainting (collapse) (information needs to come from the open narrative) • Dizziness (information needs to come from the open narrative).",
+  "VAs-04.99": "Other and unspecified cardiac disease No specific guidelines for this category",
+  "VAs-05.01": "Chronic obstructive pulmonary disease (COPD) 1. Recurrent episodes of productive cough >2yrs AND breathlessness, initially episodic (more in winter) later progressive (information on mode of onset needs to come from the open narrative) AND no H/O TB AND any of the following: • Ankle swelling late in disease • Death is often preceded by signs of terminal pneumonia (information needs to come from the open narrative) • Wheezing. NOTE: respondents may suggest that a patient has asthma when referring to COPD, but narrative may indicate adult onset which would be more in keeping with COPD.",
+  "VAs-05.02": "Asthma 1. Severe acute breathlessness AND H/O asthma AND any of the following: • Usually in children and young adults • Not responding to usual treatment for breathing problems (information needs to come from the open narrative).",
+  "VAs-06.01": "Acute abdomen 1. Severe acute abdominal pain AND any of the following: • Vomiting • Fever • Abdominal distension • Jaundice • Constipation (information needs to come from the open narrative) • Rigidity of abdomen (information needs to come from the open narrative) • Back pain that radiates to the buttocks, groin, or legs (information needs to come from the open narrative) • Pallor/coldness in the legs (information needs to come from the open narrative).",
+  "VAs-06.02": "Liver cirrhosis 1. Abdominal distension (i.e., fluid in abdomen; ascites) AND jaundice AND swelling of lower limbs AND with or without any of the following: • Vomiting of blood • Passing of blood in stool • H/o chronic alcoholism • Drowsiness/coma (information needs to come from the open narrative).",
+  "VAs-07.01": "Renal failure 1. H/O renal dialysis/renal failure from health records AND no other specific cause of death. OR 2. (Passing small amount of urine over a long period (information needs to come from the open narrative) OR acute onset of decreasing urinary output for more than 1 day (information needs to come from the open narrative)) AND any two of the following: • H/O hypertension • H/O diabetes • Swelling of the eyelids/face • Swelling of the whole body • Lower abdominal pain • Confusion/drowsiness (information needs to come from the open narrative) • Hiccups (information needs to come from the open narrative).",
+  "VAs-08.01": "Epilepsy 1. (H/O epilepsy OR H/O generalized convulsions over a long period (information on duration needs to come from the open narrative)) AND (general convulsions during final illness AND loss of consciousness after convulsions) AND: • No fever • No neck stiffness • No H/O injury to head up to one week before death (information needs to come from the open narrative). OR 2. H/O epilepsy AND no other specific cause of death.",
+  "VAs-09.01": "Ectopic pregnancy 1. Female aged 12 -49 years old AND sudden severe abdominal pain AND (vaginal bleeding OR fainted). NOTE: H/O pregnancy <2 months is supporting evidence but not essential.",
+  "VAs-09.02": "Abortion-related death 1. Female aged 12 -49 years old AND H/O abortion (i.e., termination before 28 weeks of pregnancy) AND died within 42 days of having an abortion AND any of the following: • Lower abdominal pain and abnormal vaginal discharge • Excessive vaginal bleeding • Fever until death.",
+  "VAs-09.03": "Pregnancy-induced hypertension 1. (Pregnancy >20 weeks of gestation OR up to 6 weeks postpartum) AND (diagnosis of high blood pressure by a health professional at >20 weeks gestation OR up to 6 weeks postpartum (information on timing needs to come from the open narrative)). OR 2. (Pregnancy >20 weeks gestation OR up to 6 weeks postpartum) AND any of the following: • Convulsions for first time in pregnancy OR up to 6 weeks postpartum • Swelling of face • Blurred vision • Severe headache • Upper abdominal pain.",
+  "VAs-09.04": "Obstetric haemorrhage Antepartum haemorrhage 1. Abdominal/back pain after 28 weeks of gestation but before birth of baby (information needs to come from the open narrative) AND (excessive vaginal bleeding OR fainting attack (information needs to come from the open narrative)). OR 2. H/O painless vaginal bleeding during pregnancy (information on pain needs to come from the open narrative) AND excessive bleeding during labour and delivery. Postpartum haemorrhage 3. Excessive bleeding after delivery of baby OR fainting attack AND no abdominal pain AND any one of the following: • Placenta was partially or fully retained • Abdominal pain had stopped after delivering the baby (information on timing needs to come from the open narrative).",
+  "VAs-09.05": "Obstructed labour 1. Abnormal presentation (breech, shoulder, hand, or transverse) AND baby not delivered. OR 2. (Difficulty in delivering baby OR forceps/vacuum/C-section delivery) AND prolonged labour >24 hours.",
+  "VAs-09.06": "Pregnancy-related sepsis 1. H/O delivery/abortion within 42 days AND severe fever persisting till death AND any of the following: • Foul smelling vaginal discharge • Lower abdominal pain/distention.",
+  "VAs-09.07": "Anaemia of pregnancy 1. Death during pregnancy, labour, delivery or occurring soon after birth of child AND no other specific cause of death was identified AND any of the following: • (Paleness of tongue, lips or palms OR fatigue) AND breathlessness prior to death • H/O need/given blood transfusion • H/O diagnosis of severe anaemia (HB < 5g/dl) (information needs to come from the open narrative or medical records) NOTE: Other symptoms that can be available from the open narrative include palpitations/tachycardia, irritability, dizziness, and restless legs.",
+  "VAs-09.08": "Ruptured uterus 1. H/O prolonged labour AND sudden severe abdominal pain AND any of the following: • Vaginal bleeding • H/O c-section.",
+  "VAs-10.01": "Prematurity or low birth weight 1. Born alive AND pregnancy duration less than 8 months (i.e., for 7 months and below) AND no other obvious cause of death. OR 2. If pregnancy duration not known: Smaller than average size baby (if weighted, birth weight below 2.5 kilograms) AND no other obvious cause of death.",
+  "VAs-10.02": "Birth asphyxia 1. (Delayed or no breathing at birth OR delayed or no crying at birth) AND any sign of life present at birth (i.e., exclude stillbirths) AND any of the following: • Died within 24 hours of birth • Convulsions in first 24 hours • Prolonged or difficult labour • Poor suckling • Respiratory distress after birth in a term infant.",
+  "VAs-10.03": "Neonatal pneumonia 1. Breathed immediately at birth, even if a little AND (fever OR cold to touch) AND any of the following: • Fast breathing • Nasal flaring/grunting • Chest in drawing.",
+  "VAs-10.04": "Neonatal sepsis 1. (Fever OR cold to touch) AND no other obvious causes of death (e.g., acute respiratory infection, including pneumonia, meningitis, diarrhoea) AND any of the following: • Purulent cord • Skin sores/ulcers • Poor suckling • Lethargic • Unconscious • Convulsions.",
+  "VAs-10.05": "Neonatal tetanus 1. Baby able to suckle and cry after birth AND stopped suckling or crying after 2 days AND baby’s body became rigid (stiff with the back arched backwards) AND any of the following: • Convulsions • Umbilical cord inflammation (pus draining from the cord or redness extending to the skin) • Mother not vaccinated against tetanus in pregnancy.",
+  "VAs-10.06": "Congenital malformation 1. Any of the following: • Abnormally small head • Abnormally large head • Swelling or defect of the back • Open palate (cleft) (information needs to come from the open narrative) • No anal opening (i.e., not being able to defecate) (information needs to come from the open narrative) • Defect of the abdominal wall and visible internal organs (information needs to come from the open narrative).",
+  "VAs-10.99": "Other and unspecified perinatal cause of death Death within 7 days of birth; No specific guidelines for this category.",
+  "VAs-11.01": "Fresh stillbirth 1. Baby did not cry, move, or breathe at birth AND (stopped moving during labour OR no maceration).",
+  "VAs-11.02": "Macerated stillbirth 1. Baby did not cry, move, or breathe at birth AND (stopped moving before the onset of labour OR baby’s body was soft, discoloured and the skin peeling away).",
+  "VAs-12.01": "Road traffic accident",
+  "VAs-12.02": "Other transport accident",
+  "VAs-12.03": "Accidental fall",
+  "VAs-12.04": "Accidental drowning and submersion",
+  "VAs-12.05": "Accidental exposure to smoke, fire and flames",
+  "VAs-12.06": "Contact with venomous animals and plants",
+  "VAs-12.07": "Accidental poisoning and exposure to noxious substance",
+  "VAs-12.08": "Intentional self-harm",
+  "VAs-12.09": "Assault",
+  "VAs-12.10": "Exposure to force of nature",
+  "VAs-12.99": "Other and unspecified external cause of death",
+  "VAs-98": "Other and unspecified non-communicable disease No specific guidelines. NOTE: This group covers all non-communicable conditions that could not be assigned to another category in this section. There is a separate category for cases where the cause of death is unknown.",
+  "VAs-99": "Cause of death unknown"
+ },
+ "shared_guidance": {
+  "external_causes": {
+   "who_section_heading": "VAS-12 External causes of death",
+   "source_locator": "WHO 2026 Section 6, printed pp. 74-75, PDF pp. 81-82",
+   "applies_to_analysis_causes": [
+    "Traffic / transport accident",
+    "Assault",
+    "Suicide",
+    "Other and unspecified external causes"
+   ],
+   "guidance": "NOTE: The list of questions contains sub questions that allow for more specificity for accidents. Diagnosis is evident from related information from questions and open narrative. Care should be taken to certify external cause as well as body part involved in injury, as applicable."
+  }
+ },
+ "cross_cause_rules": [
+  {
+   "rule_id": "hypertension_not_underlying",
+   "applies_to": [
+    "Cardiac disease",
+    "Cerebrovascular disease",
+    "Other and unspecified non communicable diseases"
+   ],
+   "who_quote": "Where co-existent with IHD or stroke, the ICD coding rules consider hypertension as a risk factor, rather than an underlying cause of death. In such circumstances, the underlying cause is selected as IHD or stroke.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4",
+   "why_it_matters_here": "Hypertensive heart and renal disease (I11-I13) is the largest single contributor to the Cardiac disease category in this cause schema, so the rule bears directly on the Cardiac / Cerebrovascular boundary.",
+   "summary": "Hypertension coexisting with ischaemic heart disease or stroke is a risk factor, not the underlying cause; the underlying cause is the ischaemic heart disease or the stroke. Hypertensive heart disease and hypertensive renal disease are separate and can be underlying.",
+   "who_quote_2": "This is a common co-existing condition with ischaemic heart disease (IHD) (VAs-04.01 acute cardiac disease) and cerebrovascular disease (VAs-04.02 Stroke) but is also an independent cause of death in the form of hypertensive heart disease, or hypertensive renal disease.",
+   "source_2": "WHO 2026 PCVA manual, Section 4.1.4.1, the sentence preceding who_quote",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "chronic_disease_over_pneumonia",
+   "applies_to": [
+    "Pneumonia",
+    "Cardiac disease",
+    "Cerebrovascular disease",
+    "Chronic pulmonary disease and asthma",
+    "Neoplasms",
+    "Diabetes"
+   ],
+   "who_quote": "it is important to identify other signs that may be suggestive of co-existent heart disease, stroke, COPD, neoplasms, or diabetes, which would then be considered as the underlying cause of death, rather than the pneumonia.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4",
+   "why_it_matters_here": "Pneumonia is frequently a terminal event on top of a chronic condition; without this rule a model reading respiratory signs will stop at the proximate cause.",
+   "summary": "Look for signs of coexisting heart disease, stroke, COPD, neoplasm or diabetes before settling on pneumonia: where present, that condition is the underlying cause and the pneumonia the immediate cause.",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "duration_decides_chronology",
+   "applies_to": [
+    "ALL"
+   ],
+   "who_quote": "with the duration of symptoms or signs being a major criterion for deciding the chronology of conditions, and assigning the underlying cause of death.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4",
+   "why_it_matters_here": "Duration is often stated only in the narrative, which is the modality contrast this study is measuring.",
+   "summary": "Duration of symptoms and signs is a major criterion for deciding the chronology of conditions and so the underlying cause.",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "hiv_inclusion_and_exclusion",
+   "applies_to": [
+    "HIV/AIDS",
+    "Pulmonary tuberculosis",
+    "Pneumonia",
+    "Diarrhea",
+    "Other and unspecified infections"
+   ],
+   "who_quote": "HIV/AIDS is a condition that requires careful attention, both for inclusion as well as exclusion as an underlying cause of death. The availability of serological evidence on HIV status could be sufficient for labelling it as the underlying cause, but provided it is possible to identify any specific coexisting infections (TB, fungal infections, diarrhoeal diseases, or opportunistic pneumonia), which should be listed as the immediate cause of death. In the absence of serological evidence, availability of a clinical record of presence of Kaposi’s sarcoma, cryptococcal meningitis, or pneumocystis carinii pneumonia could be used to make a presumptive diagnosis of HIV/AIDS.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.3.2 Infectious diseases in adulthood",
+   "summary": "HIV/AIDS needs care for inclusion AND exclusion. Serological evidence can be enough to make HIV the underlying cause, and a coexisting infection it caused - tuberculosis, fungal infection, diarrhoeal disease, opportunistic pneumonia - is then the immediate cause, not the underlying one. Without serology, Kaposi's sarcoma, cryptococcal meningitis or pneumocystis pneumonia support a presumptive diagnosis.",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "hiv_on_haart_may_be_irrelevant",
+   "applies_to": [
+    "HIV/AIDS",
+    "Diabetes",
+    "Cardiac disease",
+    "Cerebrovascular disease",
+    "Neoplasms"
+   ],
+   "who_quote": "In more recent times, the introduction and maintenance of HAART therapy for HIV patients has led to much improved survival, and potential to develop other conditions such as non-communicable diseases, which are un-related to an immune-compromised status. Hence, a history of being seropositive for HIV may not be relevant in the presence of clinical features and evidence of treatment for conditions such as diabetes, cardiovascular disease or neoplasms, and this should be borne in mind when assigning underlying causes of death for individuals with HIV+ status.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.3.2",
+   "summary": "HAART has greatly improved survival, so people with HIV now die of unrelated conditions. A history of being HIV seropositive may be irrelevant where there are clinical features and evidence of treatment for diabetes, cardiovascular disease or neoplasms; in that case the other condition is the underlying cause.",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "tb_alone_versus_tb_with_hiv",
+   "applies_to": [
+    "Pulmonary tuberculosis",
+    "HIV/AIDS"
+   ],
+   "who_quote": "Tuberculosis is another infectious disease that may co-exist with HIV/AIDS, or manifest by itself. Wherever possible, the above criteria could be used to identify the associated HIV/AIDS, which could also be inferred from a relatively short interval between onset of TB-like symptoms and death (less than 3 months). A positive sputum smear is confirmatory of tuberculosis, either by itself or as co-existing with HIV/AIDS. In the absence of such evidence, a prolonged duration of symptoms of tuberculosis (fever, cough, bloody sputum, long term weight loss etc) punctuated by periods of treatment and relapses with terminal respiratory symptoms could guide clinical judgement of TB.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.3.2",
+   "summary": "Tuberculosis may coexist with HIV/AIDS or stand alone. A short interval between onset of TB-like symptoms and death, under three months, suggests associated HIV/AIDS. A prolonged course punctuated by treatment and relapses with terminal respiratory symptoms supports TB itself.",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "malnutrition_anaemia_are_contributory",
+   "applies_to": [
+    "Diarrhea",
+    "Malaria",
+    "Meningitis and encephalitis",
+    "Pneumonia",
+    "Other and unspecified infections"
+   ],
+   "who_quote": "On Part II, it is important to note the presence of malnutrition or anaemia, as significant contributory conditions co-existing with any of the above infectious diseases.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.3.1 Childhood infectious diseases",
+   "summary": "In a child whose death involved one of the childhood infectious diseases discussed in this section, malnutrition or anaemia coexisting with that infection is a contributory condition rather than the underlying cause. This does not apply where severe malnutrition or anaemia is itself the underlying cause, and it is not a general rule about all ages.",
+   "age_scope": [
+    "child",
+    "neonate"
+   ],
+   "scope_correction": "Was applies_to ALL with no age scope until 2026-10-05, which over-extended a passage specific to childhood infectious disease to every age and cause."
+  },
+  {
+   "rule_id": "infection_may_be_terminal_complication_of_ncd",
+   "applies_to": [
+    "Pneumonia",
+    "Other and unspecified infections",
+    "Cardiac disease",
+    "Cerebrovascular disease",
+    "Chronic pulmonary disease and asthma",
+    "Neoplasms",
+    "Diabetes",
+    "Other and unspecified non communicable diseases"
+   ],
+   "summary": "In adults, infections are often the terminal complication of a chronic non-communicable disease. Finding an infectious cause is a reason to look for an underlying non-communicable one, not a reason to stop.",
+   "who_quote": "In general, infectious diseases are common terminal complications of NCDs. Therefore, the identification of such infectious causes, especially among adults, should stimulate a careful examination of the data from the questionnaire to identify any possible non-communicable underlying causes of death.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "duration_with_symptoms_establishes_sequence",
+   "applies_to": [
+    "ALL"
+   ],
+   "summary": "Signs and symptoms are read together with their reported durations to establish the chronological sequence, case by case. Past history, previous hospitalisations and what health staff said are part of that, and often appear only in the open narrative.",
+   "who_quote": "In general, information on signs and symptoms from VA should always be considered in conjunction with reported durations, to establish the pathophysiological pathway and chronological sequence of events, which would have to be determined on a case-by-case evaluation of available information. Details about past history, previous hospitalizations, or information conveyed by health professionals would also need to be considered, and some of these details could be available from the open narrative section.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "sudden_death_supports_ami_or_stroke",
+   "applies_to": [
+    "Cardiac disease",
+    "Cerebrovascular disease"
+   ],
+   "summary": "Sudden death in verbal autopsy means death in a person with no obvious illness up to 24 hours before. When it occurs without the cardinal sign, a history of hypertension or previous ischaemic heart disease, terminal breathlessness, or a health worker saying 'heart disease' supports acute cardiac disease; sudden loss of consciousness with a fall, previous stroke, or hypertension without features of heart disease supports stroke.",
+   "who_quote": "Vascular diseases such as acute myocardial infarction (AMI) (VAs-04.01 acute cardiac disease) or acute cerebrovascular accident (VAs-04.02 Stroke) have specific ‘cardinal’ clinical features such as onset of acute chest pain, or of unilateral limb paralysis during the terminal period preceding death. However, these conditions may sometimes result in ‘sudden death’ and accompanied by very few suggestive symptoms or signs that could be recognizable to lay persons. For VA, sudden death is defined as ‘death occurring in a person with no obvious illness up to 24 hours prior to death’. In some instances, there is a positive response to ‘sudden death’ along with a positive response to the main clinical feature of AMI or stroke, in which case the diagnosis is straightforward. However, in some cases of sudden death, there is no information on chest pain either in response to the structured question on this symptom or in the open narrative section. To aid the diagnosis, a positive response to a medical history of hypertension, or previous history of IHD, or mention of these conditions in the open narrative should also be noted, as they are commonly associated with AMI. In some instances, the diagnosis of AMI is further supported by a report of terminal breathlessness, which could be a feature of acute left ventricular failure secondary to AMI. Also, mention of ‘heart disease’ as the cause of death reported by a health worker (either in the open narrative or in response to the specific question) should also raise AMI as a potential cause of death, and trigger a careful review of past history, symptoms and terminal events from responses and notes recorded in the questionnaire. Sudden death is also associated with cerebrovascular stroke (VAs-04.02 Stroke), for which sudden onset of unilateral paralysis is often present. On occasions, the clinical picture is one of sudden loss of consciousness accompanied by a fall, and ensuing coma leading to death. In such cases too, the cardinal sign of paralysis may not be reported in the structured responses or in the open narrative. In these cases, the diagnosis of stroke may need to be based on some of several associated features such as sudden death, or a terminal illness precipitated by sudden loss of consciousness accompanied by fall, and/or a previous history of stroke, or history of hypertension without features of heart disease. Reports of stroke as the cause of death as told by health staff to respondents should be considered in the light of evidence from past medical history, symptoms, and history from all sections of the questionnaire.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4.1",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "diabetes_is_underlying_for_its_complications",
+   "applies_to": [
+    "Diabetes",
+    "Pneumonia",
+    "Other and unspecified infections",
+    "Other and unspecified non communicable diseases"
+   ],
+   "summary": "Where death follows a complication of diabetes - infected foot ulcer, pneumonia with uncontrolled sepsis, peripheral vascular disease with gangrene, metabolic coma, or renal disease - diabetes is the underlying cause and the complication the immediate one.",
+   "who_quote": "The rising burden from diabetes mellitus across the world results in its frequent reporting as a medical condition in adult verbal autopsies, either in the medical history or the open narrative. When diabetes is reported, the questionnaire should be carefully screened for all other diseases or conditions, and these multiple causes should then be listed on the VA cause of death form. For instance, diabetes complications leading to death can include severe infections such as infected foot ulcers or pneumonia with uncontrolled sepsis, peripheral vascular disease with gangrene and amputations, metabolic complications and coma, or renal disease. In all these situations, diabetes should be nominated as the underlying cause of death, with the multiple causes listed in the sequence in Part I of the VA cause of death form, to enable more accurate attribution of underlying cause. For instance, a history of dialysis treatment could be suggestive of renal failure in a diabetic individual, and documentation of renal failure would enable coding of the underlying cause to ‘diabetic renal disease’. Similarly, metabolic and infectious complications of diabetes also have specific underlying cause codes.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4.2",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "cardiovascular_outranks_diabetes",
+   "applies_to": [
+    "Diabetes",
+    "Cardiac disease",
+    "Cerebrovascular disease"
+   ],
+   "summary": "Diabetes with ischaemic heart disease or stroke is the exception to the rule above. WHO recommends the cardiovascular condition be the underlying cause and diabetes a contributory one, so that mortality statistics stay consistent.",
+   "who_quote": "However, there is ambiguity in the ICD coding rules for deaths from diabetes where there is association with cardiovascular causes such as ischemic heart disease or stroke. In case the physician reviewer lists ischemic heart disease or stroke as a consequence of diabetes in Part I of the form, then diabetes is selected as the underlying cause. However, if the reviewer lists the cardiovascular condition in Part I and diabetes as a contributory cause in Part II, then the cardiovascular condition is selected as the underlying cause. Variations in cause of death assignment practice by physicians, results in inconsistent mortality statistics. Hence, it is recommended that in such cases, the cardiovascular condition and its complications/sequelae should be listed in sequence of conditions in Part I of the VA cause of death form, which will enable selection of the cardiovascular condition as the underlying cause. Diabetes should be listed in Part II of the VA cause of death form, to be considered as a contributory cause of death. This will enable uniform and consistent statistics on mortality from cardiovascular diseases.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4.2",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "neoplasm_needs_more_than_symptoms",
+   "applies_to": [
+    "Neoplasms"
+   ],
+   "summary": "A neoplasm cannot be diagnosed from symptoms alone with confidence: it often presents only at the metastatic stage with signs from an organ that is not the primary site. Treatment records, a pathology or imaging report, or a health worker naming a site-specific neoplasm are what make it reliable, and should be corroborated against the questionnaire. Blood, brain and pancreatic neoplasms cannot be diagnosed from signs and symptoms at all.",
+   "who_quote": "The diagnosis of neoplasm as an underlying cause of death is particularly challenging from symptoms and signs alone. Quite often, neoplasms may present only at the terminal stages of the condition where there are metastases, and with symptoms and signs related to an organ (liver, lung) which is not the primary site. However, neoplasm of the breast can be recognized from the local lesion, and symptoms of bleeding from the genital tract, upper and lower gastro-intestinal tract, and in sputum may be reported by relatives of the deceased, suggestive of neoplasms in these sites. Another important sign is rapid loss of weight which may be recognized and reported by some respondents. Nevertheless, a purely symptom-based diagnosis cannot be achieved with confidence. Hence, information from access to health services and treatment records available with the household form important elements for a reliable diagnosis of neoplasms. In addition to diagnostic reports from pathology and imaging, even a health worker statement mentioning a site-specific neoplasm can be helpful. Wherever feasible, the diagnoses recorded from available health service documents or hearsay reports should be corroborated with responses in the questionnaire, to confirm the neoplasm as the underlying cause. For instance, a health service report of prostate neoplasm should be corroborated by positive responses to difficulties with passage of urine over a reasonable period of time. Conditions such as blood neoplasms, brain neoplasms, or pancreatic neoplasms cannot be diagnosed from signs and symptoms and would necessarily require information from health service records. All these aspects underscore the importance of careful attention to VA interviewing skills and data collection, which could benefit from feedback on data quality provided by physician reviewers to VA interviewers.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4.3",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "copd_versus_asthma_versus_heart_failure",
+   "applies_to": [
+    "Chronic pulmonary disease and asthma",
+    "Cardiac disease"
+   ],
+   "summary": "Respondents in some cultures call all breathlessness asthma. Asthma requires complete reversibility of airway narrowing, which is not present in long-standing adult breathlessness. Persistent background breathlessness that restricts activity with recurrent infective exacerbations is COPD. Breathlessness at night or interfering with sleep, possibly with swelling of the feet and WITHOUT recurrent infective exacerbations, points instead to congestive heart failure.",
+   "who_quote": "Following pneumonia, the second major respiratory condition is COPD, which is characterized by chronic cough with long standing progressive breathlessness accompanied by frequent infective exacerbations with acute breathlessness, cough, sputum, and fever. Often, there would be a history of smoking, but this may not be so when other occupational exposures or indoor air pollution serve as risk factors. In some instances, long standing breathlessness and signs of congestion from right heart failure (pedal oedema and breathlessness while lying flat or interfering with sleep) may resemble congestive heart failure. In some cultures, there is a practice of referring to all such breathlessness as ‘asthma’. By convention, a diagnosis of asthma is based on complete reversibility of airway narrowing, and such reversibility is not present in cases of long-standing breathlessness in adults. A persistent background breathlessness that restricts physical activity, along with recurrent infective episodes with aggravated breathlessness is a characteristic feature of COPD, which should be assigned as the underlying cause. Where there is information specific to breathlessness occurring at night or interfering with sleep, and possibly along with swelling of the feet, and without recurrent infective exacerbations, a diagnosis of congestive heart failure (VAs-04.99 other and unspecified cardiac disease) could be considered. Any co-existing hypertension or previous history of ischemic heart disease should also be recorded on the VA cause of death form, along with duration.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4.4",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "cirrhosis_renal_and_neurological_evidence",
+   "applies_to": [
+    "Liver cirrhosis",
+    "Other and unspecified non communicable diseases"
+   ],
+   "summary": "Liver cirrhosis is commonly recalled as jaundice, an enlarged protuberant abdomen from ascites, and terminal vomiting of blood from varices, often with prolonged alcohol use. Renal failure usually needs health records or a report of dialysis. Behavioural and mood change, memory loss, loss of motor coordination, apathy, disinhibition and dependence on a caregiver over several months, with no physician-diagnosed brain disease, suggest a nervous system, mental or dementing disorder.",
+   "who_quote": "Other important non-communicable causes of death are liver cirrhosis and renal failure, both of which are relatively difficult to diagnose solely on the basis of clinical signs and symptoms. Liver cirrhosis can present with a wide range of clinical features, of which a report of jaundice, enlarged protuberant abdomen (suggestive of ascites), and terminal vomiting of blood (due to oesophageal varices) may be the common signs recalled and reported by respondents. There may be a prolonged history of alcoholism, to support the diagnosis of alcoholic liver disease. A diagnosis of renal failure from VA may need to rely on information obtained from health records, or reports of accessing renal dialysis services. Similarly, diagnosis of deaths from musculoskeletal disorders such as rheumatoid arthritis or immune-mediated conditions would essentially require evidence from health records and are usually noted in the open narrative section of the questionnaire. The mention in the open narrative section of behavioral and mood changes, memory loss, lack of motor coordination, apathy, anxiety, inappropriate disinhibited behaviors, and significant dependence on a caregiver, of several months' duration and no mention of a physician-diagnosed disease affecting brain functioning, could be suggestive of nervous system disorders, mental disorders and dementias as basic causes of death.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.4.5",
+   "age_scope": [
+    "adult"
+   ]
+  },
+  {
+   "rule_id": "external_cause_uncertainty_prefers_undetermined",
+   "applies_to": [
+    "Assault",
+    "Suicide",
+    "Traffic / transport accident",
+    "Other and unspecified external causes",
+    "Indeterminate"
+   ],
+   "summary": "Social factors can mask suicide, assault and poisoning, and medicolegal deaths often carry incomplete information while investigations are pending, leaving the manner and intent uncertain. Where uncertainty remains high it is appropriate to assign the death as undetermined rather than speculate. Intent must be stated for poisoning, and the role of the victim for a transport death.",
+   "who_quote": "In the case of medicolegal deaths—such as those involving homicide, suicide, accidents under investigation, or deaths in custody — coding of the underlying cause of death presents particular challenges. These cases often involve incomplete or restricted information due to pending legal investigations, which may create uncertainties not only about the exact cause of death but also the manner or intentionality of the event, making timely and accurate coding of the underlying cause difficult. Without formal forensic autopsies or medicolegal reporting systems, VA data may lack the specificity needed to assign accurate ICD codes. In such cases, it is appropriate for physician reviewers to exercise caution, and if uncertainty remains high, to assign the cause of death as undetermined rather than speculate.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.5",
+   "who_quote_2": "However, in the absence of an adequate medico-legal system that requires accurate identification and registration of these details, a range of sociological factors come into play that could mask the true cause of death in many cases. While these may not be that significant for transport accidents or falls, they could be so in the case of suicides, assault, and poisoning.",
+   "who_quote_3": "The external cause must also mention whether the injury was from an assault, or intentional self-harm, or from an accident.",
+   "source_2": "WHO 2026 PCVA manual, Section 4.1.5, opening paragraph",
+   "source_3": "WHO 2026 PCVA manual, Section 4.1.5, summary paragraph",
+   "why_it_matters_here": "The study schema carries both an external residual (Other and unspecified external causes, which includes S00-T99) and Indeterminate (VAs-99, Cause of death unknown). This rule is about the second: where it cannot be established that a death was an external event at all, or the medicolegal picture is too incomplete to support any assignment. A death known to be an injury whose intent is unclear belongs in the external residual, not in Indeterminate.",
+   "age_scope": [
+    "adult"
+   ],
+   "who_quote_4": "Also, a case of poisoning should specify the intent, as well as the nature of the poison.",
+   "source_4": "WHO 2026 PCVA manual, Section 4.1.5, summary paragraph, two sentences later"
+  },
+  {
+   "rule_id": "medical_condition_in_pregnancy_is_indirect_maternal",
+   "applies_to": [
+    "Maternal conditions"
+   ],
+   "age_scope": [
+    "adult"
+   ],
+   "who_quote": "Finally, occurrence of other medical conditions (e.g. hepatitis, rheumatic heart disease, malaria, diabetes etc) while the deceased is pregnant requires their mention on the VA cause of death form, which will lead to their coding as indirect maternal causes of death. Hence, a death from hepatitis in a pregnant female would be assigned to ‘hepatitis in pregnancy’ as the underlying cause, and there is a specific ICD code available for this combination.",
+   "source": "WHO 2026 PCVA manual, Section 4.1.2 Maternal causes of death",
+   "summary": "A death of a woman of reproductive age while pregnant, or within six weeks of childbirth, from a medical condition such as hepatitis, rheumatic heart disease, malaria or diabetes is an indirect maternal death: the underlying cause is that condition in pregnancy, not the condition alone.",
+   "why_it_matters_here": "This study's grouping has a single Maternal conditions label, so an indirect maternal death is reached only by choosing it over the medical condition's own label. Without this rule nothing in the prompt said so."
+  }
+ ],
+ "criteria_source": {
+  "VAS-12 group note": "printed 74 / PDF 81",
+  "VAs-01.01": "printed 57 / PDF 64",
+  "VAs-01.02": "printed 57 / PDF 64",
+  "VAs-01.03": "printed 58 / PDF 65",
+  "VAs-01.04": "printed 58 / PDF 65",
+  "VAs-01.05": "printed 58-59 / PDF 65-66 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-01.06": "printed 59 / PDF 66",
+  "VAs-01.07": "printed 60 / PDF 67",
+  "VAs-01.08": "printed 60 / PDF 67",
+  "VAs-01.09": "printed 60 / PDF 67",
+  "VAs-01.10": "printed 61 / PDF 68",
+  "VAs-01.11": "printed 61 / PDF 68",
+  "VAs-01.12": "printed 61 / PDF 68",
+  "VAs-01.13": "printed 61-62 / PDF 68-69 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-01.99": "printed 62 / PDF 69",
+  "VAs-02.01": "printed 62 / PDF 69",
+  "VAs-02.02": "printed 63 / PDF 70",
+  "VAs-02.03": "printed 64 / PDF 71",
+  "VAs-02.04": "printed 64 / PDF 71",
+  "VAs-02.05": "printed 65 / PDF 72",
+  "VAs-02.06": "printed 65 / PDF 72",
+  "VAs-02.99": "printed 65 / PDF 72",
+  "VAs-03.01": "printed 65 / PDF 72",
+  "VAs-03.02": "printed 66 / PDF 73",
+  "VAs-03.03": "printed 66 / PDF 73",
+  "VAs-04.01": "printed 67 / PDF 74",
+  "VAs-04.02": "printed 67 / PDF 74",
+  "VAs-04.03": "printed 68 / PDF 75",
+  "VAs-04.99": "printed 68 / PDF 75",
+  "VAs-05.01": "printed 68 / PDF 75",
+  "VAs-05.02": "printed 69 / PDF 76",
+  "VAs-06.01": "printed 69 / PDF 76",
+  "VAs-06.02": "printed 69 / PDF 76",
+  "VAs-07.01": "printed 70 / PDF 77",
+  "VAs-08.01": "printed 70 / PDF 77",
+  "VAs-09.01": "printed 71 / PDF 78",
+  "VAs-09.02": "printed 71 / PDF 78",
+  "VAs-09.03": "printed 71 / PDF 78",
+  "VAs-09.04": "printed 71 / PDF 78",
+  "VAs-09.05": "printed 72 / PDF 79",
+  "VAs-09.06": "printed 72 / PDF 79",
+  "VAs-09.07": "printed 72 / PDF 79",
+  "VAs-09.08": "printed 72 / PDF 79",
+  "VAs-10.01": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-10.02": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-10.03": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-10.04": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-10.05": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-10.06": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-10.99": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-11.01": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-11.02": "printed 72-74 / PDF 79-81 (UNVERIFIED, UNUSED: bracketed from neighbours; criteria are held with M6 so this entry reaches no prompt)",
+  "VAs-12.01": "printed 74 / PDF 81",
+  "VAs-12.02": "printed 75 / PDF 82",
+  "VAs-12.03": "printed 75 / PDF 82",
+  "VAs-12.04": "printed 75 / PDF 82",
+  "VAs-12.05": "printed 75 / PDF 82",
+  "VAs-12.06": "printed 75 / PDF 82",
+  "VAs-12.07": "printed 75 / PDF 82",
+  "VAs-12.08": "printed 75 / PDF 82",
+  "VAs-12.09": "printed 75 / PDF 82",
+  "VAs-12.10": "printed 75 / PDF 82",
+  "VAs-12.99": "printed 75 / PDF 82",
+  "VAs-98": "printed 62 / PDF 69",
+  "VAs-99": "printed 75 / PDF 82"
+ },
+ "criteria_footnotes": {
+  "VAs-01.08": [
+   {
+    "callout": 31,
+    "kind": "excludes",
+    "who_quote": "Excludes: Neonatal tetanus VAs-10.05"
+   }
+  ],
+  "VAs-01.11": [
+   {
+    "callout": 32,
+    "kind": "excludes",
+    "who_quote": "Excludes: Dengue VAs-01.12."
+   }
+  ],
+  "VAs-01.13": [
+   {
+    "callout": 33,
+    "kind": "note",
+    "who_quote": "Only test for COVID-19 conducted in health professionals are acceptable."
+   }
+  ],
+  "VAs-04.01": [
+   {
+    "callout": 34,
+    "kind": "includes",
+    "who_quote": "Includes: Ischaemic heart disease; Pulmonary embolism; Sudden cardiac death; Cardiac arrest, unspecified; Left ventricular failure; and Hypertensive heart disease with heart failure."
+   }
+  ],
+  "VAs-06.02": [
+   {
+    "callout": 35,
+    "kind": "includes",
+    "who_quote": "Includes Alcoholic fibrosis/ cirrhosis; Toxic liver cirrhosis; Fibrosis and cirrhosis of liver, excluding alcoholic and toxic, but including ‘unspecified liver cirrhosis’"
+   }
+  ],
+  "VAs-10.02": [
+   {
+    "callout": 36,
+    "kind": "includes",
+    "who_quote": "Includes: Hypoxia and respiratory distress"
+   }
+  ],
+  "VAs-10.03": [
+   {
+    "callout": 37,
+    "kind": "note",
+    "who_quote": "Differs from “pneumonia”, as this refers to a death within 28 days of life."
+   }
+  ]
+ },
+ "group_notes": {
+  "VAs-04": {
+   "who_quote": "NOTE: This group covers all non-communicable conditions. Any infection of the systems that are listed in this section should be assigned to the suitable infectious disease category. Any maternal and perinatal condition should be assigned to the maternal and perinatal causes below.",
+   "source": "WHO 2026 PCVA manual, Section 6, VAs-04 group heading",
+   "extraction_note": "In who_pcva_section6_raw.txt this NOTE is contiguous with footnote 33 because both sat in the page footer. They are different objects and are stored separately."
+  }
+ }
+}

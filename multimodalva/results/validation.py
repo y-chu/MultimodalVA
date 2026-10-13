@@ -20,6 +20,10 @@ module finds it, whichever pipeline made the run:
                        ``combiner_comparison/combiner_comparison.json``
 ``meta_cv``            the chosen stacking meta-learner's cross-validated score
                        on the out-of-fold predictions
+``dev_slice``          a prompted model (``task="llm"``): the best prompt
+                       configuration's score on the dev slice carved from the
+                       training rows (``hpo/hpo_trials.csv``), or a dev-only
+                       run's score (``dev/dev_scores.json``)
 ``none``               no validation data was used — for example a tabular model
                        fitted with fixed hyperparameters. Reported as missing,
                        never filled in from the test set.
@@ -170,6 +174,33 @@ def _from_meta_learner(meta_json: Path) -> dict | None:
             "chosen": best, "file": str(meta_json)}
 
 
+def _from_llm_dev(run: Path, metric: str) -> dict | None:
+    """A prompted run: its selection on the dev slice, or a dev-only run's scores."""
+    trials_csv = run / "hpo" / "hpo_trials.csv"
+    if trials_csv.is_file():
+        trials = pd.read_csv(trials_csv)
+        if trials.empty or "value" not in trials.columns:
+            return None
+        best = trials.loc[trials["value"].idxmax()]
+        scores = {
+            c[len(_ATTR):]: _clean(best[c]) for c in trials.columns
+            if c.startswith(_ATTR) and not c[len(_ATTR):].startswith(("n", "mean_"))
+        }
+        scores = {k: v for k, v in scores.items() if v is not None}
+        return {"source": "dev_slice", "scores": scores, "objective": _clean(best["value"]),
+                "n_trials": int(len(trials)), "chosen": str(best.get("params_modules", "")),
+                "file": str(trials_csv)}
+    dev_json = run / "dev" / "dev_scores.json"
+    if dev_json.is_file():
+        with open(dev_json) as fh:
+            doc = json.load(fh)
+        scores = {k: _clean(v) for k, v in (doc.get("scores") or {}).items()}
+        scores = {k: v for k, v in scores.items() if v is not None}
+        return {"source": "dev_slice", "scores": scores, "n": doc.get("n"),
+                "file": str(dev_json)} if scores else None
+    return None
+
+
 def _from_combiner_comparison(comparison_json: Path) -> dict | None:
     """Stacking run with ``combiner="best"``: the chosen combiner's nested-CV score."""
     with open(comparison_json) as fh:
@@ -208,10 +239,20 @@ def summarize_validation(run_dir: "str | Path", metric: str = "f1_macro") -> dic
         ``source="none"`` and empty ``scores`` when no validation data was used.
     """
     run = Path(run_dir)
+    run_meta = run / "training_metadata.json"
+    # A prompted run's hpo/ is a grid on the dev slice, not a cross-validated
+    # search, so it is read before the generic hpo_trials.csv rule below.
+    if run_meta.is_file():
+        try:
+            with open(run_meta) as fh:
+                pipeline = json.load(fh).get("pipeline")
+        except (OSError, ValueError):
+            pipeline = None
+        if pipeline == "llm":
+            return _from_llm_dev(run, metric) or {"source": "none", "scores": {}}
     # Only when combiner="best" made the choice: a comparison run on its own
     # sits beside whichever combiner the run actually used.
     comparison = run / "combiner_comparison" / "combiner_comparison.json"
-    run_meta = run / "training_metadata.json"
     if comparison.is_file() and run_meta.is_file():
         with open(run_meta) as fh:
             chosen = json.load(fh).get("combiner_chosen")

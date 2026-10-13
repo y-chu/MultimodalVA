@@ -33,6 +33,10 @@ pip install "multimodalva[feature_fusion] @ git+https://github.com/y-chu/Multimo
 pip install "multimodalva[all] @ git+https://github.com/y-chu/MultimodalVA.git"
 ```
 
+The `llm` pipeline runs on the core install (a Hugging Face checkpoint through
+transformers, or a model served by [ollama](https://ollama.com)); `[llm]` adds
+the native MXFP4 kernels for the gpt-oss checkpoints on a Hopper-class GPU.
+
 ⚠️ `[feature_fusion]` pins torch and transformers tighter than the rest of the
 package — install it into a clean environment, and see the
 [FAQ](FAQ.md#feature-fusion-fails-to-install-or-conflicts-with-my-torch-version)
@@ -119,10 +123,16 @@ run(task="stacking", data="clean.csv", label_col="cause",
 Soft voting is the same as stacking with `task="voting"` — it averages the base
 models' probabilities instead of learning a combiner.
 
-</details>
+```python
+# 6. LLM — prompt a language model instead of training one; the prompt carries
+#    a definition of each cause (cause_schema) and the study setting (context)
+run(task="llm", data="clean.csv", label_col="cause", text_col="narrative",
+    model="openai/gpt-oss-20b",          # or "ollama:gpt-oss:20b"
+    cause_schema="causes.json", context="Deaths from a rural district.",
+    output_dir="runs/llm")
+```
 
-**📖 [User manual](https://y-chu.github.io/MultimodalVA/)** — every argument, with
-examples. Start there once the quick start runs.
+</details>
 
 ## Pipelines
 
@@ -134,6 +144,7 @@ examples. Start there once the quick start runs.
 | Feature fusion | `feature_fusion` | Joint text + tabular model via AutoGluon AutoMM |
 | Soft voting | `voting` | Average the probabilities of independently trained models |
 | Stacking | `stacking` | Out-of-fold base predictions, then a combiner — meta-learner (default), simple average, class-aware voter, ensemble selection, or `"best"` (`combiner=`) |
+| LLM | `llm` | Prompt a language model with the record and a definition of each cause; no training. Any Hugging Face chat model or an ollama model |
 
 ## Models
 
@@ -156,6 +167,12 @@ directory. `multimodalva list-models` prints the same list with descriptions.
 | `clinicalbigbird` | [yikuan8/Clinical-BigBird](https://huggingface.co/yikuan8/Clinical-BigBird) | [repo](https://github.com/luoyuanlab/Clinical-Longformer) |
 | `roberta-pm` | RoBERTa-base-PM-M3-Voc-distill-hf — not on the Hub; downloaded once to `~/.cache/multimodalva/` | [repo](https://github.com/facebookresearch/bio-lm) |
 
+**Language models (`task="llm"`)** — any Hugging Face Hub chat model (default
+[openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b)), or
+`"ollama:<tag>"` for a model served by ollama. See the
+[FAQ](FAQ.md#can-i-prompt-a-language-model-instead-of-training-one) for what
+each needs.
+
 **Tabular models**
 
 | Alias | Estimator |
@@ -177,8 +194,9 @@ plots, HPO diagnostics, bootstrap confidence intervals and calibration.
 
 ## Why use it
 
-- **One interface across six pipelines**, so a text model, a tabular model and
-  three kinds of fusion are comparable instead of scattered across scripts.
+- **One interface across seven pipelines**, so a text model, a tabular model,
+  three kinds of fusion and a prompted language model are comparable instead
+  of scattered across scripts.
 - **Nine tabular models and thirteen text backbones**, with or without
   hyperparameter search, all taking the same input and producing the same
   output.
@@ -218,6 +236,7 @@ in the [FAQ](FAQ.md#what-data-does-the-package-expect).
 | [`06_config_file_template.sh`](examples/06_config_file_template.sh) + `config_*.yaml` | settings files, so the config *is* the record of the run |
 | [`07_publish_to_hub.py`](examples/07_publish_to_hub.py) | publish a text or data-fusion model to the Hugging Face Hub |
 | [`08_predict_with_a_trained_model.py`](examples/08_predict_with_a_trained_model.py) | score new records with a run that has already finished |
+| [`09_prompt_a_language_model.py`](examples/09_prompt_a_language_model.py) | define your own cause list and definitions, read the prompt they produce, run `task="llm"` |
 
 Hyperparameter search and checking a config before submitting a job are covered
 in the templates. See [`examples/README.md`](examples/README.md).
@@ -249,7 +268,8 @@ Questions and bug reports are welcome as
 
 | | |
 |---|---|
-| [Hugging Face Transformers](https://github.com/huggingface/transformers) | text model fine-tuning and inference |
+| [Hugging Face Transformers](https://github.com/huggingface/transformers) | text model fine-tuning and inference; language-model generation |
+| [ollama](https://ollama.com) | optional server for the language-model pipeline |
 | [scikit-learn](https://scikit-learn.org) | tabular models, preprocessing, cross-validation |
 | [LightGBM](https://github.com/microsoft/LightGBM), [XGBoost](https://github.com/dmlc/xgboost), [CatBoost](https://github.com/catboost/catboost) | gradient-boosting tabular models |
 | [Optuna](https://optuna.org) and [Ray Tune](https://docs.ray.io/en/latest/tune/) | hyperparameter search |
@@ -272,7 +292,7 @@ repository" button gives the same metadata):
   author  = {Chu, Yue},
   title   = {MultimodalVA: cause-of-death classification from verbal autopsy data},
   url     = {https://github.com/y-chu/MultimodalVA},
-  version = {0.1.0},
+  version = {0.2.0},
   year    = {2026}
 }
 ```
@@ -289,6 +309,11 @@ For the methods:
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The WHO physician-review guidance excerpted in `multimodalva/llm/data/who_kb.json`
+is © World Health Organization 2026, redistributed under CC BY-ND 4.0 with the
+attribution in [WHO_NOTICE.md](multimodalva/llm/data/WHO_NOTICE.md); it is not
+under the MIT licence.
 
 ## Use of Generative AI Tools
 

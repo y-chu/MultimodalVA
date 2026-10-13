@@ -58,6 +58,13 @@ class PretrainedBackend(Protocol):
 
 def load_pretrained_backend(task: str) -> type:
     """Import and return the backend class registered for *task*."""
+    if task == "llm":
+        raise ValueError(
+            "An llm run has no trained artifact to load: the model is a prompt "
+            "plus a base checkpoint. To score new records, run task='llm' on them "
+            "with the same model, cause_schema, context and hyperparams, which the "
+            "run's training_metadata.json records."
+        )
     try:
         target = PRETRAINED_BACKENDS[task]
     except KeyError:

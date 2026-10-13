@@ -15,10 +15,11 @@ which column holds the cause of death:
     )
     out["predictions"].top1.head()
 
-``mv.SUPPORTED_TASKS`` lists the six tasks: ``text``, ``tabular``,
-``data_fusion``, ``feature_fusion``, ``voting``, ``stacking``. Swapping the
-``task`` is usually the only change needed — tabular tasks want ``features=``
-instead of ``text_col=``, and the ensembles want both.
+``mv.SUPPORTED_TASKS`` lists the seven tasks: ``text``, ``tabular``,
+``data_fusion``, ``feature_fusion``, ``voting``, ``stacking`` and ``llm``.
+Swapping the ``task`` is usually the only change needed — tabular tasks want
+``features=`` instead of ``text_col=``, the ensembles want both, and ``llm``
+prompts a language model instead of training one.
 
 ``mv.data(name)`` returns a small synthetic DataFrame shaped like the input the
 package expects; ``mv.list_datasets()`` names them. Nothing here is real data.
@@ -38,7 +39,7 @@ Subpackages, if you want the individual steps rather than the whole pipeline:
 module does not pull torch or transformers — those load when a pipeline runs.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Synthetic example datasets — preview the input shape the package expects:
 #   from multimodalva import data, list_datasets

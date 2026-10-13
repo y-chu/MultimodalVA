@@ -341,6 +341,33 @@ def dataframe_fingerprint(df, columns: list[str] | None = None) -> dict:
     return {**schema, "sha256": digest.hexdigest()}
 
 
+#: Pipelines that refit and re-predict from scratch after every search. For
+#: these, ``Optimize.n_trials`` says how far a search has got, not what it
+#: searches -- the default Optuna study name leaves it out for the same reason --
+#: so raising it on a finished run tops the search up instead of being refused.
+#: Stacking, voting and feature fusion are deliberately absent: they keep work
+#: built from the best hyperparameters (OOF matrices, base results, a finished
+#: AutoMM model), which a bigger budget could make stale.
+TOPUP_PIPELINES = frozenset({"text", "tabular", "data_fusion"})
+
+
+def _without_search_budget(config: dict) -> dict:
+    """``config`` (already JSON-able) with a top-up pipeline's trial budget blanked."""
+    hp = config.get("hyperparams")
+    if (
+        config.get("pipeline") in TOPUP_PIPELINES
+        and isinstance(hp, dict)
+        and {"n_trials", "space_profile", "backend"} <= hp.keys()  # an Optimize
+    ):
+        return {**config, "hyperparams": {**hp, "n_trials": None}}
+    return config
+
+
+def _sign(core: dict) -> str:
+    encoded = json.dumps(core, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def make_resume_manifest(*, dataframes: dict, config: dict) -> dict:
     """Build the content signature written before resumable work starts."""
     core = {
@@ -349,14 +376,33 @@ def make_resume_manifest(*, dataframes: dict, config: dict) -> dict:
             name: dataframe_fingerprint(value)
             for name, value in sorted(dataframes.items())
         },
-        "config": _jsonable(config),
+        "config": _without_search_budget(_jsonable(config)),
     }
-    encoded = json.dumps(core, sort_keys=True, separators=(",", ":"))
     return {
         **core,
-        "signature": hashlib.sha256(encoded.encode()).hexdigest(),
+        "signature": _sign(core),
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+
+
+def _saved_signature(saved: dict) -> str | None:
+    """The signature ``saved`` would carry if written by today's code.
+
+    Manifests written 2026-09-28..10-02 recorded ``n_trials`` for top-up
+    pipelines too; re-signing them without it lets those runs be topped up
+    instead of being refused for a difference that no longer counts.
+    """
+    config = saved.get("config")
+    if not isinstance(config, dict):
+        return saved.get("signature")
+    blanked = _without_search_budget(config)
+    if blanked is config:
+        return saved.get("signature")
+    return _sign({
+        "schema": saved.get("schema"),
+        "dataframes": saved.get("dataframes"),
+        "config": blanked,
+    })
 
 
 #: Accepted values of ``resume=``. ``"adopt"`` is for artifacts made before
@@ -443,11 +489,11 @@ def enforce_resume_manifest(
                     "existed), or move/remove the old artifacts before starting "
                     "fresh."
                 )
-        if saved is not None and saved.get("signature") != expected.get("signature"):
+        if saved is not None and _saved_signature(saved) != expected.get("signature"):
             changed = []
             if saved.get("dataframes") != expected.get("dataframes"):
                 changed.append("data/split")
-            if saved.get("config") != expected.get("config"):
+            if _without_search_budget(saved.get("config") or {}) != expected.get("config"):
                 changed.append("configuration")
             reason = " and ".join(changed) or "signature/schema"
             raise RuntimeError(

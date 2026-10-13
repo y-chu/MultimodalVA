@@ -263,6 +263,60 @@ DOC_PLAN: dict[str, list[dict]] = {
             ],
         },
     ],
+    "llm": [
+        {
+            "kind": "standalone",
+            "anchor": "llm-classifier",
+            "heading": "LLMClassifier",
+            "file": "multimodalva/llm/llm_classifier.py",
+            "name": "LLMClassifier",
+            "methods": ["run"],
+        },
+        {
+            "kind": "group",
+            "anchor": "llm-schema",
+            "heading": "Cause schemas and the prompt",
+            "items": [
+                {"file": "multimodalva/llm/cause_schema.py", "name": "load_cause_schema"},
+                {"file": "multimodalva/llm/cause_schema.py", "name": "cause_schema_template"},
+                {"file": "multimodalva/llm/cause_schema.py", "name": "describe_modules"},
+                {"file": "multimodalva/llm/cause_schema.py", "name": "build_system_prompt"},
+                {"file": "multimodalva/llm/prompts.py", "name": "format_record"},
+            ],
+        },
+        {
+            "kind": "group",
+            "anchor": "llm-backends",
+            "heading": "Backends",
+            "items": [
+                {"file": "multimodalva/llm/backends.py", "name": "build_llm_backend"},
+                {"file": "multimodalva/llm/backends.py", "name": "check_transformers_memory"},
+            ],
+        },
+        {
+            "kind": "standalone",
+            "anchor": "llm-transformers-backend",
+            "heading": "TransformersBackend",
+            "file": "multimodalva/llm/backends.py",
+            "name": "TransformersBackend",
+        },
+        {
+            "kind": "standalone",
+            "anchor": "llm-ollama-backend",
+            "heading": "OllamaBackend",
+            "file": "multimodalva/llm/backends.py",
+            "name": "OllamaBackend",
+        },
+        {
+            "kind": "group",
+            "anchor": "llm-selection",
+            "heading": "Hyperparameters and selection",
+            "items": [
+                {"file": "multimodalva/llm/selection.py", "name": "resolve_llm_hyperparams"},
+                {"file": "multimodalva/llm/selection.py", "name": "validate_llm_search"},
+            ],
+        },
+    ],
     "ensemble": [
         {
             "kind": "standalone",

@@ -55,15 +55,16 @@ _TASK_ALIASES: dict[str, str] = {
     "softvoting": "soft_voting",
     "stacking": "stacking",
     "stack": "stacking",
+    "llm": "llm",
 }
 
 #: Public list of task names accepted by :func:`run` (canonical + friendly).
 SUPPORTED_TASKS: tuple[str, ...] = (
-    "text", "tabular", "data_fusion", "feature_fusion", "voting", "stacking",
+    "text", "tabular", "data_fusion", "feature_fusion", "voting", "stacking", "llm",
 )
 
 # Tasks that consume a free-text narrative column.
-_TEXT_TASKS = {"text", "data_fusion", "feature_fusion"}
+_TEXT_TASKS = {"text", "data_fusion", "feature_fusion", "llm"}
 # Tasks that consume tabular feature columns.
 _FEATURE_TASKS = {"tabular", "data_fusion", "feature_fusion"}
 # Ensemble tasks dispatched through EnsembleClassifier(method=...).
@@ -112,6 +113,11 @@ def run(
 
     Args:
         task: One of ``SUPPORTED_TASKS`` (aliases like ``"voting"`` accepted).
+            ``"llm"`` prompts a language model instead of training one; its
+            own arguments (``cause_schema``, ``context``, ``sections``,
+            ``evaluate_on``, ``dev_size``, ``prob_source``, ``backend`` …) travel
+            in ``**run_kwargs`` and are documented on
+            :meth:`multimodalva.llm.LLMClassifier.run`.
         data: CSV/Parquet path, an in-memory DataFrame, or an explicit
             ``(train_df, test_df)`` tuple (which also fixes the split).
         label_col: Label (cause-of-death) column name.
@@ -197,6 +203,13 @@ def run(
 
             out = mv.run(task="text", data=(train_df, test_df), label_col="cause",
                          text_col="narrative", output_dir="runs/fixed_split")
+
+        Prompting a language model instead of training one::
+
+            out = mv.run(task="llm", data="clean.csv", label_col="cause",
+                         text_col="narrative", model="openai/gpt-oss-20b",
+                         cause_schema="causes.json", context="Deaths from ...",
+                         output_dir="runs/llm")
     """
     # Seed arguments that no longer exist would otherwise slip through
     # **run_kwargs into the classifier and fail there with an unhelpful
@@ -223,17 +236,20 @@ def run(
     # other call does; saying so here beats a TypeError from a positional
     # argument the caller deliberately left out.
     reuses_oof = canonical == "stacking" and run_kwargs.get("oof_from") is not None
-    if not reuses_oof and (data is None or label_col is None):
+    if not reuses_oof and (data is None or (label_col is None
+                                            and not _llm_without_labels(canonical, run_kwargs))):
         raise TypeError(
             f"run(task={task!r}) needs data= and label_col=. "
-            "Only stacking with oof_from= may omit them: that call reuses the "
-            "rows, split and seeds of the run it points at."
+            "Only stacking with oof_from= may omit them (that call reuses the "
+            "rows, split and seeds of the run it points at), and task='llm' with "
+            "evaluate_on='all' may omit label_col= (unlabelled records; the "
+            "causes then come from cause_schema=)."
         )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     init_kwargs = dict(init_kwargs or {})
     requires_text, requires_features = _required_modalities(
-        canonical, text_models, tabular_models, init_kwargs
+        canonical, text_models, tabular_models, init_kwargs, run_kwargs
     )
 
     # --- 1-3. Load, filter, drop-missing, resolve split marker --------------
@@ -312,6 +328,7 @@ def run(
 _SINGLE_MODEL_TARGETS: dict[str, tuple[str, str]] = {
     "text": ("multimodalva.text.text_classifier", "TextClassifier"),
     "tabular": ("multimodalva.tabular.tabular_classifier", "TabularClassifier"),
+    "llm": ("multimodalva.llm.llm_classifier", "LLMClassifier"),
 }
 
 #: Keyword names :func:`_dispatch` computes and supplies itself, and that are not
@@ -326,6 +343,9 @@ _DISPATCH_SUPPLIED = frozenset({"df", "split_col", "model_name"})
 #: documented spelling there even though it is not a parameter of its ``run()``.
 _DISPATCH_ROUTED_TO_CTOR: dict[str, frozenset[str]] = {
     "stacking": frozenset({"resume"}),
+    # Where the model runs is a property of the classifier object, like the
+    # model name; the flat spelling is the documented one.
+    "llm": frozenset({"backend", "backend_kwargs", "backend_instance"}),
 }
 
 #: What each pipeline counts as "there is prior work here", mirroring the
@@ -340,7 +360,13 @@ _RESUME_ARTIFACTS: dict[str, tuple[str, ...]] = {
     "feature_fusion": ("automm_model", "hpo", "predictions"),
     "soft_voting":    ("base_models", "predictions"),
     "stacking":       ("oof", "hpo", "final", "label2id.json"),
+    "llm":            ("hpo", "predictions", "dev"),
 }
+
+
+def _llm_without_labels(canonical: str, config: dict) -> bool:
+    """A prompted run on every row given, which needs no label column."""
+    return canonical == "llm" and config.get("evaluate_on", "all") == "all"
 
 
 def _resume_dir(output_dir: "str | Path", canonical: str) -> Path:
@@ -445,6 +471,22 @@ def _describe_text_model(name: str) -> tuple[str, str | None]:
                 "ID, which cannot be verified without network access)"), None
     return (f"{name} (no package alias of this name — passed to Hugging Face as a "
             "Hub ID, which cannot be verified without network access)"), None
+
+
+def _describe_llm_model(name: str, backend: str | None) -> tuple[str, str | None]:
+    """``(description, problem)`` for a prompted model, **without loading it**."""
+    from .llm.backends import resolve_llm_backend
+
+    try:
+        kind, model_id = resolve_llm_backend(name, backend or "auto")
+    except ValueError as exc:
+        return name, str(exc)
+    if kind == "ollama":
+        return f"{model_id} (served by ollama; reachable only at run time)", None
+    if Path(model_id).expanduser().is_dir():
+        return f"{model_id} (local directory, loaded with transformers)", None
+    return (f"{model_id} (Hugging Face Hub id, loaded with transformers; cannot "
+            "be verified without network access)"), None
 
 
 def _describe_tabular_model(name: str) -> tuple[str, str | None]:
@@ -587,7 +629,7 @@ def _preflight_checks(config: dict, problems: list[str], notes: list[str],
     init_kwargs = config.get("init_kwargs") or {}
     requires_text, requires_features = _required_modalities(
         canonical, config.get("text_models"), config.get("tabular_models"),
-        init_kwargs if isinstance(init_kwargs, dict) else {},
+        init_kwargs if isinstance(init_kwargs, dict) else {}, config,
     )
 
     named = set(inspect.signature(run).parameters) - {"run_kwargs"}
@@ -657,6 +699,8 @@ def _preflight_checks(config: dict, problems: list[str], notes: list[str],
             described, problem = _describe_text_model(str(model))
         elif canonical == "tabular":
             described, problem = _describe_tabular_model(str(model))
+        elif canonical == "llm":
+            described, problem = _describe_llm_model(str(model), config.get("backend"))
         else:
             described, problem = str(model), None
         facts["model"] = described
@@ -664,6 +708,10 @@ def _preflight_checks(config: dict, problems: list[str], notes: list[str],
             problems.append(problem)
     elif canonical in _ENSEMBLE_METHODS:
         facts["model"] = "per base-model spec"
+    elif canonical == "llm":
+        from .llm.backends import LLM_DEFAULT_MODEL
+
+        facts["model"] = f"{LLM_DEFAULT_MODEL} (the pipeline default)"
     else:
         facts["model"] = "the pipeline default"
 
@@ -732,6 +780,7 @@ def _preflight_checks(config: dict, problems: list[str], notes: list[str],
     # --- the data -----------------------------------------------------------
     df: "pd.DataFrame | None" = None
     train_preview: "pd.DataFrame | None" = None
+    test_preview: "pd.DataFrame | None" = None
     split_col: str | None = None
     label_col = config.get("label_col")
     reuses_oof = canonical == "stacking" and config.get("oof_from") is not None
@@ -740,11 +789,13 @@ def _preflight_checks(config: dict, problems: list[str], notes: list[str],
         facts["stage 2 only"] = f"rows, split and seeds come from {oof}"
         if not oof.exists():
             problems.append(f"oof_from={str(oof)!r} does not exist.")
-    elif config.get("data") is None or label_col is None:
+    elif config.get("data") is None or (label_col is None
+                                        and not _llm_without_labels(canonical, config)):
         problems.append(
             f"run(task={task!r}) needs data= and label_col=. Only stacking with "
-            "oof_from= may omit them: that call reuses the rows, split and seeds "
-            "of the run it points at."
+            "oof_from= may omit them (that call reuses the rows, split and seeds "
+            "of the run it points at), and task='llm' with evaluate_on='all' may "
+            "omit label_col=."
         )
     else:
         try:
@@ -761,7 +812,14 @@ def _preflight_checks(config: dict, problems: list[str], notes: list[str],
             # misspelt filter is the usual reason a run ends up with no rows.
             notes.extend(_unmatched_filter_values(config))
 
-    if df is not None:
+    if df is not None and label_col is None:
+        facts["rows"] = f"{len(df)} after filtering and the missing-row drop; unlabelled"
+        facts["split"] = "none: every row is prompted (evaluate_on='all')"
+    elif df is not None and _llm_without_labels(canonical, config):
+        facts["rows"] = f"{len(df)} after filtering and the missing-row drop"
+        facts["classes"] = str(df[label_col].nunique())
+        facts["split"] = "none: every row is prompted (evaluate_on='all')"
+    elif df is not None:
         facts["rows"] = f"{len(df)} after filtering and the missing-row drop"
         counts = df[label_col].value_counts()
         facts["classes"] = str(len(counts))
@@ -809,6 +867,10 @@ def _preflight_checks(config: dict, problems: list[str], notes: list[str],
             )
         except ValueError as exc:
             problems.append(str(exc))
+
+    # --- prompting a language model -----------------------------------------
+    if canonical == "llm" and df is not None:
+        _preflight_llm(config, df, train_preview, test_preview, problems, notes, facts)
 
     # --- resume -------------------------------------------------------------
     _preflight_resume(config, canonical, problems, notes, facts)
@@ -902,6 +964,157 @@ def _unmatched_filter_values(config: dict) -> list[str]:
     return out
 
 
+def _preflight_llm(config: dict, df, train_df, test_df, problems: list[str],
+                   notes: list[str], facts: dict[str, str]) -> None:
+    """The checks a prompted run makes before loading a model, run here instead.
+
+    Sections, markers, the cause schema, the dev slice and the module warnings
+    are all resolvable from the data and the configuration; the model is not
+    loaded. Every check calls the same function the run calls.
+    """
+    from .llm.backends import LLM_REASONING_EFFORTS, supports_reasoning_effort
+    from .llm.cause_schema import describe_modules, load_cause_schema
+    from .llm.llm_classifier import (
+        LLM_EVALUATE_ON, LLM_PROB_SOURCES, count_section_markers, resolve_sections,
+    )
+    from .llm.selection import resolve_llm_hyperparams
+
+    label_col = config.get("label_col")
+    evaluate_on = config.get("evaluate_on", "all")
+    if label_col is None and evaluate_on != "all":
+        problems.append(
+            f"evaluate_on={evaluate_on!r} needs label_col=: a split and a dev slice "
+            "are stratified on the labels. Unlabelled data runs with evaluate_on='all'."
+        )
+    for name, allowed in (("evaluate_on", LLM_EVALUATE_ON), ("prob_source", LLM_PROB_SOURCES)):
+        value = config.get(name)
+        if value is not None and value not in allowed:
+            problems.append(f"{name}={value!r}; use one of {allowed}.")
+    try:
+        names, section_cols, markers = resolve_sections(
+            df, config.get("text_col"), config.get("sections"), config.get("section_markers"),
+        )
+    except ValueError as exc:
+        problems.append(str(exc))
+        return
+    facts["sections"] = ", ".join(names) + (
+        " (split on markers)" if markers else
+        (" (one column each)" if section_cols and len(names) > 1 else "")
+    )
+    if markers:
+        counts = count_section_markers(df[config["text_col"]], markers)
+        facts["section markers"] = ", ".join(
+            f"{m!r} in {n}/{len(df)} rows" for m, n in counts.items()
+        )
+        short = [m for m, n in counts.items() if n < len(df)]
+        if short:
+            problems.append(
+                f"section marker(s) {short} are missing from some rows (see 'section "
+                "markers' above). Every marker must appear exactly once per row; a "
+                "row without it is refused, not guessed."
+            )
+    for key in ("sex_col", "age_col"):
+        col = config.get(key)
+        if col is not None and col not in df.columns:
+            problems.append(f"{key} {col!r} is not in the data.")
+
+    hyperparams = config.get("hyperparams")
+    try:
+        kind, fixed, search, grid = resolve_llm_hyperparams(hyperparams)
+    except (TypeError, ValueError) as exc:
+        problems.append(str(exc))
+        kind, fixed, search, grid = "default", None, None, None
+    model = str(config.get("model") or "")
+    if fixed is not None and model and fixed.get("reasoning_effort") and not supports_reasoning_effort(model):
+        notes.append(
+            f"{model} does not look like a model that accepts a reasoning effort "
+            f"(families: {', '.join(LLM_REASONING_EFFORTS)} apply to gpt-oss, "
+            "deepseek-r1, qwen3, magistral). If it does not, the run stops: pass "
+            "hyperparams={'reasoning_effort': None}."
+        )
+
+    causes = sorted({str(c) for c in df[label_col].dropna()}) if label_col else None
+    spec = None
+    if label_col is None and config.get("cause_schema") is None:
+        problems.append(
+            "Without label_col= the cause list has to come from cause_schema=; "
+            "pass a schema listing the causes the model may return."
+        )
+    else:
+        try:
+            spec = load_cause_schema(config.get("cause_schema"), causes,
+                                     context=config.get("context"), sources=names)
+        except (ValueError, FileNotFoundError) as exc:
+            problems.append(str(exc))
+    if spec is not None:
+        facts["cause schema"] = (
+            f"{spec.name}: {len(spec.causes)} causes" if config.get("cause_schema") is not None
+            else f"none: {len(spec.causes)} cause names only"
+        )
+        modules = fixed["modules"] if fixed else ()
+        for warning in describe_modules(spec, modules, config.get("rules_arm", "literature")):
+            notes.append(warning)
+
+    needs_dev = evaluate_on == "dev" or kind == "search"
+    if needs_dev and evaluate_on == "all":
+        problems.append(
+            "Optimize(...) selects a prompt configuration on a dev slice of the "
+            "training rows, which evaluate_on='all' does not make. Use "
+            "evaluate_on='test' or 'dev', or fix the configuration with hyperparams={...}."
+        )
+    if needs_dev and train_df is not None:
+        dev_ids = config.get("dev_ids")
+        if dev_ids is not None:
+            id_col = config.get("id_col")
+            if id_col is None:
+                problems.append("dev_ids= needs id_col= to say which rows they are.")
+            else:
+                if isinstance(dev_ids, (str, Path)):
+                    try:
+                        doc = json.loads(Path(dev_ids).read_text())
+                        dev_ids = doc["dev_ids"] if isinstance(doc, dict) else doc
+                    except (OSError, ValueError, KeyError) as exc:
+                        problems.append(f"dev_ids file could not be read: {exc}")
+                        dev_ids = []
+                wanted = {str(x) for x in dev_ids}
+                overlap = wanted & set(test_df[id_col].astype(str)) if test_df is not None else set()
+                if overlap:
+                    problems.append(
+                        f"{len(overlap)} dev id(s) are in the test partition: "
+                        f"{sorted(overlap)[:10]}. The dev slice must come from the "
+                        "training rows only."
+                    )
+                facts["dev slice"] = f"{len(wanted)} rows from dev_ids"
+        else:
+            size = config.get("dev_size", 0.1)
+            n = int(size) if isinstance(size, int) and not isinstance(size, bool) else int(round(size * len(train_df)))
+            facts["dev slice"] = f"about {n} of {len(train_df)} training rows (dev_size={size}, split_seed)"
+        if config.get("evaluate_on") == "dev":
+            facts["evaluated on"] = "the dev slice only; predictions/ is not written and the test rows are not read"
+    if search is not None and grid is not None:
+        facts["prompt selection"] = f"{len(grid)} configuration(s) on the dev slice, metric={search.metric}"
+
+
+def _preflight_llm_hyperparams(config: dict, problems: list[str],
+                               facts: dict[str, str]) -> None:
+    from .llm.selection import describe_llm_cell, resolve_llm_hyperparams
+
+    try:
+        kind, fixed, search, grid = resolve_llm_hyperparams(config.get("hyperparams"))
+    except (TypeError, ValueError) as exc:
+        if str(exc) not in problems:
+            problems.append(str(exc))
+        return
+    if kind == "search":
+        facts["hyperparameters"] = (
+            f"selection over {len(grid)} prompt configuration(s), metric={search.metric}"
+        )
+    else:
+        facts["hyperparameters"] = (
+            f"{'as given' if kind == 'fixed' else 'the defaults'}: {describe_llm_cell(fixed)}"
+        )
+
+
 def _preflight_hyperparams(config: dict, canonical: str, train_df,
                            problems: list[str],
                            notes: list[str], facts: dict[str, str]) -> None:
@@ -911,6 +1124,9 @@ def _preflight_hyperparams(config: dict, canonical: str, train_df,
     training rows again, and a class too small to appear in every fold is the
     difference between a silent degradation and a run that stops.
     """
+    if canonical == "llm":
+        _preflight_llm_hyperparams(config, problems, facts)
+        return
     hyperparams = config.get("hyperparams")
     if hyperparams is None:
         facts["hyperparameters"] = "the model library's own defaults — no search"
@@ -1059,6 +1275,7 @@ def _required_modalities(
     text_models: list[dict] | None,
     tabular_models: list[dict] | None,
     init_kwargs: dict | None,
+    run_kwargs: dict | None = None,
 ) -> tuple[bool, bool]:
     """Return whether a call actually consumes text and tabular columns.
 
@@ -1070,6 +1287,10 @@ def _required_modalities(
     init_kwargs = init_kwargs or {}
     if canonical == "text":
         return True, False
+    if canonical == "llm":
+        # One text column, or several named sections given as columns; with
+        # sections= there is no single text_col to require.
+        return not (run_kwargs or {}).get("sections"), False
     if canonical == "tabular":
         return False, True
     if canonical == "data_fusion":
@@ -1241,7 +1462,7 @@ def _looks_like_path(value) -> bool:
 
 
 def _drop_missing(df, label_col, text_col, *, requires_text: bool) -> pd.DataFrame:
-    if label_col not in df.columns:
+    if label_col is not None and label_col not in df.columns:
         raise ValueError(
             f"label column {label_col!r} not in DataFrame. "
             f"Available: {df.columns.tolist()}"
@@ -1255,7 +1476,10 @@ def _drop_missing(df, label_col, text_col, *, requires_text: bool) -> pd.DataFra
                 f"Available: {df.columns.tolist()}"
             )
     before = len(df)
-    mask = df[label_col].notna() & (df[label_col].astype(str).str.strip() != "")
+    if label_col is not None:
+        mask = df[label_col].notna() & (df[label_col].astype(str).str.strip() != "")
+    else:
+        mask = pd.Series(True, index=df.index)
     if requires_text and text_col and text_col in df.columns:
         mask &= df[text_col].notna() & (df[text_col].astype(str).str.strip() != "")
     out = df[mask].reset_index(drop=True)
@@ -1353,6 +1577,23 @@ def _dispatch(
         )
         ctor.update(init_kwargs)
         clf = TextClassifier(**ctor)
+        kwargs = dict(
+            df=df, text_col=text_col, label_col=label_col,
+            hyperparams=hyperparams, top_k=top_k, **common_split, **run_kwargs,
+        )
+        _put(kwargs, "id_col", id_col)
+        return clf.run(**kwargs)
+
+    if canonical == "llm":
+        from .llm.backends import LLM_DEFAULT_MODEL
+        from .llm.llm_classifier import LLMClassifier
+
+        ctor = dict(model_name=model or LLM_DEFAULT_MODEL, output_dir=output_dir)
+        for key in _DISPATCH_ROUTED_TO_CTOR["llm"]:
+            if key in run_kwargs:
+                ctor[key] = run_kwargs.pop(key)
+        ctor.update(init_kwargs)
+        clf = LLMClassifier(**ctor)
         kwargs = dict(
             df=df, text_col=text_col, label_col=label_col,
             hyperparams=hyperparams, top_k=top_k, **common_split, **run_kwargs,
